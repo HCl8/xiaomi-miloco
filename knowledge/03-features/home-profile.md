@@ -43,7 +43,7 @@ AI 的每次对话默认是无记忆的。用户每次说"我爸爸有高血压"
 
 ### 架构概览（数据流图）
 
-**知识写入路径**
+#### 知识写入路径
 
 ```
 感知日志（Omni caption）
@@ -58,7 +58,7 @@ AI 的每次对话默认是无记忆的。用户每次说"我爸爸有高血压"
             → profile.md 写盘
 ```
 
-**档案消费路径**
+#### 档案消费路径
 
 ```
 profile.md（$MILOCO_HOME/home-profile/profile.md）
@@ -103,14 +103,14 @@ profile.md（$MILOCO_HOME/home-profile/profile.md）
 
 ### 如果我要修改家庭记忆相关功能
 
-| 修改目标 | 去看哪个文件 |
-|---------|------------|
-| 修改档案写入/权重逻辑 | `home_profile/service.py`（HomeProfileService） |
-| 修改档案存储格式 | `home_profile/store.py` |
+| 修改目标                | 去看哪个文件                                                                              |
+| ----------------------- | ----------------------------------------------------------------------------------------- |
+| 修改档案写入/权重逻辑   | `home_profile/service.py`（HomeProfileService）                                           |
+| 修改档案存储格式        | `home_profile/store.py`                                                                   |
 | 修改档案 Agent 注入方式 | `plugins/openclaw/src/hooks/prompt.ts`（注入 Hook；档案读取见 `home-profile/helpers.ts`） |
-| 修改档案 Omni 注入方式 | `perception/engine/omni/home_profile_loader.py` |
-| 修改 cron 调度配置 | `plugins/openclaw/src/home-profile/scheduler.ts`（`kCronTasks`） |
-| 修改家庭档案 API | `home_profile/router.py` |
+| 修改档案 Omni 注入方式  | `perception/engine/omni/home_profile_loader.py`                                           |
+| 修改 cron 调度配置      | `plugins/openclaw/src/home-profile/scheduler.ts`（`kCronTasks`）                          |
+| 修改家庭档案 API        | `home_profile/router.py`                                                                  |
 
 ### 家庭档案相关 API 路径
 

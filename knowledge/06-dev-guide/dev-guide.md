@@ -77,19 +77,19 @@ cd backend && uv run task dev
 
 ### 配置分段与用途
 
-| 配置段 | 控制什么 |
-|--------|---------|
-| `server` | 后端监听 host/port、访问 Bearer token、启动用 Python 路径、日志级别 |
-| `agent` | OpenClaw webhook 地址和认证凭据 |
-| `model.omni` | 多模态模型的 API Key、Base URL、模型标识；**感知必填项** |
-| `directories` | 工作目录（`storage`）、ONNX 模型目录；派生路径（log_dir / snapshot_dir 等）由此计算 |
-| `database` | SQLite 连接参数 |
-| `miot` | 小米云区域（`cn/de/i2/ru/sg/us`） |
-| `camera` | 摄像头采集帧间隔和缓冲大小 |
-| `rule` | 规则日志保留天数；duration 窗口触发比例默认值 |
-| `perception` | 感知日志 TTL、事件截图 TTL + 磁盘配额；子段：`perception.collect`（采集窗口）、`perception.engine`（识别 / VLM 等引擎子参数）、tier_u dump 调试开关 |
-| `perf` | 可观测性总开关（`enabled`）、各表/文件保留天数；关闭后 observability.db 不建 |
-| `dispatcher` | Agent 事件队列上限、单 turn 等待超时 |
+| 配置段        | 控制什么                                                                                                                                            |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `server`      | 后端监听 host/port、访问 Bearer token、启动用 Python 路径、日志级别                                                                                 |
+| `agent`       | OpenClaw webhook 地址和认证凭据                                                                                                                     |
+| `model.omni`  | 多模态模型的 API Key、Base URL、模型标识；**感知必填项**                                                                                            |
+| `directories` | 工作目录（`storage`）、ONNX 模型目录；派生路径（log_dir / snapshot_dir 等）由此计算                                                                 |
+| `database`    | SQLite 连接参数                                                                                                                                     |
+| `miot`        | 小米云区域（`cn/de/i2/ru/sg/us`）                                                                                                                   |
+| `camera`      | 摄像头采集帧间隔和缓冲大小                                                                                                                          |
+| `rule`        | 规则日志保留天数；duration 窗口触发比例默认值                                                                                                       |
+| `perception`  | 感知日志 TTL、事件截图 TTL + 磁盘配额；子段：`perception.collect`（采集窗口）、`perception.engine`（识别 / VLM 等引擎子参数）、tier_u dump 调试开关 |
+| `perf`        | 可观测性总开关（`enabled`）、各表/文件保留天数；关闭后 observability.db 不建                                                                        |
+| `dispatcher`  | Agent 事件队列上限、单 turn 等待超时                                                                                                                |
 
 ### 用户最常修改的配置项
 
@@ -195,6 +195,7 @@ curl -H "Authorization: Bearer $(miloco-cli config get server.token)" \
 ```
 
 相关代码入口：
+
 - 感知调度：`perception/runner.py`（PerceptionRunner）
 - Gate 逻辑：`perception/engine/gate/gate.py`
 - 身份识别逻辑：`perception/engine/identity/engine.py`
@@ -237,19 +238,18 @@ openclaw skills list | grep miloco
 
 ```yaml
 ---
-name: miloco-<skill-name>     # 小写字母+连字符，必须以 miloco- 开头
-description: 一句话描述        # 何时激活，Agent 依据此选择 Skill
+name: miloco-<skill-name> # 小写字母+连字符，必须以 miloco- 开头
+description: 一句话描述 # 何时激活，Agent 依据此选择 Skill
 metadata:
   author: miloco
   version: "1.0"
-  date: YYYY-MM-DD            # 取 git 最后提交日期
+  date: YYYY-MM-DD # 取 git 最后提交日期
   openclaw:
     requires:
-      bins: ["miloco-cli"]    # 依赖的命令行工具
-      tools:                  # 依赖的 OpenClaw built-in tools（可选）
+      bins: ["miloco-cli"] # 依赖的命令行工具
+      tools: # 依赖的 OpenClaw built-in tools（可选）
         - miloco_im_push
 ---
-
 # Skill 正文（Markdown）
 ```
 
@@ -357,22 +357,22 @@ bash scripts/install.sh --dev
 
 ## 数据落盘约定
 
-| 路径 | 用途 |
-|------|------|
-| `~/.openclaw/miloco/` | `$MILOCO_HOME` 默认根 |
-| `config.json` | 三端共享配置 |
-| `miloco.db` | SQLite 业务数据库 |
-| `observability.db` | 性能追踪数据库（`perf.enabled=true` 时建） |
-| `data/identity_lib/persons/<id>/` | 身份库（tier_a / tier_c / meta.json） |
-| `models/` | ONNX 模型（必需 det_4C / human_body_reid_v2，另有可选模型；清单见 `resource_validator.py`） |
-| `home-profile/` | 家庭档案（candidates.json / profile.json / profile.md） |
-| `static/` | 家庭面板前端静态资源（由 `install.sh` 从 `web/dist/` 同步） |
-| `log/` | 各组件日志（`miloco-backend.log` / `supervisord.log` 等） |
-| `supervisord.*` | supervisor 配置和 socket（service start 首次生成） |
-| `memory/` | Agent 工作区记忆（如 `_system/dynamic_failures.md`；任务行为统计已迁至 `miloco.db` 的 `task_record_*` 表） |
-| `trace/agent/` | DYNAMIC rule trace jsonl（`debug_observability` flag 开时写） |
-| `trace/omni/` | Omni 推理 trace jsonl（同上） |
-| `packs/` | 日志打包产物（LRU 保留最新几个） |
+| 路径                              | 用途                                                                                                       |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `~/.openclaw/miloco/`             | `$MILOCO_HOME` 默认根                                                                                      |
+| `config.json`                     | 三端共享配置                                                                                               |
+| `miloco.db`                       | SQLite 业务数据库                                                                                          |
+| `observability.db`                | 性能追踪数据库（`perf.enabled=true` 时建）                                                                 |
+| `data/identity_lib/persons/<id>/` | 身份库（tier_a / tier_c / meta.json）                                                                      |
+| `models/`                         | ONNX 模型（必需 det_4C / human_body_reid_v2，另有可选模型；清单见 `resource_validator.py`）                |
+| `home-profile/`                   | 家庭档案（candidates.json / profile.json / profile.md）                                                    |
+| `static/`                         | 家庭面板前端静态资源（由 `install.sh` 从 `web/dist/` 同步）                                                |
+| `log/`                            | 各组件日志（`miloco-backend.log` / `supervisord.log` 等）                                                  |
+| `supervisord.*`                   | supervisor 配置和 socket（service start 首次生成）                                                         |
+| `memory/`                         | Agent 工作区记忆（如 `_system/dynamic_failures.md`；任务行为统计已迁至 `miloco.db` 的 `task_record_*` 表） |
+| `trace/agent/`                    | DYNAMIC rule trace jsonl（`debug_observability` flag 开时写）                                              |
+| `trace/omni/`                     | Omni 推理 trace jsonl（同上）                                                                              |
+| `packs/`                          | 日志打包产物（LRU 保留最新几个）                                                                           |
 
 ---
 

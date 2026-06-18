@@ -4,7 +4,7 @@
 
 小米 MiOT SDK（`backend/miot/src/miot/`）是 Miloco 访问小米智能家居生态的底层库。它封装了 OAuth2 认证、小米云 HTTP API、局域网 OT 协议直连、摄像头流媒体（C 库封装）、mDNS 局域网发现等能力，由小米内部维护，以预编译形式（Python wheel + `.so`/`.dylib`）分发。
 
-**能力范围**
+### 能力范围
 
 - **OAuth2 + 云端 API**：账号授权、设备列表、属性读写、动作触发、场景执行、App 推送通知
 - **LAN 直连（OT 协议）**：UDP 广播发现局域网 MiOT 设备，维护在线/离线状态，本地低延迟控制

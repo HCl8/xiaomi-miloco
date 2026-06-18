@@ -91,6 +91,7 @@ Scope 定义了"Miloco 管控哪些设备"的边界，分为两个维度：
 **摄像头维度（Camera Scope）**：在启用家庭内，用户可以进一步禁用某些摄像头（如不想让 Miloco 看客厅）。被禁用的摄像头 DID 以黑名单形式存在 KV 表中——新摄像头默认被感知，用户选择性关闭。
 
 **Scope 过滤的作用点**：
+
 - 设备列表 / 场景列表接口返回前，`filter.py` 过滤掉不在启用家庭的条目
 - 控制设备前，`MiotService` 校验 did 所属家庭是否在启用集内，不在则拒绝
 - 感知流水线层：摄像头 scope 变更后，`MiotService` 热同步对应摄像头的**感知投喂订阅**（仅影响感知解码，不重建 camera manager、不中断正在进行的直播），无需重启服务
@@ -101,12 +102,12 @@ Scope 定义了"Miloco 管控哪些设备"的边界，分为两个维度：
 
 ### 关键设计决策
 
-**Cloud vs LAN 两条控制路径**
+#### Cloud vs LAN 两条控制路径
 
-| 路径 | 实现 | 适用场景 |
-|------|------|----------|
+| 路径      | 实现                                                                  | 适用场景               |
+| --------- | --------------------------------------------------------------------- | ---------------------- |
 | **Cloud** | `MIoTHttpClient`（`backend/miot/src/miot/cloud.py`）→ 小米云 HTTP API | 默认路径，支持远程访问 |
-| **LAN** | `MIoTLan`（`backend/miot/src/miot/lan.py`）→ 局域网 UDP 直连 | 本地低延迟，不依赖外网 |
+| **LAN**   | `MIoTLan`（`backend/miot/src/miot/lan.py`）→ 局域网 UDP 直连          | 本地低延迟，不依赖外网 |
 
 两条路径由 `MIoTClient` 内部协调，上层调用方无需感知。
 
@@ -116,13 +117,13 @@ Scope 定义了"Miloco 管控哪些设备"的边界，分为两个维度：
 
 ### 如果我要修改设备控制相关功能
 
-| 修改目标 | 去看哪个文件 |
-|---------|------------|
-| 修改 scope 过滤逻辑 | `miot/filter.py` |
-| 修改 scope CRUD 逻辑 | `miot/service.py`（`switch_home` / `toggle_camera` / `list_cameras_with_state`） |
-| 修改设备控制 API 端点 | `miot/router.py` |
-| 修改 MiOT SDK 封装层 | `miot/client.py`（MiotProxy），更底层看 `backend/miot/src/miot/` |
-| 修改摄像头管理逻辑 | `miot/camera_handler.py`（`CameraVisionHandler`） |
+| 修改目标              | 去看哪个文件                                                                     |
+| --------------------- | -------------------------------------------------------------------------------- |
+| 修改 scope 过滤逻辑   | `miot/filter.py`                                                                 |
+| 修改 scope CRUD 逻辑  | `miot/service.py`（`switch_home` / `toggle_camera` / `list_cameras_with_state`） |
+| 修改设备控制 API 端点 | `miot/router.py`                                                                 |
+| 修改 MiOT SDK 封装层  | `miot/client.py`（MiotProxy），更底层看 `backend/miot/src/miot/`                 |
+| 修改摄像头管理逻辑    | `miot/camera_handler.py`（`CameraVisionHandler`）                                |
 
 ### 设备控制相关 API 路径
 

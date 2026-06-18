@@ -75,12 +75,12 @@ GET /api/miot/watch → watch.html（server.token 注入）
 
 ### 如果我要修改直播相关功能
 
-| 修改目标 | 去看哪个文件 |
-|---------|------------|
-| 修改 WebSocket 订阅/管理逻辑 | `miot/ws.py`（MIoTVideoStreamManager） |
-| 修改编码参数或 WebSocket 帧格式 | `miot/transcoder.py`（H264LiveEncoder） |
+| 修改目标                              | 去看哪个文件                                           |
+| ------------------------------------- | ------------------------------------------------------ |
+| 修改 WebSocket 订阅/管理逻辑          | `miot/ws.py`（MIoTVideoStreamManager）                 |
+| 修改编码参数或 WebSocket 帧格式       | `miot/transcoder.py`（H264LiveEncoder）                |
 | 修改 watch.html 页面或 token 注入逻辑 | `miot/router.py`（`watch_page`）和 `static/watch.html` |
-| 修改浏览器端解码逻辑 | `static/watch.html` 内的 JavaScript 部分 |
+| 修改浏览器端解码逻辑                  | `static/watch.html` 内的 JavaScript 部分               |
 
 ### 与其他模块的关系
 

@@ -6,7 +6,7 @@ Miloco 是小米面向未来的全屋智能 AI 开源方案。运行在家庭本
 
 用户只需告诉 AI"把书房台灯调暗，爷爷在看书"——Miloco 识别谁在哪里、联动灯光、并将这条信息沉淀为家庭记忆。
 
-**九大能力域**
+### 九大能力域
 
 - **设备控制** — 通过 MiOT 协议操控米家设备：开关、调参、查状态、触发场景
 - **环境感知** — 摄像头四层流水线（MultimodalCollector → Gate → Identity → Omni），将画面转化为结构化事件
@@ -60,13 +60,13 @@ miloco/
 
 后端遵循 Router → Service/Runner → Repo/外部代理 分层，各域 router 以各自 prefix 挂载，由 `main.py` 统一收在 `/api` 下。
 
-| 层 | 职责 | 典型类（文件路径） |
-|----|------|-----------------|
-| **Router** | 接收 HTTP 请求、参数校验、鉴权前置 | `miot/router.py`、`perception/router.py`、`rule/router.py`、`person/router.py`、`home_profile/router.py`、`task/router.py`、`task_record/router.py`、`admin/router.py`、`observability/router.py` |
-| **Service** | 业务编排，跨域协调 | `MiotService`（`miot/service.py`）、`PerceptionService`（`perception/service.py`）、`RuleService`（`rule/service.py`）、`PersonService`（`person/service.py`）、`HomeProfileService`（`home_profile/service.py`）、`TaskService`（`task/service.py`）、`TaskRecordService`（`task_record/service.py`） |
-| **Runner** | 异步后台循环，驱动持续任务 | `PerceptionRunner`（`perception/runner.py`）、`RuleRunner`（`rule/runner.py`）、`TerminateEvaluator`（`rule/terminate_evaluator.py`） |
-| **Repo** | 数据持久化，隔离 SQLite 细节 | `KVRepo` / `RuleRepo` / `PersonRepo` / `PerceptionLogRepo` / `TaskRepo` / `TokenUsageRepo`（`database/*.py`）、任务记录各 Repo（`task_record/repo.py`） |
-| **外部代理** | 封装第三方 API | `MiotProxy`（`miot/client.py`）、`PerceptionEngineProxy`（`perception/client.py`） |
+| 层           | 职责                               | 典型类（文件路径）                                                                                                                                                                                                                                                                                     |
+| ------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Router**   | 接收 HTTP 请求、参数校验、鉴权前置 | `miot/router.py`、`perception/router.py`、`rule/router.py`、`person/router.py`、`home_profile/router.py`、`task/router.py`、`task_record/router.py`、`admin/router.py`、`observability/router.py`                                                                                                      |
+| **Service**  | 业务编排，跨域协调                 | `MiotService`（`miot/service.py`）、`PerceptionService`（`perception/service.py`）、`RuleService`（`rule/service.py`）、`PersonService`（`person/service.py`）、`HomeProfileService`（`home_profile/service.py`）、`TaskService`（`task/service.py`）、`TaskRecordService`（`task_record/service.py`） |
+| **Runner**   | 异步后台循环，驱动持续任务         | `PerceptionRunner`（`perception/runner.py`）、`RuleRunner`（`rule/runner.py`）、`TerminateEvaluator`（`rule/terminate_evaluator.py`）                                                                                                                                                                  |
+| **Repo**     | 数据持久化，隔离 SQLite 细节       | `KVRepo` / `RuleRepo` / `PersonRepo` / `PerceptionLogRepo` / `TaskRepo` / `TokenUsageRepo`（`database/*.py`）、任务记录各 Repo（`task_record/repo.py`）                                                                                                                                                |
+| **外部代理** | 封装第三方 API                     | `MiotProxy`（`miot/client.py`）、`PerceptionEngineProxy`（`perception/client.py`）                                                                                                                                                                                                                     |
 
 `Manager`（`manager.py`）是进程内依赖注入中心，各 Router 通过统一入口取到单例实例。
 
@@ -86,11 +86,11 @@ miloco/
 
 `/health` 无需鉴权。语义是"不不健康"：
 
-| 返回 | 含义 |
-|------|------|
-| `200 {"status":"ok"}` | 无节点处于 FAILED 或 STALLED |
+| 返回                         | 含义                           |
+| ---------------------------- | ------------------------------ |
+| `200 {"status":"ok"}`        | 无节点处于 FAILED 或 STALLED   |
 | `503 {"status":"unhealthy"}` | 至少一个节点 FAILED 或 STALLED |
-| `503 {"status":"unknown"}` | 健康检查自身抛异常 |
+| `503 {"status":"unknown"}`   | 健康检查自身抛异常             |
 
 感知引擎 PREREQ_MISSING（Omni API Key 未配置或 ONNX 模型缺失）是预期等待态，`/health` 返回 200。节点详情通过 `/api/monitor/nodes`（需鉴权）查询。
 
@@ -147,17 +147,17 @@ CLI / Agent Skill
 
 ## 技术栈
 
-| 组件 | 技术 |
-|------|------|
-| Web 框架 | FastAPI + Uvicorn（单进程，不支持 multi-worker） |
-| 持久化 | SQLite（`miloco.db` 业务数据，18 张表，schema 见 `database/connector.py`；`observability.db` 性能追踪） |
-| 配置 | pydantic-settings，优先级：环境变量 > `$MILOCO_HOME/config.json` > `settings.yaml` > 代码默认值 |
-| MiOT | OAuth2 + 小米云 API + LAN OT 协议 + 摄像头 C 库 |
-| 感知 | OpenCV + ONNX Runtime（人体检测 + ReID）+ VLM（可配置） |
-| CLI | Click + httpx |
-| 插件 | TypeScript + OpenClaw Plugin SDK |
-| 前端 | React + Vite + Tailwind（由 SPA handler 伺服，无独立前端服务）；中英双语 i18n（`web/src/i18n/`，默认中文 / 可选英文） |
-| 包管理 | uv workspace（Python）/ pnpm（TypeScript） |
+| 组件     | 技术                                                                                                                  |
+| -------- | --------------------------------------------------------------------------------------------------------------------- |
+| Web 框架 | FastAPI + Uvicorn（单进程，不支持 multi-worker）                                                                      |
+| 持久化   | SQLite（`miloco.db` 业务数据，18 张表，schema 见 `database/connector.py`；`observability.db` 性能追踪）               |
+| 配置     | pydantic-settings，优先级：环境变量 > `$MILOCO_HOME/config.json` > `settings.yaml` > 代码默认值                       |
+| MiOT     | OAuth2 + 小米云 API + LAN OT 协议 + 摄像头 C 库                                                                       |
+| 感知     | OpenCV + ONNX Runtime（人体检测 + ReID）+ VLM（可配置）                                                               |
+| CLI      | Click + httpx                                                                                                         |
+| 插件     | TypeScript + OpenClaw Plugin SDK                                                                                      |
+| 前端     | React + Vite + Tailwind（由 SPA handler 伺服，无独立前端服务）；中英双语 i18n（`web/src/i18n/`，默认中文 / 可选英文） |
+| 包管理   | uv workspace（Python）/ pnpm（TypeScript）                                                                            |
 
 ---
 
@@ -165,12 +165,12 @@ CLI / Agent Skill
 
 所有 API 响应走统一 JSON 封装（`NormalResponse`）：
 
-| 状态码 | 触发场景 |
-|--------|---------|
-| `200` | 成功；业务错误也返回 200，靠 `code` 字段区分 |
-| `401` | Bearer token 缺失或无效（code=1003） |
-| `422` | 请求参数 Pydantic 校验失败（code=1002） |
-| `503` | 感知引擎未就绪；或 `server.token` 未配置时访问 SPA |
+| 状态码 | 触发场景                                           |
+| ------ | -------------------------------------------------- |
+| `200`  | 成功；业务错误也返回 200，靠 `code` 字段区分       |
+| `401`  | Bearer token 缺失或无效（code=1003）               |
+| `422`  | 请求参数 Pydantic 校验失败（code=1002）            |
+| `503`  | 感知引擎未就绪；或 `server.token` 未配置时访问 SPA |
 
 业务错误码（HTTP 200 + code）：常见 code 含义见 [故障排查 · 错误码速查](../06-dev-guide/troubleshooting.md#错误码速查)。
 
@@ -180,15 +180,15 @@ CLI / Agent Skill
 
 家庭面板是 React SPA，构建产物由 `spa_handler`（`main.py`）伺服，无需独立前端服务器。访问 `http://<host>:1810/` 即可使用，开发期 `pnpm dev` 启动 Vite dev server 自动代理 `/api` 到 backend。
 
-**五个主标签页**
+### 五个主标签页
 
-| 标签 | 内容 | 独有操作 |
-|------|------|---------|
-| **概览（now）** | 当前在家成员、摄像头状态卡（含直播入口）、感知暂停/恢复；MiOT/感知引擎状态条 | 实时摄像头直播、感知引擎启停 |
-| **设备（devices）** | 按房间展示设备列表、属性查询、开关/属性控制、场景触发 | 直接点击控制设备（无需 CLI） |
-| **家庭（family）** | 成员档案、正式家庭记忆、待审候选知识 | 人脸注册、成员管理 |
-| **日志（activity）** | 今日有价值事件流（规则命中、语音指令、建议），可回放视频片段 | — |
-| **模型（usage）** | LLM Token 用量统计（今日/近7天/近30天），含调用类型与模态构成饼图 | — |
+| 标签                 | 内容                                                                         | 独有操作                     |
+| -------------------- | ---------------------------------------------------------------------------- | ---------------------------- |
+| **概览（now）**      | 当前在家成员、摄像头状态卡（含直播入口）、感知暂停/恢复；MiOT/感知引擎状态条 | 实时摄像头直播、感知引擎启停 |
+| **设备（devices）**  | 按房间展示设备列表、属性查询、开关/属性控制、场景触发                        | 直接点击控制设备（无需 CLI） |
+| **家庭（family）**   | 成员档案、正式家庭记忆、待审候选知识                                         | 人脸注册、成员管理           |
+| **日志（activity）** | 今日有价值事件流（规则命中、语音指令、建议），可回放视频片段                 | —                            |
+| **模型（usage）**    | LLM Token 用量统计（今日/近7天/近30天），含调用类型与模态构成饼图            | —                            |
 
 **家庭切换器**：顶部 TopBar 中显示当前启用的家庭名，多家庭账号可在此切换——切换后后端单事务写 scope 并触发后台刷新，前端整页 reload。底部左侧显示米家账号登录状态，可在此绑定/解绑米家账号。
 

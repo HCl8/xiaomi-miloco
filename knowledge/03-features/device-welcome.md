@@ -61,14 +61,14 @@
 
 ### 核心模块
 
-| 类 | 文件 | 职责 |
-|---|---|---|
-| `MIoTMipsCloud` | `backend/miot/src/miot/mips_cloud.py` | paho-mqtt 客户端，MQTT v5 + TLS，自动重连，订阅用户 bind / 设备 meta / 场景事件主题 |
-| `BindEventListener` | `miot/mips_listeners.py` | bind 路径：trailing-edge 防抖 → 拉云端终态 → present 判断（present 委托 welcome，absent 即 unbind 丢弃） |
-| `DeviceMetaEventListener` | `miot/mips_listeners.py` | home-move 路径：处理 `hr_change`，设备移入受管家庭时同样委托 welcome |
-| `DeviceWelcomeService` | `miot/welcome_service.py` | 欢迎动作本体：scope gate、跨路径去重（一次到达若同时触发 bind 与 hr_change 只播报一次）、构造欢迎消息、调 `dispatch_event("bind", ...)` |
-| `MiotProxy` | `miot/client.py` | 持有各 listener 与 `DeviceWelcomeService` 生命周期，把 MQTT push 转给对应 listener |
-| `AgentDispatcher` | `dispatch/dispatcher.py` | bind 事件复用主交互会话，经 `run_agent_turn` 投递给 OpenClaw |
+| 类                        | 文件                                  | 职责                                                                                                                                    |
+| ------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `MIoTMipsCloud`           | `backend/miot/src/miot/mips_cloud.py` | paho-mqtt 客户端，MQTT v5 + TLS，自动重连，订阅用户 bind / 设备 meta / 场景事件主题                                                     |
+| `BindEventListener`       | `miot/mips_listeners.py`              | bind 路径：trailing-edge 防抖 → 拉云端终态 → present 判断（present 委托 welcome，absent 即 unbind 丢弃）                                |
+| `DeviceMetaEventListener` | `miot/mips_listeners.py`              | home-move 路径：处理 `hr_change`，设备移入受管家庭时同样委托 welcome                                                                    |
+| `DeviceWelcomeService`    | `miot/welcome_service.py`             | 欢迎动作本体：scope gate、跨路径去重（一次到达若同时触发 bind 与 hr_change 只播报一次）、构造欢迎消息、调 `dispatch_event("bind", ...)` |
+| `MiotProxy`               | `miot/client.py`                      | 持有各 listener 与 `DeviceWelcomeService` 生命周期，把 MQTT push 转给对应 listener                                                      |
+| `AgentDispatcher`         | `dispatch/dispatcher.py`              | bind 事件复用主交互会话，经 `run_agent_turn` 投递给 OpenClaw                                                                            |
 
 ### 关键设计决策
 
@@ -80,12 +80,12 @@
 
 ### 如果我要修改设备欢迎相关功能
 
-| 修改目标 | 去看哪个文件 |
-|---------|------------|
-| 修改防抖 / present 判断逻辑 | `miot/mips_listeners.py`（BindEventListener / DeviceMetaEventListener） |
-| 修改欢迎消息格式 / scope gate / 去重 | `miot/welcome_service.py`（DeviceWelcomeService） |
-| 修改 MQTT 连接参数 | `backend/miot/src/miot/mips_cloud.py`（MIoTMipsCloud） |
-| 查看 MQTT 连接状态 | `GET /api/miot/mips_status`（`miot/router.py`） |
+| 修改目标                             | 去看哪个文件                                                            |
+| ------------------------------------ | ----------------------------------------------------------------------- |
+| 修改防抖 / present 判断逻辑          | `miot/mips_listeners.py`（BindEventListener / DeviceMetaEventListener） |
+| 修改欢迎消息格式 / scope gate / 去重 | `miot/welcome_service.py`（DeviceWelcomeService）                       |
+| 修改 MQTT 连接参数                   | `backend/miot/src/miot/mips_cloud.py`（MIoTMipsCloud）                  |
+| 查看 MQTT 连接状态                   | `GET /api/miot/mips_status`（`miot/router.py`）                         |
 
 ### 与其他模块的关系
 
