@@ -243,33 +243,14 @@ def _render_device_spec(dev: dict) -> str:
 
 
 @device_group.command("catalog")
-@click.option(
-    "--cap", default=50, show_default=True, type=int, help="设备数上限"
-)
-@click.option(
-    "--capacity", default=7, show_default=True, type=int, help="每设备 LRU buffer 容量"
-)
-@click.option(
-    "--no-whitelist", is_flag=True, default=False, help="禁用白名单过滤（输出全量 spec）"
-)
-@click.option(
-    "--token-budget", default=5000, show_default=True, type=int, help="目录 token 预算"
-)
-def device_catalog(cap, capacity, no_whitelist, token_budget):
-    """生成 TSV 设备目录，供 plugin 注入到 system prompt。"""
-    from miloco_cli.catalog import build_catalog, load_whitelist
-    from miloco_cli.home_info import get_home_info
+def device_catalog():
+    """生成 TSV 设备目录——调后端 ``GET /api/miot/catalog`` 获取。"""
+    from miloco_cli.client import api_get
 
-    info = get_home_info()
-    whitelist = set() if no_whitelist else load_whitelist()
-    result = build_catalog(
-        info,
-        whitelist=whitelist,
-        cap=cap,
-        capacity=capacity,
-        token_budget=token_budget,
-    )
-    sys.stdout.write(result.text)
+    resp = api_get("/api/miot/catalog")
+    catalog = resp.get("data", {}).get("catalog", "")
+    if catalog:
+        sys.stdout.write(catalog)
 
 
 # ─── device refresh ───────────────────────────────────────────────────────────
@@ -278,13 +259,13 @@ def device_catalog(cap, capacity, no_whitelist, token_budget):
 @device_group.command("refresh")
 @click.option("--pretty", is_flag=True)
 def device_refresh(pretty):
-    """从后端拉取最新 home_info（触发后端刷新设备/摄像头/场景）。"""
+    """从后端拉取最新 home_info（触发后端刷新设备/摄像头/场景，并清除 catalog 缓存）。"""
     from miloco_cli.home_info import get_home_info
 
     info = get_home_info(refresh=True)
     print_result({
         "code": 0,
-        "message": "home_info refreshed",
+        "message": "home_info refreshed (backend catalog cache cleared)",
         "devices": len(info.get("devices", [])),
     }, pretty)
 

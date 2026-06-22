@@ -170,10 +170,7 @@ export const registerBeforePromptBuildHook: HookRegister = (api) => {
         if (pending) append.push(pending);
       }
 
-      // catalog 放最末（最易变）；CLI 失败回退空串则整段不出现。
-      // 套 ```text 围栏：catalog 是类 TSV 数据块，行首 `#` 是注释前缀而非 markdown
-      // 标题，裸贴会让 `# devices catalog` 在 `## 设备目录`(H2) 下被解析成 H1 倒挂。
-      const catalog = await getCatalog();
+      const catalog = await getCatalog(ctx?.sessionKey);
       if (catalog) append.push(`${DEVICE_CATALOG_INTRO}\n\n\`\`\`text\n${catalog}\n\`\`\``);
     }
 

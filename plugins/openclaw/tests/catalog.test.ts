@@ -1,20 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runShellMock } = vi.hoisted(() => ({ runShellMock: vi.fn() }));
+const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
 
-vi.mock("../src/utils/shell.js", () => ({
-  runShell: runShellMock,
-}));
-vi.mock("node:fs", () => ({
-  default: { statSync: vi.fn() },
-  statSync: vi.fn(),
+vi.stubGlobal("fetch", fetchMock);
+vi.mock("../src/utils/io.js", () => ({
+  readTextFileSync: () =>
+    JSON.stringify({ server: { url: "http://127.0.0.1:1810", token: "test-token" } }),
+  writeTextFileSync: vi.fn(),
 }));
 vi.mock("../src/utils/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import fs from "node:fs";
-import { _resetCatalogCache, getCatalog } from "../src/services/catalog.js";
+import { _resetCatalogCache, evictCatalogSession, getCatalog } from "../src/services/catalog.js";
+
+function mockCatalogResponse(text: string) {
+  fetchMock.mockResolvedValue({
+    ok: true,
+    json: () => Promise.resolve({ code: 0, data: { catalog: text } }),
+  });
+}
 
 describe("getCatalog", () => {
   beforeEach(() => {
@@ -22,120 +27,42 @@ describe("getCatalog", () => {
     vi.clearAllMocks();
   });
 
-  it("returns CLI stdout on first call", async () => {
-    (fs.statSync as any).mockReturnValue({ mtimeMs: 1000 });
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# devices catalog\nfoo|bar|c|d|online\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    expect(await getCatalog()).toContain("# devices catalog");
-    expect(runShellMock).toHaveBeenCalledWith(
-      "miloco-cli",
-      ["device", "catalog"],
-      expect.any(Object),
+  it("fetches catalog from backend with session_key", async () => {
+    mockCatalogResponse("# catalog\n");
+    const out = await getCatalog("session-1");
+    expect(out).toBe("# catalog\n");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1810/api/miot/catalog?session_key=session-1",
+      expect.objectContaining({ method: "GET" }),
     );
   });
 
-  it("uses cache within throttle window (5s)", async () => {
-    (fs.statSync as any).mockReturnValue({ mtimeMs: 1000 });
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# devices catalog\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    await getCatalog();
-    await getCatalog();
-    expect(runShellMock).toHaveBeenCalledTimes(1);
+  it("returns empty string on HTTP error", async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 500 });
+    expect(await getCatalog("session-1")).toBe("");
   });
 
-  it("regenerates after throttle window expires", async () => {
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# v1\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    (fs.statSync as any).mockReturnValue({ mtimeMs: 1000 });
-    await getCatalog();
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(Date.now() + 10_000));
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# v2\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    const out = await getCatalog();
-    vi.useRealTimers();
-    expect(out).toContain("v2");
-    expect(runShellMock).toHaveBeenCalledTimes(2);
+  it("returns empty string on network error", async () => {
+    fetchMock.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await getCatalog("session-1")).toBe("");
   });
 
-  it("regenerates after throttle even when home_info mtime unchanged (LRU update)", async () => {
-    (fs.statSync as any).mockReturnValue({ mtimeMs: 1000 });
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# before LRU touch\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    await getCatalog();
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(Date.now() + 10_000));
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# after LRU touch\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    const out = await getCatalog();
-    vi.useRealTimers();
-    expect(out).toContain("after LRU touch");
-    expect(runShellMock).toHaveBeenCalledTimes(2);
+  it("throttles within 5s when no sessionKey, returns cached result", async () => {
+    mockCatalogResponse("# v1\n");
+    await getCatalog(); // no sessionKey
+    const out = await getCatalog(); // throttled — should return cached
+    expect(out).toBe("# v1\n");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+});
 
-  it("falls back to old cache on CLI failure", async () => {
-    (fs.statSync as any).mockReturnValue({ mtimeMs: 1000 });
-    runShellMock.mockResolvedValue({
-      status: 0,
-      stdout: "# good\n",
-      stderr: "",
-      signal: null,
-      error: null,
-    });
-    expect(await getCatalog()).toContain("# good");
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(Date.now() + 10_000));
-    runShellMock.mockResolvedValue({
-      status: 1,
-      stdout: "",
-      stderr: "boom",
-      signal: null,
-      error: null,
-    });
-    const out = await getCatalog();
-    vi.useRealTimers();
-    expect(out).toContain("# good");
-  });
-
-  it("returns empty string when no cache and CLI fails", async () => {
-    (fs.statSync as any).mockReturnValue({ mtimeMs: 1000 });
-    runShellMock.mockResolvedValue({
-      status: 127,
-      stdout: "",
-      stderr: "command not found",
-      signal: null,
-      error: null,
-    });
-    expect(await getCatalog()).toBe("");
+describe("evictCatalogSession", () => {
+  it("sends DELETE request", async () => {
+    fetchMock.mockResolvedValue({ ok: true });
+    await evictCatalogSession("session-1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1810/api/miot/catalog/session-1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
   });
 });

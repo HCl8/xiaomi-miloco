@@ -7,6 +7,7 @@ MiOT service module
 
 import asyncio
 import logging
+import time
 
 from miot.types import (
     MIoTActionParam,
@@ -91,8 +92,56 @@ class MiotService:
         self._person_repo = person_repo
         self._lru = LRUStore(miot_proxy._kv_repo.db_connector)
 
+        # In-memory catalog cache: session_key → (timestamp_seconds, catalog_text)
+        self._catalog_cache: dict[str, tuple[float, str]] = {}
+        self._catalog_cache_max = 20
+        self._catalog_cache_ttl = 24 * 60 * 60  # 24h
+
     async def lru_snapshot(self) -> dict:
         return self._lru.load()
+
+    async def catalog_for_session(self, session_key: str | None = None) -> str:
+        """Build device catalog TSV with in-memory per-session caching.
+
+        session_key=None → rebuild every call (API default).
+        session_key set → check cache first (24h TTL, max 20 entries).
+
+        Returns plain text TSV; empty string on error.
+        """
+        from miloco.miot.catalog_render import build_catalog, load_whitelist
+
+        if session_key:
+            entry = self._catalog_cache.get(session_key)
+            if entry is not None:
+                ts, text = entry
+                if time.time() - ts < self._catalog_cache_ttl:
+                    return text
+                del self._catalog_cache[session_key]
+
+        try:
+            info = await self.get_home_info()
+            lru_state = self._lru.load()
+            whitelist = load_whitelist()
+            result = build_catalog(info, whitelist=whitelist, lru_state=lru_state)
+            text = result.text
+        except Exception:
+            logger.exception("catalog_for_session build failed")
+            return ""
+
+        if session_key:
+            if len(self._catalog_cache) >= self._catalog_cache_max:
+                oldest = min(self._catalog_cache, key=lambda k: self._catalog_cache[k][0])
+                del self._catalog_cache[oldest]
+            self._catalog_cache[session_key] = (time.time(), text)
+
+        return text
+
+    def clear_catalog_cache(self, session_key: str | None = None) -> None:
+        """Clear catalog cache. session_key=None → clear all."""
+        if session_key is None:
+            self._catalog_cache.clear()
+        else:
+            self._catalog_cache.pop(session_key, None)
 
     @property
     def _kv_repo(self):
@@ -142,6 +191,7 @@ class MiotService:
         self._kv_repo.delete(ScopeConfigKeys.HOME_WHITE_LIST_KEY)
         self._kv_repo.delete(ScopeConfigKeys.CAMERA_BLACK_LIST_KEY)
         self._lru.clear()
+        self._catalog_cache.clear()
 
     @property
     def miot_client(self):
@@ -273,6 +323,7 @@ class MiotService:
             result = await self._miot_proxy.refresh_devices()
             if not result:
                 raise MiotServiceException("Failed to refresh MiOT devices")
+            self._catalog_cache.clear()
             return True
         except Exception as e:
             logger.error("Failed to refresh MiOT devices: %s", e)
@@ -625,6 +676,7 @@ class MiotService:
                     self._miot_proxy.refresh_scenes(),
                     self._miot_proxy.refresh_cameras(),
                 )
+                self._catalog_cache.clear()
             data = await self._miot_proxy.get_home_info_data()
 
             # 家庭过滤：data 内的 devices/scenes 不带 home_id，借助原始 dict 反查
@@ -901,6 +953,9 @@ class MiotService:
         others = [h for h in target_list if h != home_id]
         if others:
             target_list, _ = set_homes_in_use(self._kv_repo, others, False)
+
+        # 家庭变了 → 全量 catalog 缓存已陈旧
+        self._catalog_cache.clear()
 
         # 后台异步刷新：设备/摄像头/场景列表需随家庭切换更新，但不必
         # 让 HTTP 响应等它们完成。设备列表/摄像头列表请求时兜底触发刷新。

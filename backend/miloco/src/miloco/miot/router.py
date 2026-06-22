@@ -295,6 +295,34 @@ async def get_device_history(current_user: str = Depends(verify_token)):
 
 
 @router.get(
+    path="/catalog",
+    summary="Get device catalog TSV for prompt injection",
+    response_model=NormalResponse,
+)
+async def get_catalog(
+    session_key: str | None = Query(None, description="session identifier for in-memory caching"),
+    current_user: str = Depends(verify_token),
+):
+    """Return catalog TSV text. Backend caches per session_key (24h TTL, max 20)."""
+    text = await manager.miot_service.catalog_for_session(session_key)
+    return NormalResponse(code=0, message="ok", data={"catalog": text})
+
+
+@router.delete(
+    path="/catalog/{session_key}",
+    summary="Clear cached catalog for a session",
+    response_model=NormalResponse,
+)
+async def delete_catalog_cache(
+    session_key: str,
+    current_user: str = Depends(verify_token),
+):
+    """Clear cached catalog entry. Called by plugin on session_end. Idempotent."""
+    manager.miot_service.clear_catalog_cache(session_key)
+    return NormalResponse(code=0, message="ok", data=None)
+
+
+@router.get(
     path="/devices/{did}/status",
     summary="Get device property status",
     response_model=NormalResponse,
