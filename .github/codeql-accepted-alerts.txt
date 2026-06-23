@@ -1,3 +1,3 @@
 # CodeQL 已评估并接受的告警清单（门禁从 base 分支读取，命中的 (rule_id, path) 跳过）。
 # 测试条目：zz-accepted-test.yml 故意触发 untrusted-checkout，验证门禁会跳过它。
-actions/untrusted-checkout/high .github/workflows/zz-accepted-test.yml
+actions/untrusted-checkout/critical .github/workflows/zz-accepted-test.yml
