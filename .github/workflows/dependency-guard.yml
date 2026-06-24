@@ -18,7 +18,8 @@ permissions:
   issues: read
 
 concurrency:
-  group: dependency-guard-${{ github.event.pull_request.number || github.event.issue.number }}
+  # 带 event_name：避免 issue_comment 的 reapprove run 与它重跑的 pull_request_target run 落入同一组而互相 cancel
+  group: dependency-guard-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
