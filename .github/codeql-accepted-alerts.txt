@@ -1,3 +1,8 @@
 # CodeQL 已评估并接受的告警清单（门禁从 base 分支读取，命中的 (rule_id, path) 跳过）。
-# 测试条目：zz-accepted-test.yml 故意触发 untrusted-checkout，验证门禁会跳过它。
+# 测试：接受 zz-*-test.yml 触发的全部规则，验证「全部已接受 → 门禁放行变绿」。
 actions/untrusted-checkout/critical .github/workflows/zz-accepted-test.yml
+actions/untrusted-checkout/critical .github/workflows/zz-blocked-test.yml
+actions/cache-poisoning/poisonable-step .github/workflows/zz-accepted-test.yml
+actions/cache-poisoning/poisonable-step .github/workflows/zz-blocked-test.yml
+actions/missing-workflow-permissions .github/workflows/zz-accepted-test.yml
+actions/missing-workflow-permissions .github/workflows/zz-blocked-test.yml
