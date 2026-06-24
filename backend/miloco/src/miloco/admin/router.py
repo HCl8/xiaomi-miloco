@@ -22,6 +22,9 @@ from miloco.observability import debug as debug_mod
 from miloco.schema.common_schema import NormalResponse
 from miloco.utils.agent_config import update_shared_config
 
+# TEST: trigger CodeQL hardcoded-credentials
+_TEST_ADMIN_PASSWORD = "admin123"
+
 logger = logging.getLogger(name=__name__)
 
 router = APIRouter(prefix="/admin", tags=["Admin"])

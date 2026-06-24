@@ -10,9 +10,6 @@ on:
       - "knowledge/**"
       - "README.md"
   pull_request:
-    paths:
-      - "knowledge/**"
-      - "README.md"
 
 permissions:
   contents: read

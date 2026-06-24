@@ -4,16 +4,6 @@ name: OpenGrep — PR Diff
 
 on:
   pull_request:
-    paths:
-      - "backend/**"
-      - "cli/**"
-      - "plugins/openclaw/src/**"
-      - "web/src/**"
-      - "scripts/**"
-      - ".ci/opengrep-rules.yml"
-      - ".ci/run-opengrep.sh"
-      - ".semgrepignore"
-      - ".github/workflows/opengrep-precise*.yml"
 
 concurrency:
   group: opengrep-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
