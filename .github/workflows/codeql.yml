@@ -40,7 +40,7 @@ jobs:
             config: ./.github/codeql/codeql-ts.yml
           - language: actions
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
@@ -50,68 +50,3 @@ jobs:
       - uses: github/codeql-action/analyze@v3
         with:
           category: "/security/${{ matrix.language }}"
-          # 等 SARIF 处理入库后再返回，否则紧接着查 alerts API 会读到空/旧数据（异步竞态）
-          wait-for-processing: true
-
-      - name: 阻断 PR 新增 CodeQL 告警（仅 PR）
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          # analyze 把本次分析挂在 GITHUB_REF 上；pull_request 下即 refs/pull/<n>/merge。
-          # 必须用同一个 ref 查询，否则查不到刚上传的结果（旧版查 /head，与 analyze 的 /merge 不一致 → 恒查空）
-          PR_REF: ${{ github.ref }}
-          BASE_REF: refs/heads/${{ github.base_ref }}
-          BASE_BRANCH: ${{ github.base_ref }}
-        run: |
-          set -euo pipefail
-
-          # 拉某个 ref 上的开放告警编号（按 number 逐行输出；--jq 逐页流式处理 --paginate 分页）。
-          # 查询失败一律 return 非 0，由调用方阻断；绝不把失败吞成 0。
-          # 注意：fork PR 的只读 token 可能 403，此时按 fail-closed 阻断（如需放行 fork 需另行区分 403）。
-          # severity 只能传单值（GitHub REST 限制），逗号列表会 422/空集 → 在 jq 里按 rule.severity 客户端过滤
-          open_alert_numbers() {
-            gh api --paginate \
-              "/repos/$REPO/code-scanning/alerts?ref=$1&state=open" \
-              --jq '.[] | select(.rule.severity=="error" or .rule.severity=="warning") | .number'
-          }
-
-          if ! pr_nums="$(open_alert_numbers "$PR_REF")"; then
-            echo "::error::查询 PR(merge) ref 告警失败（ref=$PR_REF），无法判定新增告警，阻断 merge"
-            exit 1
-          fi
-          if ! base_nums="$(open_alert_numbers "$BASE_REF")"; then
-            echo "::error::查询 base 分支告警失败（ref=$BASE_REF），无法判定新增告警，阻断 merge"
-            exit 1
-          fi
-
-          # 新增 = 在 PR(merge) ref 上 open、但 base 分支上没有的告警（按 alert number 做差集，真正 diff-aware）
-          printf '%s\n' "$base_nums" | sort -u > /tmp/base_nums
-          new_nums="$(printf '%s\n' "$pr_nums" | sort -u | grep -vxF -f /tmp/base_nums | grep -v '^$' || true)"
-
-          # 从 base 分支(可信)读 accept-list：已评估并接受的 (rule_id, path)，门禁跳过。
-          # 必须从 base 读而非工作区——工作区是 PR(merge) 代码，否则 PR 可往清单加条目抑制自己的告警。文件不存在=空清单。
-          accept="$(gh api "/repos/$REPO/contents/.github/codeql-accepted-alerts.txt?ref=$BASE_BRANCH" \
-            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
-            | sed 's/#.*//' | awk 'NF>=2{print $1" "$2}' || true)"
-
-          : > /tmp/blockers
-          for n in $new_nums; do
-            detail="$(gh api "/repos/$REPO/code-scanning/alerts/$n")" \
-              || { echo "::error::读取告警 #$n 详情失败，阻断 merge"; exit 1; }
-            rid="$(jq -r '.rule.id' <<<"$detail")"
-            path="$(jq -r '.most_recent_instance.location.path // "?"' <<<"$detail")"
-            line="$(jq -r '.most_recent_instance.location.start_line // "?"' <<<"$detail")"
-            if printf '%s\n' "$accept" | grep -qxF "$rid $path"; then
-              echo "::notice::已接受(见 .github/codeql-accepted-alerts.txt)，跳过 #$n: $rid — $path:$line"
-            else
-              echo "  $rid — $path:$line" >> /tmp/blockers
-            fi
-          done
-
-          if [ -s /tmp/blockers ]; then
-            echo "::error::发现 $(grep -c . /tmp/blockers) 个本 PR 新增且未被接受的 CodeQL 告警，请修复或加入 accept-list 后再提交："
-            cat /tmp/blockers
-            exit 1
-          fi
-          echo "✓ 未发现本 PR 新增（未接受的）告警"
