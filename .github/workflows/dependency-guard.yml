@@ -1,16 +1,13 @@
 # 依赖变更准入守卫：PR 改动锁文件 / 依赖清单时阻塞，需维护者评论
 # `/allow-dependencies-change <head_sha>` 放行。逻辑见 .ci/dependency-guard.mjs。
+# 放行机制见 dependency-guard-reapprove.yml：授权人评论后重跑本 workflow 的 guard run，带评论重判即翻绿。
 #
 # pull_request_target 在可信的 base 上下文运行；脚本只读 PR 元数据，不 checkout PR head 代码。
-# 放行机制：授权人评论后，issue_comment 路径重跑该 PR head 上的 guard run——重跑带着放行评论重新判定，
-# 把 PR head 上同名 check 刷绿。required check 用原生的 `Dependency Guard / guard` job，无需写 commit status。
 name: Dependency Guard
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-  issue_comment:
-    types: [created, edited]
 
 permissions:
   contents: read
@@ -18,13 +15,12 @@ permissions:
   issues: read
 
 concurrency:
-  # 带 event_name：避免 issue_comment 的 reapprove run 与它重跑的 pull_request_target run 落入同一组而互相 cancel
-  group: dependency-guard-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: dependency-guard-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   guard:
-    if: github.event_name == 'pull_request_target' && !github.event.pull_request.draft
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -43,37 +39,3 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           MILOCO_SECURITY_APPROVERS: ""
         run: node .ci/dependency-guard.mjs
-
-  # 授权人评论 /allow-dependencies-change → 重跑该 PR head 上的 guard run。
-  # 重跑会带着放行评论重新判定，把 head 上那条红 check 刷绿；
-  # 这样 required check 仍是原生的 `Dependency Guard / guard` job，无需 commit status，也不留残红。
-  reapprove:
-    if: >-
-      github.event_name == 'issue_comment'
-      && github.event.issue.pull_request != null
-      && startsWith(github.event.comment.body, '/allow-dependencies-change')
-      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write # 重跑 workflow run
-      contents: read
-      pull-requests: read
-    steps:
-      - name: 重跑 PR head 上的 dependency-guard
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.issue.number }}
-        run: |
-          HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-          # 取该 head SHA 上最近一次 pull_request_target 的 guard run
-          RUN_ID=$(gh api \
-            "repos/$REPO/actions/workflows/dependency-guard.yml/runs?event=pull_request_target&head_sha=$HEAD_SHA&per_page=1" \
-            --jq '.workflow_runs[0].id // empty')
-          if [ -z "$RUN_ID" ]; then
-            echo "::notice::未找到 head=$HEAD_SHA 的 pull_request_target run（可能尚未跑完），可重 push 触发"
-            exit 0
-          fi
-          echo "重跑 run $RUN_ID（带放行评论重新判定 head=$HEAD_SHA）"
-          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/rerun"
