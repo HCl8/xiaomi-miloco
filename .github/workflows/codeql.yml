@@ -5,12 +5,6 @@ name: CodeQL
 
 on:
   pull_request:
-    paths:
-      - "backend/**"
-      - "cli/**"
-      - "plugins/openclaw/**"
-      - "web/**"
-      - ".github/workflows/**"
   push:
     branches: [main]
     paths:
