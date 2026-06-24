@@ -5,11 +5,6 @@ name: CodeQL Quality
 
 on:
   pull_request:
-    paths:
-      - "backend/**"
-      - "cli/**"
-      - "plugins/openclaw/**"
-      - "web/**"
   schedule:
     - cron: "30 6 * * *"
 
