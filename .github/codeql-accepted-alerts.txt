@@ -1,0 +1,4 @@
+# CodeQL 已评估并接受的告警清单（门禁从 base 分支读取，命中的 (rule_id, path) 跳过）。
+# pr-review.yml 在 pull_request_target 下 checkout PR merge ref → untrusted-checkout(high)。
+# 已评估接受：只跑 base 上的 gate 脚本/命令，不可信 PR 代码经 dontAsk+命令白名单沙箱化。详见 PR #332。
+actions/untrusted-checkout/high .github/workflows/pr-review.yml
