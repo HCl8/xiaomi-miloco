@@ -28,4 +28,4 @@ jobs:
           context: .
           file: .ci/Dockerfile.pr-review
           push: true
-          tags: ghcr.io/xiaomi/xiaomi-miloco/pr-review:trixie
+          tags: ghcr.io/hcl8/xiaomi-miloco/pr-review:trixie

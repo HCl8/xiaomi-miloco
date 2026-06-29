@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: ghcr.io/xiaomi/xiaomi-miloco/pr-review:trixie
+      image: ghcr.io/hcl8/xiaomi-miloco/pr-review:trixie
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
