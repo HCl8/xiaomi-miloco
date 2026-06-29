@@ -380,19 +380,30 @@ PR 上始终只保留 1 条 review-pr-ci comment——多次跑 `--ci` 不累积
 
 把 **Step 8 完整输出**（不要复制模板，直接复用上面已经生成的内容）前缀上一行 `<!-- review-pr-ci -->` 作为 body。heredoc 用 `'EOF'` 引号防止 shell 解释 review body 里的反引号 / `$`。
 
-**分两步执行**——独立 Bash 调用，避免 `$()` 组合导致权限规则匹配失败：
+**分两步独立 Bash 调用**——每一步都干净地以 `gh api` 或 `jq` 开头，确保权限规则精准命中：
 
-1. 把 Step 8 完整输出（前缀 `<!-- review-pr-ci -->`）写入 `/tmp/review-body.md`：
+1. 查找已有 review-pr-ci comment 的 ID（无结果时输出空串）：
 ```bash
-cat > /tmp/review-body.md <<'EOF'
+gh api "/repos/XiaoMi/xiaomi-miloco/issues/$PR_ID/comments" --paginate | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .id] | .[0] // ""'
+```
+
+2. 根据第 1 步的输出，把 Step 8 完整输出（前缀 `<!-- review-pr-ci -->`）作为 body 发 PATCH（已有 id）或 POST（空 id）。heredoc 用 `'EOF'` 引号防止 shell 解释 review body 里的反引号 / `$`：
+```bash
+<如果第1步输出了数字 id>
+
+gh api -X PATCH "/repos/XiaoMi/xiaomi-miloco/issues/comments/<第1步输出的id>" -f body="$(cat <<'EOF'
 <!-- review-pr-ci -->
 <这里粘贴 Step 8 的完整输出，不要重写一遍>
 EOF
-```
+)"
 
-2. 查已有 comment ID，PATCH 更新（id 非空）否则 POST 新建。用 `||` 分流：
-```bash
-gh api "/repos/XiaoMi/xiaomi-miloco/issues/$PR_ID/comments" --paginate | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .id] | .[0] // ""' > /tmp/comment-id.txt && gh api -X PATCH "/repos/XiaoMi/xiaomi-miloco/issues/comments/$(cat /tmp/comment-id.txt)" -f body="$(cat /tmp/review-body.md)" 2>/dev/null || gh api -X POST "/repos/XiaoMi/xiaomi-miloco/issues/$PR_ID/comments" -f body="$(cat /tmp/review-body.md)"
+<如果第1步没有输出内容（空）>
+
+gh api -X POST "/repos/XiaoMi/xiaomi-miloco/issues/$PR_ID/comments" -f body="$(cat <<'EOF'
+<!-- review-pr-ci -->
+<这里粘贴 Step 8 的完整输出，不要重写一遍>
+EOF
+)"
 ```
 
 ### Step 10 — Cleanup（主动执行，仅默认 / `--post` 模式）
