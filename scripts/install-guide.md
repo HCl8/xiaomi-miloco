@@ -8,13 +8,13 @@ description: Miloco 安装引导入口，当用户说「安装 miloco」时激�
 ## 人工命令行安装
 
 ```bash
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash
+curl -LsSf https://github.com/HCl8/xiaomi-miloco/releases/latest/download/install.sh | bash
 ```
 
 安装程序会询问装给哪个 agent 平台（仅限直接终端执行时）。通过 `curl | bash` 管道安装时，加 `--agent-platform` 指定：
 
 ```bash
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-platform=hermes
+curl -LsSf https://github.com/HCl8/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-platform=hermes
 ```
 
 ## Agent 执行安装

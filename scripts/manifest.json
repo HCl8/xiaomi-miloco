@@ -1,10 +1,10 @@
 {
   "download": {
     "sites": [
-      "https://github.com/XiaoMi/xiaomi-miloco/releases/download",
-      "https://gh-proxy.com/https://github.com/XiaoMi/xiaomi-miloco/releases/download",
-      "https://gh-proxy.org/https://github.com/XiaoMi/xiaomi-miloco/releases/download",
-      "https://gh.idayer.com/https://github.com/XiaoMi/xiaomi-miloco/releases/download"
+      "https://github.com/HCl8/xiaomi-miloco/releases/download",
+      "https://gh-proxy.com/https://github.com/HCl8/xiaomi-miloco/releases/download",
+      "https://gh-proxy.org/https://github.com/HCl8/xiaomi-miloco/releases/download",
+      "https://gh.idayer.com/https://github.com/HCl8/xiaomi-miloco/releases/download"
     ]
   }
 }

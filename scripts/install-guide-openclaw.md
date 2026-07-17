@@ -16,7 +16,7 @@ metadata:
 **安装方式：**
 
 ```bash
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash
+curl -LsSf https://github.com/HCl8/xiaomi-miloco/releases/latest/download/install.sh | bash
 ```
 
 > **Windows 用户：** 当前不支持原生 Windows，请先安装 [WSL](https://learn.microsoft.com/zh-cn/windows/wsl/install)，在 WSL 终端中执行上述命令。
@@ -30,7 +30,7 @@ curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/inst
 ### 1.1 运行 Prepare
 
 ```bash
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare
+curl -LsSf https://github.com/HCl8/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare
 ```
 
 ### 1.2 解析输出
@@ -135,7 +135,7 @@ curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/inst
 根据 Step 2 收集到的信息组装命令：
 
 ```bash
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-finish \
+curl -LsSf https://github.com/HCl8/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-finish \
   --account-auth "<授权码>" \
   --omni-api-key "<API Key>" \
   --omni-model "xiaomi/mimo-v2.5" \
