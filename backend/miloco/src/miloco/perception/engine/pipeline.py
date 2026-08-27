@@ -19,6 +19,7 @@ from miloco.observability.context import (
 from miloco.observability.metrics_client import get_metrics_client
 from miloco.perception.engine.config import PerceptionConfig
 from miloco.perception.engine.gate.gate import run_gate
+from miloco.perception.engine.gate.visual_gate import VisualBaseline
 from miloco.perception.engine.identity.identity import run_identity
 from miloco.perception.engine.identity.tracking_service import TrackingService
 from miloco.perception.engine.omni.omni import (
@@ -34,9 +35,6 @@ from miloco.perception.engine.omni.omni_client import (
 )
 
 if TYPE_CHECKING:
-    import numpy as np
-    from numpy.typing import NDArray
-
     from miloco.perception.engine.identity.engine import IdentityEngine
     from miloco.perception.engine.types import IdentityPacket
 from miloco.perception.engine.types import (
@@ -390,7 +388,7 @@ async def run_batch_pipeline(
     on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
     assign_suggestion_link: "Callable[[str, Suggestion, float], bool] | None" = None,
     frame_index_offset: int = 0,
-    gate_prev_frames: "dict[str, NDArray[np.uint8]] | None" = None,
+    gate_prev_frames: "dict[str, VisualBaseline] | None" = None,
     gate_last_visual_pass_ts: "dict[str, float] | None" = None,
     gate_last_audio_pass_ts: "dict[str, float] | None" = None,
     gate_hold_active: "dict[str, bool] | None" = None,
@@ -411,7 +409,8 @@ async def run_batch_pipeline(
         get_identity_engine:  工厂回调 ``did -> IdentityEngine | None``。每个
                               device 一个 engine，状态隔离。返回 ``None`` 表示
                               该 device 退化为无 identity 模式（启动失败兜底）。
-        gate_prev_frames:     per-device 跨窗口基准帧字典（预处理后 448 灰度，
+        gate_prev_frames:     per-device 跨窗口 visual 基准（``VisualBaseline``：预处理后
+                              448 灰度帧 + 昼夜档 + 待切换计数）字典（
                               原地读写）。``None`` 时 prev_frame 恒为 None →
                               每窗 cold-start 放行，视觉 gate 永不因静止 skip，
                               hold 也失效。生产流式循环传共享 ``{}``（首窗自动
@@ -561,6 +560,10 @@ async def run_batch_pipeline(
         room_timing[f"_gate_video_score_{did}"] = gate_timing.video_score
         room_timing[f"_gate_audio_energy_{did}"] = gate_timing.audio_energy
         room_timing[f"_gate_speech_prob_{did}"] = gate_timing.speech_prob
+        # visual 结构判据诊断:verdict 是误报成因分解的主键,diag 是阈值标定的原料。
+        room_timing[f"_gate_video_verdict_{did}"] = gate_timing.video_verdict
+        room_timing[f"_gate_video_mode_{did}"] = gate_timing.video_mode
+        room_timing[f"_gate_visual_diag_{did}"] = gate_timing.video_diag
         # intra/cross 拆分 → 经 _merge_results 加 "{room}/" 前缀进 timing_detail JSON。
         room_timing[f"gate_video_intra_score_{did}"] = gate_timing.video_intra_score
         room_timing[f"gate_video_cross_score_{did}"] = gate_timing.video_cross_score

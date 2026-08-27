@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _TRACES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS traces (
@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS traces_device (
   gate_skipped      INTEGER DEFAULT 0,
   gate_video_score  REAL,
   gate_audio_energy REAL,
+  -- visual 结构判据诊断。verdict/mode 单独落列(误报成因分解 = GROUP BY verdict,
+  -- 塞进 JSON 就查不了);其余承重中间量走 gate_visual_diag JSON,免得每加一个判据
+  -- 就动一次 schema。
+  gate_video_verdict TEXT,
+  gate_video_mode    TEXT,
+  gate_visual_diag   TEXT,
   identity_ms       REAL,
   omni_ms                REAL,
   omni_error_code        TEXT,
@@ -281,9 +287,35 @@ def _migrate_v4_action_home(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v5_gate_visual_diag(conn: sqlite3.Connection) -> None:
+    """v4 → v5:给 traces_device 补 visual 结构判据的诊断列(幂等)。
+
+    gate 从裸帧差换成「多尺度 PCT + 结构判据」后,7 个承重阈值全靠线上分布标定,而
+    「本窗被哪一层拦下」是误报/漏报成因分解的主键——没有它就无法回答「误报里漫射光变
+    占多少、局部光变占多少」,也就无法判断方案的 v2/v3 该不该做。verdict/mode 单独落列
+    以便 GROUP BY;其余中间量走 JSON 一列,后续加判据不再动 schema。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(traces_device)")}
+    if "gate_video_verdict" not in cols:
+        conn.execute("ALTER TABLE traces_device ADD COLUMN gate_video_verdict TEXT")
+    if "gate_video_mode" not in cols:
+        conn.execute("ALTER TABLE traces_device ADD COLUMN gate_video_mode TEXT")
+    if "gate_visual_diag" not in cols:
+        conn.execute("ALTER TABLE traces_device ADD COLUMN gate_visual_diag TEXT")
+    # 成因分解的典型查询是「某时间段内按 verdict 分组计数」,故建 (verdict, timestamp)
+    # 复合索引。timestamp 是 v1 就有的列,但迁移跑在启动期——崩了整个服务起不来,所以按
+    # 列存在性保护而不是假定库的形状。
+    if "timestamp" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_td_verdict_ts "
+            "ON traces_device(gate_video_verdict, timestamp)"
+        )
+
+
 # 步进迁移注册表:{target_version: fn}。fn 只做 additive DDL,须幂等。
 _MIGRATIONS = {
     2: _migrate_v2_action_ledger,
     3: _migrate_v3_action_source,
     4: _migrate_v4_action_home,
+    5: _migrate_v5_gate_visual_diag,
 }

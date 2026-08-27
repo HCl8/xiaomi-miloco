@@ -32,6 +32,11 @@ class GateTrace:
     # 本窗 packet 由 hold 滞回拉起(visual 不通过、距上次 visual 通过 <= hold_duration_sec)。
     # 与 video_pass 互斥(hold 前置条件要求 visual 不通过);可与 audio_pass 共存。
     hold_pass: bool = False
+    # visual 结构判据诊断(见 engine/types.py GateTiming 同名字段)。verdict / mode 单独
+    # 落列以便 GROUP BY 做误报成因分解;其余中间量走 visual_diag JSON。
+    video_verdict: str | None = None
+    video_mode: str | None = None
+    visual_diag: dict[str, float] | None = None
 
     @property
     def passed(self) -> bool:
@@ -205,6 +210,12 @@ class DeviceTraceRecord:
             "gate_skipped": int(self.gate.skipped),
             "gate_video_score": self.gate.video_score,
             "gate_audio_energy": self.gate.audio_energy,
+            "gate_video_verdict": self.gate.video_verdict,
+            "gate_video_mode": self.gate.video_mode,
+            "gate_visual_diag": (
+                json.dumps(self.gate.visual_diag, ensure_ascii=False)
+                if self.gate.visual_diag is not None else None
+            ),
             "dropped_windows_count": self.dropped_windows_count,
             "overflow_count": self.overflow_count,
             "max_buffer_depth": self.max_buffer_depth,

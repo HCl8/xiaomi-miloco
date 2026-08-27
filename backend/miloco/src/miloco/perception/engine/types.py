@@ -77,6 +77,13 @@ class GateTiming:
     # 诊断用:cross >> intra 持续高,基本是 ISP 长周期漂移(AGC/IR/AWB)误判 motion。
     video_intra_score: float = 0.0
     video_cross_score: float = 0.0
+    # visual 结构判据的诊断出口。verdict = 本窗最终被哪一层/哪个尺度拦下(成因分解的主键,
+    # 单独落列供 GROUP BY);mode = 昼/夜档;diag = 其余承重中间量(PCT 三判据原始值、结构
+    # 响应占比、候选块统计、旧裸帧差对照),按 JSON 落一列,不为每个量单独建列。
+    # 阈值标定完全依赖这些分布,见方案 §3.5。
+    video_verdict: str = ""
+    video_mode: str = ""
+    video_diag: dict[str, float] | None = None
 
     @property
     def total_ms(self) -> float:

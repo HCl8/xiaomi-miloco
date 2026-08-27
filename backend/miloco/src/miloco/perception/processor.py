@@ -680,6 +680,14 @@ class PipelineProcessor:
             ga_raw = timing.get(f"_gate_audio_energy_{did}")
             gate_video_score = float(gv_raw) if isinstance(gv_raw, (int, float)) else None
             gate_audio_energy = float(ga_raw) if isinstance(ga_raw, (int, float)) else None
+            # visual 结构判据诊断。on-demand bypass / cycle 异常 fallback 路径没跑真实
+            # gate,这几个键缺失 → 落 NULL,与 video_score 同口径(分布视图过滤掉)。
+            vd_raw = timing.get(f"_gate_video_verdict_{did}")
+            vm_raw = timing.get(f"_gate_video_mode_{did}")
+            diag_raw = timing.get(f"_gate_visual_diag_{did}")
+            gate_video_verdict = vd_raw if isinstance(vd_raw, str) and vd_raw else None
+            gate_video_mode = vm_raw if isinstance(vm_raw, str) and vm_raw else None
+            gate_visual_diag = diag_raw if isinstance(diag_raw, dict) else None
 
             device_records.append(DeviceTraceRecord(
                 device_trace_id=dt_id,
@@ -698,6 +706,9 @@ class PipelineProcessor:
                     video_pass=gvp, audio_pass=gap, skipped=gate_skipped,
                     video_score=gate_video_score, audio_energy=gate_audio_energy,
                     hold_pass=ghp,
+                    video_verdict=gate_video_verdict,
+                    video_mode=gate_video_mode,
+                    visual_diag=gate_visual_diag,
                 ),
                 identity=None if gate_skipped else IdentityTrace(ms=identity_ms),
                 # error_code 时,即使 gate timing 缺失(整 batch 早死)也算"omni 被尝试且失败",

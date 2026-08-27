@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from miloco.perception.engine.gate.visual_gate import VisualBaseline
 from miloco.perception.engine.identity.tier_u import cam_id_from_device_id
 from miloco.perception.engine_base import BasePerceptionEngine
 from miloco.perception.types import (
@@ -305,7 +306,7 @@ class PerceptionEngine(BasePerceptionEngine):
         # 拾音关闭已打过 INFO 的相机集合（防每窗刷屏；重新开启时移除、下次关闭再打）
         self._mic_off_logged: set[str] = set()
         # 上一窗口末次被检帧（gate 预处理后的 448 灰度），visual gate 跨窗口比较用
-        self._gate_prev_frames: dict[str, NDArray[np.uint8]] = {}   # key: device_id
+        self._gate_prev_frames: dict[str, VisualBaseline] = {}   # key: device_id
         # visual / audio 最近通过的 monotonic ts,喂 gate hold 判定。
         # visual 用于 hold 资格(spec Section 3.1);audio 仅落 traces 不参与判定。
         self._gate_last_visual_pass_ts: dict[str, float] = {}       # key: device_id
