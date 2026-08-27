@@ -76,6 +76,8 @@ async def run_gate(
     t = time.monotonic()
     visual = await asyncio.to_thread(
         evaluate_visual, frames, config, config.check_fps, prev_frame,
+        # 调试落盘的文件名标签:device + 窗口结束时间,离线据此对齐 omni 描述当标签。
+        f"{input_slice.device.did}_{int(input_slice.end_timestamp)}",
     )
     visual_changed = visual.changed
     visual_score = visual.max_score
@@ -146,7 +148,14 @@ async def run_gate(
             "struct_ratio": visual.diag.struct_ratio,
             "light_block_ratio": visual.diag.light_block_ratio,
             "env_block_ratio": visual.diag.env_block_ratio,
+            "offset_sign_coh": visual.diag.offset_sign_coh,
+            "offset_shift_cv": visual.diag.offset_shift_cv,
+            "offset_std_delta": visual.diag.offset_std_delta,
+            "offset_rejected": float(visual.diag.offset_rejected),
             "env_duty_max": visual.diag.env_duty_max,
+            "env_blink_max": visual.diag.env_blink_max,
+            "env_blink_at_block": visual.diag.env_blink_at_block,
+            "env_duty_at_block": visual.diag.env_duty_at_block,
             "env_cov_max": visual.diag.env_cov_max,
             "block_count": float(visual.diag.block_count),
             "max_block_ratio": visual.diag.max_block_ratio,

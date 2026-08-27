@@ -290,6 +290,11 @@ class PctThresholds:
     """
 
     residual_k: float
+    # 残差预算里的**对比度正比项**系数。仿射模型自身的近似误差与信号幅度成正比(边缘重采样、
+    # 编码量化在高梯度处更大、gamma 非线性),不是噪声——纯噪声阈值会把高对比区的完美拟合也判
+    # 成不一致。真机实测:std≈47 的块残差 3.3~7.4(仅占对比度 7~16%,r²>0.99),而纯噪声阈值只
+    # 有 2.1 → 判据①永不成立、PCT 从未命中。
+    residual_rel: float
     ncc_tau: float
     texture_k: float
     neighbor_k: float
@@ -358,8 +363,9 @@ def pct_from_moments(
     texture = float(np.sqrt(max(0.0, m_aa - m_a * m_a)))
     texture_b = float(np.sqrt(var_b))
     floor = thr.texture_k * frame_scale
+    budget = thr.residual_k * noise_scale + thr.residual_rel * texture
     is_light = (
-        resid_rms <= thr.residual_k * noise_scale
+        resid_rms <= budget
         and ncc > thr.ncc_tau
         and texture >= floor
         and texture_b >= floor
@@ -498,12 +504,21 @@ def pct_blocks(
 
     tol = thr.neighbor_k * frame_scale
     floor = thr.texture_k * frame_scale
+    budget = thr.residual_k * noise_scale + thr.residual_rel * std_a
     trusted = (
-        (resid_rms <= thr.residual_k * noise_scale)
+        (resid_rms <= budget)
         & (ncc > thr.ncc_tau)
         & (std_a >= floor)
         & (std_b >= floor)  # 双侧:见 pct_from_moments 判据③(否则均匀物体压掉纹理块)
     )
+    # ⚠️ 覆盖率门控**只作用于救援路径**,不作用于 trusted。
+    #
+    # 这道门原本是为救援加的:被低对比物体部分覆盖的块,若其均值恰好落进邻块光照变换的容差里
+    # 就会被"推断"成光变、于是物体被从边缘啃掉。那是**推断**出来的结论,需要额外证据。
+    #
+    # 但 trusted 块是用**自己的像素**直接证明了①②③的,不需要这道门;而它对细长结构是结构性
+    # 一刀切:一条 21px 宽的竖带穿过 28px 的网格单元,几何上最多只能覆盖 21/28=75%,实测因边缘
+    # 抗锯齿只有 0.4~0.58 → **任何比网格单元窄的细长结构都过不了**,无论它是不是光变。
     is_light = trusted.copy()
 
     # 不可信块(①②在低 SNR 下空洞,或双侧纹理有一边不达标)只能靠可信块的光照变换定量预测。
@@ -516,16 +531,80 @@ def pct_blocks(
             predicted = (np.abs(m_b - (at * m_a + bt)) <= tol) & (
                 np.abs(std_b - at * std_a) <= tol
             )
-            is_light |= candidate & predicted
-
-    # 覆盖率门控:响应不铺满整块的,一律不许按光变抑制(那是物体的形状,不是光的形状)。
-    is_light &= suppressible
+            # 救援是**推断**,故受覆盖率门控约束(见上方说明)。
+            is_light |= candidate & predicted & suppressible
 
     return (
         is_light,
         (resid_rms / np.maximum(noise_scale, _MIN_SIGMA)).astype(np.float32),
         ncc.astype(np.float32),
     )
+
+
+class OffsetTest(NamedTuple):
+    """加性偏移判据的结果 + 三个原始量(全部落 trace,阈值靠它们的分布标定)。"""
+
+    is_offset: bool
+    sign_coherence: float
+    shift_cv: float
+    std_delta: float
+
+
+def additive_offset_test(
+    gray_a: NDArray[np.uint8],
+    gray_b: NDArray[np.uint8],
+    blob_mask: NDArray[np.uint8],
+    *,
+    scale: float,
+    coh_min: float,
+    cv_max: float,
+    std_delta_k: float,
+    min_px: int,
+) -> OffsetTest:
+    """判「这个候选块的变化是不是一次纯加性光度偏移」。是 → 不是事件,不该触发。
+
+    # 为什么需要它(真机证据)
+
+    C700 安静机位的主要误报源是 **H.264 宏块带状伪影**:平滑低对比区(std≈9~11)里一条又高又
+    窄的竖带,整条带的重建电平**一次阶跃 ±13~17 灰度级**后保持稳定,位置固定在宏块列边界
+    (实测 4 次都落在同一处 (289,140),尺寸 17~19×83~84)。它的幅度正好卡在本判据阈值(≈7)与
+    旧裸帧差阈值(25)之间——旧 gate 漏掉它不是因为更聪明,是因为阈值高。
+
+    这本该由 PCT 判据①(仿射一致)抓住,但①跑在**固定网格单元**上:变化区比单元窄时,单元内混了
+    「变了的 56%」与「没变的 44%」两群像素,单一仿射映射拟合不了(理论残差 13.6×√(.56×.44)=6.75,
+    实测 6.30,而预算只有 4.47)→ ①永远不成立。改成只在响应像素上拟合也只能把残差压到 4.19、
+    仍差一根头发(边界上的部分位移像素自带 ±4.2 离散度)。
+
+    所以换成**直接在候选块自己的响应像素上**问三个更鲁棒的问题——无量纲、与网格无关:
+
+    - **符号一致性**:``|P(D>0) − 0.5|·2``。光度偏移让整块朝同一方向移动;结构变化(物体盖住
+      背景)必然双向——物体比背景亮处变亮、暗处变暗。实测光度型 **1.000**、结构型 **≤0.348**,
+      0.35~1.0 之间 58 个样本里**一个都没有**。
+    - **位移变异系数**:``std(D)/|mean(D)|``。纯加性偏移的位移近乎常数;真实物体的位移
+      ``= 物体 − 背景``,随背景纹理波动。实测光度型 **0.279~0.394**、结构型 **1.803~3436**。
+      这一条同时挡住「整体比背景亮的均匀物体」(深色墙前的白衬衫)——那种情形符号也是一致的,
+      但位移随背景起伏、变异系数高。
+    - **标准差守恒**:``|std(B)−std(A)|`` 小。纯加性偏移**必然保持标准差**(物理上精确);
+      「均匀物体盖住有纹理背景」会让 std 大幅下降,据此排除。
+
+    三条都满足才判加性偏移。任一不满足 → 放行(宁误不漏)。
+    """
+    m = blob_mask.astype(bool)
+    if int(m.sum()) < min_px:
+        return OffsetTest(False, 0.0, 0.0, 0.0)
+    a = gray_a[m].astype(np.float32)
+    b = gray_b[m].astype(np.float32)
+    d = b - a
+    coh = abs(float((d > 0).mean()) - 0.5) * 2.0
+    mu = abs(float(d.mean()))
+    cv = float(d.std()) / max(mu, _EPS)
+    sd = abs(float(b.std()) - float(a.std()))
+    is_offset = (
+        coh >= coh_min
+        and cv <= cv_max
+        and sd <= std_delta_k * max(scale, _MIN_SIGMA)
+    )
+    return OffsetTest(is_offset, coh, cv, sd)
 
 
 def saturation_mean(bgr: NDArray[np.uint8]) -> float:

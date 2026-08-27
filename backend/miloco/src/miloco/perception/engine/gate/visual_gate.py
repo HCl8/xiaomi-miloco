@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -41,6 +42,7 @@ from miloco.perception.engine.gate.photometric import (
     FrameFeat,
     PctResult,
     PctThresholds,
+    additive_offset_test,
     frame_features,
     frame_moments,
     noise_sigma,
@@ -52,7 +54,11 @@ from miloco.perception.engine.gate.photometric import (
     temporal_scale,
 )
 
+logger = logging.getLogger(__name__)
+
 _DIFF_SIZE = (448, 448)
+# 调试落盘计数(进程内),受 GateConfig.gate_debug_dump_max 限制。
+_dump_count = 0
 _MASK_TOTAL_PX = _DIFF_SIZE[0] * _DIFF_SIZE[1]
 
 MODE_DAY = "day"
@@ -72,6 +78,9 @@ VERDICT_LIGHT_FRAME = "light_frame"  # PCT@全帧 判漫射光变(开灯/AGC/IR 
 VERDICT_LIGHT_BLOCKS = "light_blocks"
 # 响应全部落在「持续变化源」块里(OSD 水印/摆动线缆/风扇/屏幕)。与 blocks_rejected 分桶:
 # 前者说明抑制层真的在干活,后者只说明块不合格——分不开就无法判断这一层的收益。
+# 候选块的变化是一次**纯加性光度偏移**(真机主要误报源=H.264 宏块带状伪影)。与 light_* 分桶:
+# 前者是 PCT 在网格上判的,后者是直接在候选块自己的响应像素上判的——真机上恰恰是后者才抓得住。
+VERDICT_OFFSET_ONLY = "offset_only"
 VERDICT_ENV_SUPPRESSED = "env_suppressed"
 VERDICT_BLOCKS_REJECTED = "blocks_rejected"  # 有响应、非光变,但无合格块(面积/紧凑度)
 VERDICT_TRIGGER = "trigger"  # 放行
@@ -87,9 +96,30 @@ _VERDICT_RANK = {
     VERDICT_NO_STRUCTURE: 1,
     VERDICT_LIGHT_FRAME: 2,
     VERDICT_LIGHT_BLOCKS: 3,
-    VERDICT_ENV_SUPPRESSED: 4,
-    VERDICT_BLOCKS_REJECTED: 5,
+    VERDICT_OFFSET_ONLY: 4,
+    VERDICT_ENV_SUPPRESSED: 5,
+    VERDICT_BLOCKS_REJECTED: 6,
 }
+
+
+class _OffsetParams(NamedTuple):
+    """加性偏移判据的参数组(昼夜共用)。"""
+
+    enabled: bool
+    coh_min: float
+    cv_max: float
+    std_delta_k: float
+    min_px: int
+
+
+def _offset_params(config: GateConfig) -> _OffsetParams:
+    return _OffsetParams(
+        enabled=config.offset_test_enabled,
+        coh_min=config.offset_coh_min,
+        cv_max=config.offset_cv_max,
+        std_delta_k=config.offset_std_delta_k,
+        min_px=config.offset_min_px,
+    )
 
 
 class _EnvParams(NamedTuple):
@@ -172,7 +202,9 @@ def _env_update(
     amp: NDArray[np.float32],
     env: _EnvParams,
     grid: int,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+) -> tuple[
+    NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]
+]:
     """按**抑制之前**的逐块响应更新占空比与幅度基线(方案 §7.2 定死的顺序)。
 
     顺序反了会自我拆台:一旦开始抑制,被抑制块的响应归零 → 占空比掉下去 → 抑制解除 → 又开始
@@ -195,11 +227,28 @@ def _env_update(
         prev_duty = np.zeros((grid, grid), np.float32)
         prev_amp = np.zeros((grid, grid), np.float32)
 
+    prev_active = (
+        baseline.prev_active
+        if baseline is not None and baseline.prev_active is not None
+        and baseline.prev_active.shape == (grid, grid)
+        else np.zeros((grid, grid), np.float32)
+    )
+    prev_blink = (
+        baseline.blink
+        if baseline is not None and baseline.blink is not None
+        and baseline.blink.shape == (grid, grid)
+        else np.zeros((grid, grid), np.float32)
+    )
+
     active = (cov >= env.active_cov).astype(np.float32)
     a = env.duty_alpha
     duty = (1.0 - a) * prev_duty + a * active
     amp_base = np.where(active > 0, (1.0 - a) * prev_amp + a * amp, prev_amp)
-    return duty.astype(np.float32), amp_base.astype(np.float32)
+    # blink:活跃状态的翻转率。用 |active - prev_active| 而非 duty 的一阶差分——后者会被
+    # EMA 平滑掉,恰好抹掉「高频闪烁」这个唯一的信号。
+    blink = (1.0 - a) * prev_blink + a * np.abs(active - prev_active)
+    return (duty.astype(np.float32), amp_base.astype(np.float32),
+            blink.astype(np.float32), active)
 
 
 class _Band(NamedTuple):
@@ -217,6 +266,7 @@ class _Band(NamedTuple):
     pct: PctThresholds
     block_grid: int
     env: _EnvParams
+    offset: _OffsetParams
 
 
 def _band_for(config: GateConfig, mode: str) -> _Band:
@@ -231,6 +281,7 @@ def _band_for(config: GateConfig, mode: str) -> _Band:
             min_block_ratio=config.night_min_block_ratio,
             pct=PctThresholds(
                 residual_k=config.night_pct_residual_k,
+                residual_rel=config.pct_residual_rel,
                 ncc_tau=config.night_pct_ncc_tau,
                 texture_k=config.night_pct_texture_k,
                 neighbor_k=config.night_pct_neighbor_k,
@@ -239,6 +290,7 @@ def _band_for(config: GateConfig, mode: str) -> _Band:
             ),
             block_grid=config.pct_block_grid,
             env=_env_params(config),
+            offset=_offset_params(config),
         )
     return _Band(
         check_fps=config.check_fps,
@@ -250,6 +302,7 @@ def _band_for(config: GateConfig, mode: str) -> _Band:
         min_block_ratio=config.min_block_ratio,
         pct=PctThresholds(
             residual_k=config.pct_residual_k,
+            residual_rel=config.pct_residual_rel,
             ncc_tau=config.pct_ncc_tau,
             texture_k=config.pct_texture_k,
             neighbor_k=config.pct_neighbor_k,
@@ -258,6 +311,7 @@ def _band_for(config: GateConfig, mode: str) -> _Band:
         ),
         block_grid=config.pct_block_grid,
         env=_env_params(config),
+        offset=_offset_params(config),
     )
 
 
@@ -285,6 +339,14 @@ class VisualBaseline:
     # 「本窗幅度显著超过 amp_base」,而不是靠占空比本身(方案 §7.4:后者方向是反的)。
     duty: NDArray[np.float32] | None = None
     amp_base: NDArray[np.float32] | None = None
+    # blink:该块「活跃状态发生翻转」的 EMA 频率(SuBSENSE 的 blinking-pixel / dynamic-entropy
+    # 同构)。**与 duty 数的是不同的东西,方向也相反**:duty 数「是不是活跃」,人站着不动会把它
+    # 顶到最高(实测 0.87)而编码伪影只有 0.28 —— 方向反了,这正是 duty 层被真机证伪的原因;
+    # blink 数「活跃↔不活跃切换了多少次」,人长驻切换少(实测 0.025),伪影闪烁切换多(0.438)。
+    # 现阶段**只测不用**:落 trace 供标定,不参与任何抑制决策。
+    blink: NDArray[np.float32] | None = None
+    # 上窗的逐块活跃布尔(float 0/1),blink 需要它才能算「翻转」。
+    prev_active: NDArray[np.float32] | None = None
 
 
 @dataclass(frozen=True)
@@ -330,10 +392,20 @@ class VisualDiag:
     light_block_ratio: float = 0.0
     # 被「持续变化源」抑制掉的块占比。这一层的收益直接看它 + env_suppressed 桶的计数。
     env_block_ratio: float = 0.0
+    # 加性偏移判据在「最大候选块」上的三个原始量(阈值靠它们的分布标定)+ 被它剔掉的块数。
+    offset_sign_coh: float = 0.0
+    offset_shift_cv: float = 0.0
+    offset_std_delta: float = 0.0
+    offset_rejected: int = 0
     # 最热块的占空比与响应覆盖率。抑制层不生效时,只看 env_block_ratio=0 分不出是「占空比没
     # 爬上来」还是「爬上来了但被显著性解除」——必须同时看这两个量。
     env_duty_max: float = 0.0
     env_cov_max: float = 0.0
+    # blink 统计(只测不用,见 VisualBaseline.blink)。``env_blink_at_block`` 是**承重的那个**:
+    # 全图 max 会被任意一个闪烁块占满,标定需要的是「触发的那一块历史上闪不闪」。
+    env_blink_max: float = 0.0
+    env_blink_at_block: float = 0.0
+    env_duty_at_block: float = 0.0
     # 候选块统计
     block_count: int = 0
     max_block_ratio: float = 0.0
@@ -367,6 +439,7 @@ def evaluate_visual(
     config: GateConfig,
     input_fps: int = 1,
     prev_frame: NDArray[np.uint8] | VisualBaseline | None = None,
+    dump_tag: str = "",
 ) -> VisualEvalResult:
     """判本窗画面有没有真实变动。
 
@@ -481,12 +554,30 @@ def evaluate_visual(
         np.max(np.stack(amps), axis=0)
         if amps else np.zeros((grid, grid), np.float32)
     )
-    duty, amp_base = _env_update(baseline, win_cov, win_amp, band_env, grid)
+    duty, amp_base, blink, active = _env_update(
+        baseline, win_cov, win_amp, band_env, grid
+    )
     duty_max = float(duty.max()) if duty.size else 0.0
     cov_max = float(win_cov.max()) if win_cov.size else 0.0
+    blink_max = float(blink.max()) if blink.size else 0.0
+    # 合格斑块**覆盖到的所有网格块**上的 duty/blink 最大值。标定要的是「这一处历史上闪不闪」,
+    # 不是全图 max —— 人横穿画面时路径上每块都翻转,全图 max 立刻顶满(实测长驻用例下
+    # blink_max == duty_max == 0.97),分不开任何东西。
+    # ⚠️ 也不能只取 bbox **左上角**所在的那一块:斑块跨若干块,而角点所在块通常是覆盖最少的
+    # 那个,常常根本没到 active_cov(实测活跃块是 (5,4)(6,3)(6,4)(7,4) 而角点落在 (5,3),
+    # 读出来恒为 0)。
+    blink_at = duty_at = 0.0
+    if best_diag.max_block_w > 0 and blink.size:
+        bs = _DIFF_SIZE[0] / grid
+        r0 = int(min(grid - 1, best_diag.max_block_y // bs))
+        c0 = int(min(grid - 1, best_diag.max_block_x // bs))
+        r1 = int(min(grid, (best_diag.max_block_y + best_diag.max_block_h) // bs + 1))
+        c1 = int(min(grid, (best_diag.max_block_x + best_diag.max_block_w) // bs + 1))
+        blink_at = float(blink[r0:r1, c0:c1].max())
+        duty_at = float(duty[r0:r1, c0:c1].max())
     new_baseline = VisualBaseline(
         frame=grays[-1], mode=mode, pending_switch=pending, diff_scale=scale,
-        duty=duty, amp_base=amp_base,
+        duty=duty, amp_base=amp_base, blink=blink, prev_active=active,
     )
 
     # cold-start:无跨窗基准时静止画面所有判据都归零,会被当无变化丢掉,导致开机已存在的
@@ -497,7 +588,7 @@ def evaluate_visual(
     else:
         verdict = VERDICT_TRIGGER if changed else best_diag.verdict
 
-    return VisualEvalResult(
+    result = VisualEvalResult(
         changed=changed,
         max_score=max_score,
         intra_max=intra_max,
@@ -507,8 +598,12 @@ def evaluate_visual(
             best_diag, verdict=verdict, mode=mode, raw_scale=raw_scale,
             checked_frames=len(grays), pair_count=len(pairs),
             env_duty_max=duty_max, env_cov_max=cov_max,
+            env_blink_max=blink_max, env_blink_at_block=blink_at,
+            env_duty_at_block=duty_at,
         ),
     )
+    _maybe_dump(config, grays, baseline, result, frames[0] if frames else None, dump_tag)
+    return result
 
 
 class _PairOutcome(NamedTuple):
@@ -627,13 +722,15 @@ def _evaluate_pair(
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    n_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+    n_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
     count = 0
     max_ratio = 0.0
     max_fill = 0.0
     max_box = (0, 0, 0, 0)
+    offset_rejected = 0
+    off_diag = None
     for i in range(1, n_labels):  # 0 是背景
         area = int(stats[i, cv2.CC_STAT_AREA])
         bw = int(stats[i, cv2.CC_STAT_WIDTH])
@@ -641,6 +738,19 @@ def _evaluate_pair(
         ratio = area / _MASK_TOTAL_PX
         fill = area / (bw * bh) if bw * bh > 0 else 0.0
         if ratio < band.min_block_ratio or fill < band.min_fill_ratio:
+            continue
+        # 加性偏移判据:直接在这个块自己的响应像素上问「是不是一次纯光度偏移」。
+        # 放在连通域**之后**是关键——它避免了 PCT@分块 的网格对不齐问题(变化区比网格单元窄时,
+        # 单元内混了变了/没变两群像素,单一仿射映射必然拟合不了)。这里的作用域正是候选块本身。
+        off = additive_offset_test(
+            a.gray, b.gray, (labels == i).astype(np.uint8), scale=scale,
+            coh_min=band.offset.coh_min, cv_max=band.offset.cv_max,
+            std_delta_k=band.offset.std_delta_k, min_px=band.offset.min_px,
+        )
+        if off_diag is None or ratio > max_ratio:
+            off_diag = off
+        if off.is_offset and band.offset.enabled:
+            offset_rejected += 1
             continue
         count += 1
         if ratio > max_ratio:
@@ -653,7 +763,16 @@ def _evaluate_pair(
         diag, block_count=count, max_block_ratio=max_ratio, max_block_fill=max_fill,
         max_block_x=max_box[0], max_block_y=max_box[1],
         max_block_w=max_box[2], max_block_h=max_box[3],
+        offset_rejected=offset_rejected,
+        offset_sign_coh=off_diag.sign_coherence if off_diag else 0.0,
+        offset_shift_cv=off_diag.shift_cv if off_diag else 0.0,
+        offset_std_delta=off_diag.std_delta if off_diag else 0.0,
     )
+    if count == 0 and offset_rejected > 0:
+        # 合格块全被加性偏移判据剔掉 → 归因给它,而不是笼统的「块不合格」。
+        return _PairOutcome(
+            False, _replace_diag(diag, verdict=VERDICT_OFFSET_ONLY), blk_cov, blk_amp
+        )
     if count == 0:
         # 无合格块。若响应的大部分本就是被某个抑制层拿掉的,就归因给那一层而不是「块不合格」——
         # 否则「持续源被压掉 + 别处几个残留噪点」会被记进噪点桶,成因分解看不出抑制层的收益。
@@ -692,12 +811,61 @@ def _frame_thresholds(block_thr: PctThresholds) -> PctThresholds:
     """
     return PctThresholds(
         residual_k=block_thr.residual_k,
+        residual_rel=block_thr.residual_rel,
         ncc_tau=block_thr.ncc_tau,
         texture_k=0.0,
         neighbor_k=block_thr.neighbor_k,
         light_coverage_min=block_thr.light_coverage_min,
         ncc_evidence_k=block_thr.ncc_evidence_k,
     )
+
+
+def _maybe_dump(
+    config: GateConfig,
+    grays: list[NDArray[np.uint8]],
+    baseline: VisualBaseline | None,
+    result: VisualEvalResult,
+    ref_bgr: NDArray[np.uint8] | None,
+    dump_tag: str,
+) -> None:
+    """把触发窗的**输入**落盘,供离线逐阶段复现(见 config.gate_debug_dump_dir)。
+
+    只存输入(抽检灰度帧 + 上窗基准 + 全分辨率参考帧 + diag),不存中间结果:各阶段在本地用
+    同一份代码重跑,改可视化不必重新部署,复现路径也与线上严格一致。
+
+    **落全部窗,不只落触发窗**:只落触发窗的样本是有偏的——看不到「本判据漏了而别的判据能抓到」
+    的窗,也量不出误报的真实下降,在那种样本上调阈值等于自欺。dump_tag 带 device 与窗口结束
+    时间,离线才能把 omni 的描述对齐成标签(用真看过视频的 VLM 当真值,而不是拿旧算法当参照)。
+    """
+    global _dump_count
+    if not config.gate_debug_dump_dir:
+        return
+    if _dump_count >= config.gate_debug_dump_max:
+        return
+    try:
+        import json
+        import time as _time
+        from dataclasses import asdict
+        from pathlib import Path
+
+        out = Path(config.gate_debug_dump_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = dump_tag or f"{int(_time.time() * 1000)}"
+        np.savez_compressed(
+            out / f"{stamp}.npz",
+            grays=np.stack(grays),
+            prev=(baseline.frame if baseline is not None else np.zeros((0, 0), np.uint8)),
+        )
+        payload = asdict(result.diag)
+        payload["changed"] = bool(result.changed)
+        (out / f"{stamp}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1)
+        )
+        if ref_bgr is not None and ref_bgr.size > 0:
+            cv2.imwrite(str(out / f"{stamp}_ref.jpg"), ref_bgr)
+        _dump_count += 1
+    except Exception:  # 调试路径绝不能影响主流程
+        logger.debug("gate debug dump failed", exc_info=True)
 
 
 def _raw_scale(

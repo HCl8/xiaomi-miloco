@@ -80,10 +80,11 @@ def _lit(img: np.ndarray, alpha: float, half: bool = False) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _with_person(img: np.ndarray) -> np.ndarray:
+def _with_person(img: np.ndarray, dx: int = 0) -> np.ndarray:
+    """dx 让人在窗间微动 —— blink 的用例需要「持续活跃」而非「一次性出现后静止」。"""
     out = img.copy()
-    cv2.rectangle(out, (520, 330), (610, 590), (55, 60, 75), -1)
-    cv2.circle(out, (565, 305), 32, (95, 105, 130), -1)
+    cv2.rectangle(out, (520 + dx, 330), (610 + dx, 590), (55, 60, 75), -1)
+    cv2.circle(out, (565 + dx, 305), 32, (95, 105, 130), -1)
     return out
 
 
@@ -455,15 +456,20 @@ class TestPersistentSourceSuppression:
     def _watermark(img: np.ndarray, sec: int) -> np.ndarray:
         """左上角固定位置的持续变化区，模拟 OSD 时间水印 / 屏幕这类源。
 
-        整块底色随秒位交替（不只是单个数字变）：真机水印只有秒位一个字符跳变时，缩到 448
-        网格后约占 0.07% 面积，远低于 min_block_ratio(0.5%)、根本形不成块——那测不到抑制
-        机制。这里让固定区整块变化到能成块（≈1.3% 面积），才是这一层要抑制的目标形态。
+        固定区内一个亮块左右交替（形状变化）：真机水印只有秒位一个字符跳变时，缩到 448 网格
+        后约占 0.07% 面积，远低于 min_block_ratio(0.5%)、根本形不成块——那测不到抑制机制。
+        这里让变化区达到能成块的面积（≈1.3%）。
         """
         out = img.copy()
-        shade = 30 if sec % 2 == 0 else 70
-        cv2.rectangle(out, (20, 20), (330, 60), (shade, shade, shade), -1)
+        cv2.rectangle(out, (20, 20), (330, 60), (30, 30, 30), -1)
         cv2.putText(out, f"2026/08/27 13:20:{sec:02d}", (26, 52),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (245, 245, 245), 2)
+        # 固定区内左右交替一个亮块 = **形状**变化。
+        # 不能改成「整块底色明暗交替」:那在数学上是一次完美的仿射映射(两个灰度级必被两参数
+        # 仿射拟合),PCT@分块 会正确地把它当局部光变压掉,于是测不到本层。真实水印变的是数字
+        # 字形——形状变化非仿射,PCT 压不掉,正是需要本层的那类源。
+        x = 40 if sec % 2 == 0 else 190
+        cv2.rectangle(out, (x, 24), (x + 130, 56), (200, 200, 200), -1)
         return out
 
     def _run_stream(self, cfg, n_windows, rng, *, person_at=None):
@@ -527,3 +533,80 @@ class TestPersistentSourceSuppression:
         res = self._run_stream(cfg, 40, rng)
         assert any(r.changed for r in res[-8:])
         assert res[-1].diag.env_block_ratio == 0.0
+
+
+class TestBlinkStatistic:
+    """blink(活跃状态翻转率)的**方向**必须与 duty 相反。
+
+    这是 SuBSENSE 的 blinking-pixel / dynamic-entropy 在本实现里的对应量。为什么需要它:
+    duty 数「该块是不是活跃」,真机实测**人站着不动 duty 冲到 0.87 而编码带状伪影只有
+    0.28** —— 方向是反的,这正是 duty 抑制层被真机证伪的根因。blink 数「活跃↔不活跃翻转了
+    多少次」:人长驻只在进/出各翻一次(实测 0.025),偶发伪影反复翻(实测 0.438)。
+
+    ⚠️ 断言必须用 ``env_blink_at_block`` 而不是全图 ``env_blink_max``:人横穿画面时路径上
+    每个块都会翻转,全图 max 立刻顶满(实测长驻用例下 blink_max == duty_max == 0.97),这个
+    统计量分不开任何东西。承重的是「触发的那一块历史上闪不闪」。
+
+    ⚠️ 这里用合成流是**恰当的**:blink 是纯时间统计量。之前记过「合成 fixture 在 fill/coh/
+    stdA 上是负资产」——那是因为 `cv2.rectangle` 把「矩形性」直接编码进了被测量的那个性质;
+    时间维度上不存在这个问题,活跃序列的形状就是被断言的语义本身。
+    """
+
+    def _stream(self, cfg, n_windows, rng, *, flicker_every=None, person_from=None):
+        """flicker_every: 每 k 窗出现一次的偶发源(→ 高 blink)。
+        person_from: 从第 k 窗起持续存在并每窗微动的人(→ 高 duty、低 blink)。
+        """
+        room = _room()
+        base = None
+        out = []
+        for w in range(n_windows):
+            f = room.copy()
+            if flicker_every and w % flicker_every == 0 and w > 0:
+                cv2.rectangle(f, (300, 250), (400, 350), (200, 205, 215), -1)
+            frames = []
+            for i in range(9):
+                g = f
+                if person_from is not None and w >= person_from:
+                    # 步长按块尺寸反推:active_cov=0.25 要求 28px 块内 25% 像素响应
+                    # → 448 空间约 7px 位移 → 1280 空间约 20px。步长小于它则该块永不"活跃",
+                    # duty 恒为 0(踩过:dx=3 时 duty 只有 0.004)。
+                    g = _with_person(f, dx=22 * (i % 4))   # 原地小幅摆动,不横扫全帧
+                frames.append(_noisy(g, rng))
+            r = evaluate_visual(frames, cfg, input_fps=3, prev_frame=base)
+            base = r.last_checked
+            out.append(r)
+        return out
+
+    def test_sporadic_source_has_high_blink_low_duty(self):
+        """偶发源:活跃/不活跃反复翻转 → blink 高。"""
+        cfg = GateConfig()
+        res = self._stream(cfg, 36, np.random.default_rng(31), flicker_every=6)
+        d = res[-1].diag
+        d = next((r.diag for r in reversed(res) if r.diag.max_block_w > 0), d)
+        assert d.env_blink_at_block > 0.25, (
+            f"偶发源触发块的 blink 应显著,实际 {d.env_blink_at_block}"
+        )
+        assert d.env_blink_at_block >= d.env_duty_at_block * 0.5, (
+            f"偶发源 blink 不应远低于 duty: "
+            f"blink={d.env_blink_at_block} duty={d.env_duty_at_block}"
+        )
+
+    def test_persistent_activity_has_high_duty_low_blink(self):
+        """人长驻:只在进入时翻一次 → duty 高而 blink 低。**方向与 duty 层相反的证据。**"""
+        cfg = GateConfig()
+        res = self._stream(cfg, 36, np.random.default_rng(32), person_from=4)
+        d = res[-1].diag
+        assert d.env_duty_at_block > 0.7, (
+            f"长驻活动触发块的 duty 应高,实际 {d.env_duty_at_block}"
+        )
+        assert d.env_blink_at_block < d.env_duty_at_block * 0.5, (
+            f"长驻活动的 blink 必须显著低于 duty: "
+            f"blink={d.env_blink_at_block} duty={d.env_duty_at_block}"
+        )
+
+    def test_blink_measured_even_when_env_mask_disabled(self):
+        """默认(env_mask_enabled=False)下也必须照常统计 —— 现阶段就是只测不用。"""
+        cfg = GateConfig(env_mask_enabled=False)
+        res = self._stream(cfg, 20, np.random.default_rng(33), flicker_every=5)
+        assert res[-1].diag.env_blink_max > 0.0
+        assert res[-1].diag.env_block_ratio == 0.0, "只测不用:不得产生任何抑制"
