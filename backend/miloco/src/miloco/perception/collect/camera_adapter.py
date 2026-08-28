@@ -30,6 +30,7 @@ from miloco.miot.client import MiotProxy
 from miloco.miot.schema import CameraInfo
 from miloco.node_monitor import NodeName, get_monitor
 from miloco.perception.collect.adapter_base import BaseDeviceAdapter
+from miloco.perception.collect.raw_capture import RawCapture
 from miloco.perception.collect.stream_buffer import (
     MultiTrackSyncBuffer,
     StreamFragment,
@@ -103,6 +104,8 @@ class _CameraDeviceState:
     # Clock calibration: epoch_delta = unix_ms - monotonic_ms (locked on first frame)
     # Used to convert monotonic wall_ms to unix timestamps for display.
     epoch_delta: int | None = None
+    # 调试:裸 H.264 抓取(默认 None=未开启)。见 collect/raw_capture.py。
+    raw_capture: "RawCapture | None" = None
 
 
 class CameraDeviceAdapter(BaseDeviceAdapter):
@@ -271,6 +274,10 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         except Exception as e:
             logger.error("Failed to subscribe decoded audio for %s: %s", did, e)
 
+        # 调试通道:裸 H.264 抓取。放在解码流订阅**之后**,这样即使 raw 注册失败/崩溃,
+        # 感知主路径已经订上、不受影响。raw 与 decode 是两路独立 multi_reg 注册。
+        await self._maybe_start_raw_capture(did, physical_did, channel, state)
+
         # 两路流都没订上 = camera_img_manager 缺失（典型：登录时相机 LAN 未就绪，
         # refresh_cameras 没建成 manager，start_*_stream 返回 -1 静默失败）。保留该
         # device 只会让 active_sources 报「已连」假象，且 did 留在 _devices 使后续
@@ -283,6 +290,39 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 did,
             )
             return
+
+    async def _maybe_start_raw_capture(
+        self, did: str, physical_did: str, channel: int, state: "_CameraDeviceState"
+    ) -> None:
+        """按配置开启裸码流抓取。任何失败都只记日志,绝不影响拉流。"""
+        cfg = get_settings().perception.collect
+        if not cfg.raw_capture_dir:
+            return
+        wanted = [s.strip() for s in cfg.raw_capture_dids.split(",") if s.strip()]
+        if wanted and did not in wanted and physical_did not in wanted:
+            return
+        try:
+            cap = RawCapture(did, cfg.raw_capture_dir, cfg.raw_capture_seconds)
+        except Exception as e:
+            logger.error("raw capture init failed for %s: %s", did, e)
+            return
+        state.raw_capture = cap
+
+        async def _cb(*args: object) -> None:
+            cap.feed(*args)
+            if cap.done:
+                # 到时自动注销:抓取是一次性的,不该长期占着一路 raw 注册。
+                try:
+                    await self._miot_proxy.stop_camera_raw_stream(physical_did, channel)
+                except Exception as e:
+                    logger.error("raw capture unregister failed for %s: %s", did, e)
+
+        try:
+            await self._miot_proxy.start_camera_raw_stream(physical_did, channel, _cb)
+        except Exception as e:
+            logger.error("raw capture subscribe failed for %s: %s", did, e)
+            cap.close()
+            state.raw_capture = None
 
     async def disconnect_device(self, did: str) -> None:
         state = self._devices.pop(did, None)
@@ -307,6 +347,13 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 )
             except Exception as e:
                 logger.error("Failed to unsubscribe decoded audio for %s: %s", did, e)
+
+        if state.raw_capture is not None and not state.raw_capture.done:
+            state.raw_capture.close()
+            try:
+                await self._miot_proxy.stop_camera_raw_stream(physical_did, channel)
+            except Exception as e:
+                logger.error("Failed to unsubscribe raw video for %s: %s", did, e)
 
         state.sync_buffer.clear()
 

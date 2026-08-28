@@ -301,6 +301,19 @@ class PerceptionCollectSettings(BaseModel):
     full_action: str = Field(
         default="clear", description="窗口满载处理策略（drop/clear/keep）"
     )
+    # ↓ 调试通道:抓相机裸 H.264 码流到磁盘,供离线取运动矢量。默认关闭。
+    # 判据「真实运动有 MV、量化带状伪影没有」只在**相机自己那次编码**的码流里成立;
+    # 我们收到的是已解码帧,伪影此时已烘进像素,重编一遍证明不了任何事。
+    raw_capture_dir: str = Field(
+        default="", description="调试:裸 H.264 抓取输出目录;空 = 关闭"
+    )
+    raw_capture_seconds: int = Field(
+        default=20, description="调试:每路裸码流抓取秒数（到时自动注销）"
+    )
+    raw_capture_dids: str = Field(
+        default="",
+        description="调试:只抓这些 did（逗号分隔）;空 = 所有相机。抓完请把 dir 改回空。",
+    )
 
 
 class PerceptionSettings(BaseModel):

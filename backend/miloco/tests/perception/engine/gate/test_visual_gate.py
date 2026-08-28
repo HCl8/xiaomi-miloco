@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import pytest
 from miloco.perception.engine.config import GateConfig
+from miloco.perception.engine.gate import visual_gate as visual_gate_module
 from miloco.perception.engine.gate.visual_gate import (
     _DIFF_SIZE,
     MODE_DAY,
@@ -610,3 +611,51 @@ class TestBlinkStatistic:
         res = self._stream(cfg, 20, np.random.default_rng(33), flicker_every=5)
         assert res[-1].diag.env_blink_max > 0.0
         assert res[-1].diag.env_block_ratio == 0.0, "只测不用:不得产生任何抑制"
+
+
+class TestDumpOnDisagree:
+    """``gate_debug_dump_on_disagree`` 只落新旧判定不一致的窗。
+
+    为什么需要这一档:``gate_debug_dump_max`` 是全局计数、只在重启时归零,落全部窗时夜里一小时
+    就用光配额。实测 03:37~06:08 出现的 19 个夜间分歧窗一个都没留下帧,导致无法人工核实。
+    """
+
+    def _dump(self, tmp_path, on_disagree, a, b, *, rng=None):
+        cfg = GateConfig(
+            gate_debug_dump_dir=str(tmp_path),
+            gate_debug_dump_max=50,
+            gate_debug_dump_on_disagree=on_disagree,
+        )
+        rng = rng or np.random.default_rng(41)
+        base = evaluate_visual([_noisy(a, rng)] * 3, cfg, input_fps=3).last_checked
+        r = evaluate_visual([_noisy(b, rng) for _ in range(6)], cfg, input_fps=3,
+                            prev_frame=base)
+        return r, sorted(p.name for p in tmp_path.glob("*.json"))
+
+    def test_agreement_not_dumped(self, tmp_path, monkeypatch):
+        """静止窗:两者都不放行 → 不是分歧 → 不落盘。"""
+        monkeypatch.setattr(visual_gate_module, "_dump_count", 0, raising=False)
+        room = _room()
+        r, files = self._dump(tmp_path, True, room, room)
+        assert not r.changed
+        assert r.diag.legacy_diff_score < GateConfig().change_threshold
+        assert files == [], f"一致的窗不该落盘,实际落了 {files}"
+
+    def test_disagreement_dumped(self, tmp_path, monkeypatch):
+        """小面积运动:新判据触发而旧裸帧差低于阈值 → 分歧 → 落盘。"""
+        monkeypatch.setattr(visual_gate_module, "_dump_count", 0, raising=False)
+        room = _room()
+        moved = room.copy()
+        cv2.rectangle(moved, (300, 250), (430, 330), (95, 120, 175), -1)
+        r, files = self._dump(tmp_path, True, room, moved)
+        assert r.changed
+        assert r.diag.legacy_diff_score < GateConfig().change_threshold
+        assert len(files) == 1, f"分歧窗必须落盘,实际 {files}"
+
+    def test_disabled_dumps_everything(self, tmp_path, monkeypatch):
+        """关掉该档 → 恢复「落全部窗」(标定阈值分布需要无偏样本)。"""
+        monkeypatch.setattr(visual_gate_module, "_dump_count", 0, raising=False)
+        room = _room()
+        r, files = self._dump(tmp_path, False, room, room)
+        assert not r.changed
+        assert len(files) >= 1, "关掉后静止窗也应落盘"

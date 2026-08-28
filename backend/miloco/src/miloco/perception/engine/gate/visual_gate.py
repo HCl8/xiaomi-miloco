@@ -833,6 +833,8 @@ def _maybe_dump(
     只存输入(抽检灰度帧 + 上窗基准 + 全分辨率参考帧 + diag),不存中间结果:各阶段在本地用
     同一份代码重跑,改可视化不必重新部署,复现路径也与线上严格一致。
 
+    ``gate_debug_dump_on_disagree`` 打开时只落**新旧判定不一致**的窗(见 :func:`_is_disagreement`)。
+
     **落全部窗,不只落触发窗**:只落触发窗的样本是有偏的——看不到「本判据漏了而别的判据能抓到」
     的窗,也量不出误报的真实下降,在那种样本上调阈值等于自欺。dump_tag 带 device 与窗口结束
     时间,离线才能把 omni 的描述对齐成标签(用真看过视频的 VLM 当真值,而不是拿旧算法当参照)。
@@ -841,6 +843,8 @@ def _maybe_dump(
     if not config.gate_debug_dump_dir:
         return
     if _dump_count >= config.gate_debug_dump_max:
+        return
+    if config.gate_debug_dump_on_disagree and not _is_disagreement(config, result):
         return
     try:
         import json
@@ -866,6 +870,19 @@ def _maybe_dump(
         _dump_count += 1
     except Exception:  # 调试路径绝不能影响主流程
         logger.debug("gate debug dump failed", exc_info=True)
+
+
+def _is_disagreement(config: GateConfig, result: VisualEvalResult) -> bool:
+    """新判据与旧裸帧差是否给出了不同结论。
+
+    落盘取样用:需要人工核实的恰恰是分歧窗——新拦旧放=新增漏报,新放旧拦=新增触发。
+
+    ``cold_start`` / ``mode_switch`` 不是真正的判定(前者无条件放行以建立基准,后者吞掉一窗
+    重建基准),把它们算成分歧会白占配额。
+    """
+    if result.diag.verdict in (VERDICT_COLD_START, VERDICT_MODE_SWITCH):
+        return False
+    return result.changed != (result.diag.legacy_diff_score >= config.change_threshold)
 
 
 def _raw_scale(
