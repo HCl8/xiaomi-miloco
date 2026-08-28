@@ -165,6 +165,25 @@ class GateConfig:
     offset_std_a_max: float = 35.0   # 底座纹理守卫:伪影长在平滑区(≤31.4),真实光度事件在高纹理(≥34.7)
     offset_min_px: int = 100         # 太小的块统计不可靠 → 不判(放行)
 
+    # ---- 光变抑制的召回回补(2026-08-28)----
+    # PCT 光变抑制会把「光漂 + 背景微动」窗整体吞掉:办公室/客厅这类场景里曝光/白平衡慢漂
+    # 占主导,人在背景里的挪动只是块内一小部分响应,分块 PCT 把它们连同光变一起判成 light,
+    # 连 blocks_rejected 桶都进不去。而旧 gate 靠「0.5% 像素超 25 灰阶」的高面积敏感度恰好
+    # 放行这些窗——新 gate 相对旧 gate 出现的唯一系统性召回缺口就是这一片。
+    #
+    # 回补规则:窗内存在某帧对被光变/无合格块压制,但该对的 legacy_diff_score ≥ floor
+    # (旧 gate 会放行)且 struct_ratio < max_struct_ratio(不是整幅光变),则整窗放行,
+    # verdict=light_relaxed。
+    #
+    # max_struct_ratio=0.1 由真机分歧库 40 窗实测:争议带 struct_ratio 0.012~0.045,真正的
+    # 整幅光变(α=0.2/0.88/0.91,PCT 既有收益)0.52~0.97,中间 **10 倍空隙**。代价:
+    # 争议带里 dpf 盲检约 4 成无实际变化(旧 gate 本来也在消费它们,不产生假事件,只多跑
+    # VLM);收益:dpf 确认的真实背景移动不再被拦(D2 方向)。
+    light_relax_enabled: bool = True
+    light_relax_legacy_floor: float = 0.005      # 旧 gate 的放行阈:legacy 达标才回补
+    light_relax_max_struct_ratio: float = 0.1    # 超过视为整幅光变,维持抑制
+    light_relax_min_comp_ratio: float = 0.0015   # 抑制前响应里至少要有这么大的连通结构(排除散点噪声)
+
     # ---- 调试落盘(定位误报用,默认关)----
     # 非空则把**触发窗**的输入落盘:448 灰度抽检帧序列 + 上窗基准帧 + 全分辨率参考帧 + diag。
     # 只存输入不存中间结果——中间各阶段在本地用同一份代码复现,这样改可视化不必重新部署,

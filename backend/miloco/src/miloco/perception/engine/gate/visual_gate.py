@@ -84,6 +84,7 @@ VERDICT_OFFSET_ONLY = "offset_only"
 VERDICT_ENV_SUPPRESSED = "env_suppressed"
 VERDICT_BLOCKS_REJECTED = "blocks_rejected"  # 有响应、非光变,但无合格块(面积/紧凑度)
 VERDICT_TRIGGER = "trigger"  # 放行
+VERDICT_LIGHT_RELAXED = "light_relaxed"  # 光变抑制被召回回补解除(见 config.light_relax_*)
 VERDICT_LEGACY_DIFF = "legacy_diff"  # visual_algo="diff" 回退路径
 
 # 同一窗多个帧对各有判定时,报**响应最大**的那一对(见 evaluate_visual 里的 best 逻辑),
@@ -99,6 +100,7 @@ _VERDICT_RANK = {
     VERDICT_OFFSET_ONLY: 4,
     VERDICT_ENV_SUPPRESSED: 5,
     VERDICT_BLOCKS_REJECTED: 6,
+    VERDICT_LIGHT_RELAXED: 7,
 }
 
 
@@ -400,6 +402,9 @@ class VisualDiag:
     offset_std_delta: float = 0.0
     offset_std_a: float = 0.0
     offset_rejected: int = 0
+    # 形态学后最大连通域占比(不过面积/紧凑度门槛)。count=0 的窗里它非零说明「有结构、
+    # 只是不到一块的门槛」——召回回补的必要条件。
+    max_comp_ratio: float = 0.0
     # 最热块的占空比与响应覆盖率。抑制层不生效时,只看 env_block_ratio=0 分不出是「占空比没
     # 爬上来」还是「爬上来了但被显著性解除」——必须同时看这两个量。
     env_duty_max: float = 0.0
@@ -543,6 +548,26 @@ def evaluate_visual(
 
     max_score = max(intra_max, cross_max)
 
+    # 光变抑制的召回回补:被光变/无合格块压制的帧对里,若有 legacy 已达旧 gate 放行阈、
+    # 且 struct_ratio 未达整幅光变量级的,整窗放行。语义 = 新 gate 是旧 gate 的严格超集,
+    # 唯独整幅光变例外(那是 PCT 的既有收益)。env_suppressed / offset_only 是各抑制层的
+    # 明确裁决,不参与回补。
+    if not changed and config.light_relax_enabled:
+        for outcome in outcomes:
+            d = outcome.diag
+            if d.verdict not in (VERDICT_LIGHT_FRAME, VERDICT_LIGHT_BLOCKS, VERDICT_BLOCKS_REJECTED):
+                continue
+            if (
+                d.legacy_diff_score >= config.light_relax_legacy_floor
+                and d.struct_ratio < config.light_relax_max_struct_ratio
+                and d.max_comp_ratio >= config.light_relax_min_comp_ratio
+            ):
+                changed = True
+                best_diag = _replace_diag(d, verdict=VERDICT_LIGHT_RELAXED)
+                break
+
+    max_score = max(intra_max, cross_max)
+
     # 占空比统计取窗内**各块的最大**覆盖率/幅度(抑制之前的量):窗内任一帧对该块活跃就算活跃,
     # 否则 16 个帧对里只有一半跨过水印跳变时,占空比会被没跳变的那些对稀释到阈值以下。
     band_env = _env_params(config)
@@ -590,6 +615,10 @@ def evaluate_visual(
         verdict = VERDICT_COLD_START
     else:
         verdict = VERDICT_TRIGGER if changed else best_diag.verdict
+        if changed and best_diag.verdict == VERDICT_LIGHT_RELAXED:
+            # 回补放行在 trace 里保留独立桶——它是「光漂+微动」争议带的放行计数,
+            # 混进 trigger 就量不到这条语义改动的实际发生率了。
+            verdict = VERDICT_LIGHT_RELAXED
 
     result = VisualEvalResult(
         changed=changed,
@@ -615,6 +644,28 @@ class _PairOutcome(NamedTuple):
     # 抑制**之前**的逐块响应覆盖率/幅度,窗级据此更新占空比统计(方案 §7.2)。
     blk_cov: NDArray[np.float32] | None = None
     blk_amp: NDArray[np.float32] | None = None
+
+
+def _max_comp_ratio(
+    mask: NDArray[np.uint8], morph_ksize: int
+) -> float:
+    """抑制前掩膜经形态学后的最大连通域面积占比(不过面积/紧凑度门槛)。
+
+    供召回回补判断「被光变抑制吞掉的响应里有没有结构」:纯散点噪声经 OPEN 后 ≈0,
+    真实微动的碎片群有 0.002~0.005 级的最大块。
+    """
+    m = mask
+    if morph_ksize > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_ksize, morph_ksize))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
+    if not m.any():
+        return 0.0
+    n_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
+    return max(
+        (stats[i, cv2.CC_STAT_AREA] / _MASK_TOTAL_PX for i in range(1, n_labels)),
+        default=0.0,
+    )
 
 
 def _evaluate_pair(
@@ -692,11 +743,23 @@ def _evaluate_pair(
         keep = cv2.resize(
             (~light_blk).astype(np.uint8), _DIFF_SIZE, interpolation=cv2.INTER_NEAREST
         )
+        mask_pre = mask
         mask = mask * keep
         remain = float(np.count_nonzero(mask)) / _MASK_TOTAL_PX
         suppressed_frac = 1.0 - remain / struct_ratio
         if not mask.any():
-            return _PairOutcome(False, _replace_diag(diag, verdict=_light_verdict(frame_pct)))
+            # 回补判据要问「被吞掉的响应里有没有结构」:对抑制前掩膜补算一次最大连通域
+            # (罕见路径,只发生在整窗响应都被判光的帧对)。纯散点噪声在这里 ≈0,
+            # 「光漂+微动」会有 0.002 级的碎片结构——召回回补靠它把两者分开。
+            return _PairOutcome(
+                False,
+                _replace_diag(
+                    _replace_diag(
+                        diag, verdict=_light_verdict(frame_pct)
+                    ),
+                    max_comp_ratio=_max_comp_ratio(mask_pre, band.morph_ksize),
+                ),
+            )
 
     # ③ 持续变化源抑制:先按**抑制前**的响应算逐块统计(顺序见 _env_update),再据历史统计抑制。
     blk_cov, blk_amp = _block_stats(mask, resp, band.block_grid)
@@ -733,12 +796,14 @@ def _evaluate_pair(
     max_fill = 0.0
     max_box = (0, 0, 0, 0)
     offset_rejected = 0
+    max_comp_any = 0.0
     off_diag = None
     for i in range(1, n_labels):  # 0 是背景
         area = int(stats[i, cv2.CC_STAT_AREA])
         bw = int(stats[i, cv2.CC_STAT_WIDTH])
         bh = int(stats[i, cv2.CC_STAT_HEIGHT])
         ratio = area / _MASK_TOTAL_PX
+        max_comp_any = max(max_comp_any, ratio)
         fill = area / (bw * bh) if bw * bh > 0 else 0.0
         if ratio < band.min_block_ratio or fill < band.min_fill_ratio:
             continue
@@ -772,6 +837,7 @@ def _evaluate_pair(
         offset_shift_cv=off_diag.shift_cv if off_diag else 0.0,
         offset_std_delta=off_diag.std_delta if off_diag else 0.0,
         offset_std_a=off_diag.std_a if off_diag else 0.0,
+        max_comp_ratio=max_comp_any,
     )
     if count == 0 and offset_rejected > 0:
         # 合格块全被加性偏移判据剔掉 → 归因给它,而不是笼统的「块不合格」。
@@ -855,6 +921,9 @@ def _maybe_dump(
         # 落不下来。而它压掉的恰是「首遇漏报」的最可能来源(纯色物体贴平滑墙),必须
         # 留证人工复核——样本量小(实测 ~3% 分歧窗),不会写爆磁盘。
         or result.diag.verdict == VERDICT_OFFSET_ONLY
+        # 召回回补窗单独落盘:回补 = 新旧都放行的窗,不是分歧,但它是「光漂+微动」
+        # 争议带的放行样本,量可控,留着标定 light_relax 两个阈值。
+        or result.diag.verdict == VERDICT_LIGHT_RELAXED
     ):
         return
     try:

@@ -20,6 +20,7 @@ from miloco.perception.engine.gate.visual_gate import (
     VERDICT_ENV_SUPPRESSED,
     VERDICT_LIGHT_BLOCKS,
     VERDICT_LIGHT_FRAME,
+    VERDICT_LIGHT_RELAXED,
     VERDICT_MODE_SWITCH,
     VERDICT_OFFSET_ONLY,
     VERDICT_TRIGGER,
@@ -732,3 +733,54 @@ class TestOffsetStdAGuard:
         )
         assert not off.is_offset
         assert off.std_a == 0.0
+
+
+class TestLightRelax:
+    """光变抑制的召回回补:legacy 已过旧阈的小面积「光漂+微动」窗放行,整幅光变维持压制。
+
+    真机依据(2026-08-28,40 窗分歧库 + 36 窗 dpf 盲检):争议带 struct_ratio
+    0.012~0.045,整幅光变(α=0.2/0.88/0.91)0.52~0.97,中间 10 倍空隙;争议带里
+    dpf 确认约四成是真实背景移动被 PCT 连同光漂一起吞掉。
+    """
+
+    def test_light_drift_with_legacy_pass_relaxed(self):
+        """若干小面积光斑(单块 <0.005) + 局部超 25 灰阶核心:legacy 达标 → 回补放行。
+
+        真机形态:曝光/白平衡慢漂让画面里散布若干弱光斑,分块 PCT/块门槛都吃不下它们
+        (碎片各自 <0.005) → blocks_rejected/light_frame 压制;而旧 gate 靠 0.5% 像素
+        超 25 灰阶放行。回补判据 = legacy 达标 ∧ struct_ratio<0.1 ∧ 有连通结构。
+        """
+        room = _room()
+        rng = np.random.default_rng(42)
+        drifted = room.astype(np.int16).copy()
+        h, w = room.shape[:2]
+        for _ in range(6):  # 弱光斑:整体 +15,单块面积 ~0.3%,合计 ~1.3%
+            y = int(rng.integers(0, h - 60))
+            x = int(rng.integers(0, w - 80))
+            drifted[y : y + 40, x : x + 60] += 15
+        for _ in range(5):  # 亮核:+30 灰阶(legacy 数的是 >25 的像素),撑起 0.5% 超阈
+            y = int(rng.integers(0, h - 50))
+            x = int(rng.integers(0, w - 60))
+            drifted[y : y + 40, x : x + 50] += 30
+        drifted = np.clip(drifted, 0, 255).astype(np.uint8)
+        r = _run(room, drifted)
+        assert r.changed
+        assert r.diag.verdict == VERDICT_LIGHT_RELAXED
+
+    def test_global_light_change_stays_suppressed(self):
+        """整幅光变(α=0.55)即使 legacy 满帧超阈也不回补——PCT 的既有收益不能丢。"""
+        room = _room()
+        r = _run(room, _lit(room, 0.55))
+        assert not r.changed
+        assert r.diag.verdict == VERDICT_LIGHT_FRAME
+
+    def test_scattered_noise_stays_suppressed(self):
+        """散点噪声 legacy 可过阈(9000 像素 >25),但抑制前响应无连通结构 → 不回补。"""
+        rng = np.random.default_rng(5)
+        room = _room()
+        speckled = room.copy()
+        ys = rng.integers(0, 720, 9000)
+        xs = rng.integers(0, 1280, 9000)
+        speckled[ys, xs] = 255
+        r = _run(room, speckled, rng=rng)
+        assert not r.changed
