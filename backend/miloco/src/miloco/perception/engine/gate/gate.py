@@ -151,6 +151,7 @@ async def run_gate(
             "offset_sign_coh": visual.diag.offset_sign_coh,
             "offset_shift_cv": visual.diag.offset_shift_cv,
             "offset_std_delta": visual.diag.offset_std_delta,
+            "offset_std_a": visual.diag.offset_std_a,
             "offset_rejected": float(visual.diag.offset_rejected),
             "env_duty_max": visual.diag.env_duty_max,
             "env_blink_max": visual.diag.env_blink_max,
