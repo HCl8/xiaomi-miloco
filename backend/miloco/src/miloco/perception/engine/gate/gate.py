@@ -154,6 +154,8 @@ async def run_gate(
             "offset_std_a": visual.diag.offset_std_a,
             "offset_rejected": float(visual.diag.offset_rejected),
             "max_comp_ratio": visual.diag.max_comp_ratio,
+            "motion_pct_max": visual.diag.motion_pct_max,
+            "motion_cover": visual.diag.motion_cover,
             "env_duty_max": visual.diag.env_duty_max,
             "env_blink_max": visual.diag.env_blink_max,
             "env_blink_at_block": visual.diag.env_blink_at_block,

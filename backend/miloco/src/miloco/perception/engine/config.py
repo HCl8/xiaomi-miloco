@@ -184,6 +184,20 @@ class GateConfig:
     light_relax_max_struct_ratio: float = 0.1    # 超过视为整幅光变,维持抑制
     light_relax_min_comp_ratio: float = 0.0015   # 抑制前响应里至少要有这么大的连通结构(排除散点噪声)
 
+    # ---- Frigate 式运动否决通道(2026-08-28)----
+    # 像素 gate 触发后,问 100px 运动级(E MA 背景模型,见 gate/motion_veto.py)「触发 bbox
+    # 处是否真有运动」。真机 428 窗标定:C700 稳态 pct_motion≤0.008(对比 ViBe 逐像素模型
+    # 的 5.7% 噪声底),你肉眼确认的真实爆发 pct 0.014~0.10 / bbox 覆盖 0.44~0.89;
+    # 高频纹理微动(花盆)、伪影(幅度≤阈值30)、屏幕文字、光照在 100px 下全部不可见。
+    # 否决条件:cover < cover_max 且 pct < pct_max → 压制(verdict=motion_veto,单独落盘)。
+    # **D2 复议已获同意(2026-08-28)**:小幅真实事件(≤25 灰阶、100px 不可见)会被压,
+    # 换取整个噪声家族(微动/伪影/屏幕/光照)的压制;已知样本代价 1/17。
+    # 模型未校准(前 warmup_frames 帧,分位缓冲预热)时 fail-open 不否决。
+    motion_veto_enabled: bool = True
+    motion_veto_pct_max: float = 0.01        # 全窗运动占比上限(低于此视为无运动)
+    motion_veto_cover_max: float = 0.2       # 触发 bbox 被运动覆盖的比例上限
+    motion_veto_warmup_frames: int = 50      # 校准帧数(分位缓冲 50 帧对齐)
+
     # ---- 调试落盘(定位误报用,默认关)----
     # 非空则把**触发窗**的输入落盘:448 灰度抽检帧序列 + 上窗基准帧 + 全分辨率参考帧 + diag。
     # 只存输入不存中间结果——中间各阶段在本地用同一份代码复现,这样改可视化不必重新部署,

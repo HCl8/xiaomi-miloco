@@ -22,6 +22,7 @@ from miloco.perception.engine.gate.visual_gate import (
     VERDICT_LIGHT_FRAME,
     VERDICT_LIGHT_RELAXED,
     VERDICT_MODE_SWITCH,
+    VERDICT_MOTION_VETO,
     VERDICT_OFFSET_ONLY,
     VERDICT_TRIGGER,
     VisualBaseline,
@@ -784,3 +785,77 @@ class TestLightRelax:
         speckled[ys, xs] = 255
         r = _run(room, speckled, rng=rng)
         assert not r.changed
+
+
+class TestMotionVeto:
+    """Frigate 式运动否决:像素触发但 100px 运动级看不见运动 → 判噪声压制。
+
+    100px 降采样 + 对比度拉伸把高频微动/低幅伪影/光照平均归零(真机稳态 pct≤0.008),
+    真实运动(幅度>阈值30)幸存。代价(D2 复议已同意):小幅真实事件同被压。
+    """
+
+    @staticmethod
+    def _fullrange_room(h: int = 720, w: int = 1280) -> np.ndarray:
+        """带极端明暗条的房间(各占 5%,让 4%/96% 分位真正到达 20/240):
+        对比度拉伸增益 ≈1.16,σ4 噪声不再过阈,patch 幅度即可确定。"""
+        img = _room()
+        img[:, :64] = 20
+        img[:, -64:] = 240
+        return img
+
+    @staticmethod
+    def _warm_stream(cfg, rng, n=12):
+        """喂 n 个静态窗把运动模型喂到校准(50 帧),返回 (base, model帧数)。"""
+        room = TestMotionVeto._fullrange_room()
+        base = None
+        r = None
+        for _ in range(n):
+            r = evaluate_visual(
+                [_noisy(room, rng) for _ in range(9)], cfg, input_fps=3, prev_frame=base
+            )
+            base = r.last_checked
+        return base, r
+
+    def test_low_amplitude_dual_sign_patch_suppressed(self):
+        """±12 双符号低幅斑块:448 触发、100px 不可见(12<阈值30)→ 运动否决压制。"""
+        cfg = GateConfig()
+        rng = np.random.default_rng(31)
+        base, _ = self._warm_stream(cfg, rng)
+        room = self._fullrange_room()
+        noisy = room.copy()
+        # 双符号 ±10:448 触发(>阈≈6)、100px 不可见(拉伸后 ≈12 < 阈 30)
+        noisy[300:400, 300:375] = np.clip(noisy[300:400, 300:375].astype(np.int16) + 10, 0, 255).astype(np.uint8)
+        noisy[300:400, 375:450] = np.clip(noisy[300:400, 375:450].astype(np.int16) - 10, 0, 255).astype(np.uint8)
+        r = evaluate_visual(
+            [_noisy(noisy, rng) for _ in range(9)], cfg, input_fps=3, prev_frame=base
+        )
+        assert not r.changed
+        assert r.diag.verdict == VERDICT_MOTION_VETO
+        assert r.diag.motion_pct_max < cfg.motion_veto_pct_max
+
+    def test_real_motion_still_passes(self):
+        """真人入场(幅度 40~80,100px 可见且覆盖触发区)→ 否决不生效,照常触发。"""
+        cfg = GateConfig()
+        rng = np.random.default_rng(32)
+        base, _ = self._warm_stream(cfg, rng)
+        room = self._fullrange_room()
+        r = evaluate_visual(
+            [_noisy(_with_person(room), rng) for _ in range(9)],
+            cfg, input_fps=3, prev_frame=base,
+        )
+        assert r.changed
+        assert r.diag.verdict == VERDICT_TRIGGER
+
+    def test_veto_disabled_by_config(self):
+        cfg = GateConfig(motion_veto_enabled=False)
+        rng = np.random.default_rng(33)
+        base, _ = self._warm_stream(cfg, rng)
+        room = self._fullrange_room()
+        noisy = room.copy()
+        noisy[300:400, 300:375] = np.clip(noisy[300:400, 300:375].astype(np.int16) + 10, 0, 255).astype(np.uint8)
+        noisy[300:400, 375:450] = np.clip(noisy[300:400, 375:450].astype(np.int16) - 10, 0, 255).astype(np.uint8)
+        r = evaluate_visual(
+            [_noisy(noisy, rng) for _ in range(9)], cfg, input_fps=3, prev_frame=base
+        )
+        assert r.changed
+        assert r.diag.verdict == VERDICT_TRIGGER

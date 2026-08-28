@@ -38,6 +38,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from miloco.perception.engine.config import GateConfig
+from miloco.perception.engine.gate.motion_veto import MotionVetoState
 from miloco.perception.engine.gate.photometric import (
     FrameFeat,
     PctResult,
@@ -85,6 +86,7 @@ VERDICT_ENV_SUPPRESSED = "env_suppressed"
 VERDICT_BLOCKS_REJECTED = "blocks_rejected"  # 有响应、非光变,但无合格块(面积/紧凑度)
 VERDICT_TRIGGER = "trigger"  # 放行
 VERDICT_LIGHT_RELAXED = "light_relaxed"  # 光变抑制被召回回补解除(见 config.light_relax_*)
+VERDICT_MOTION_VETO = "motion_veto"  # 100px 运动级未见运动,像素触发被判为噪声(见 motion_veto.py)
 VERDICT_LEGACY_DIFF = "legacy_diff"  # visual_algo="diff" 回退路径
 
 # 同一窗多个帧对各有判定时,报**响应最大**的那一对(见 evaluate_visual 里的 best 逻辑),
@@ -101,6 +103,7 @@ _VERDICT_RANK = {
     VERDICT_ENV_SUPPRESSED: 5,
     VERDICT_BLOCKS_REJECTED: 6,
     VERDICT_LIGHT_RELAXED: 7,
+    VERDICT_MOTION_VETO: 8,
 }
 
 
@@ -351,6 +354,9 @@ class VisualBaseline:
     blink: NDArray[np.float32] | None = None
     # 上窗的逐块活跃布尔(float 0/1),blink 需要它才能算「翻转」。
     prev_active: NDArray[np.float32] | None = None
+    # Frigate 式运动级状态(100px EMA 背景模型,见 motion_veto.py)。跨窗携带,
+    # 供否决通道判定「像素 gate 触发处 100px 下是否真有运动」。
+    motion: object | None = None
 
 
 @dataclass(frozen=True)
@@ -405,6 +411,10 @@ class VisualDiag:
     # 形态学后最大连通域占比(不过面积/紧凑度门槛)。count=0 的窗里它非零说明「有结构、
     # 只是不到一块的门槛」——召回回补的必要条件。
     max_comp_ratio: float = 0.0
+    # Frigate 式运动级(100px):本窗最大运动占比 + 触发 bbox 处的最大运动覆盖率。
+    # 稳态真机实测 pct≤0.008,真实事件 0.014~0.10—— veto 的两个标定量。
+    motion_pct_max: float = 0.0
+    motion_cover: float = 0.0
     # 最热块的占空比与响应覆盖率。抑制层不生效时,只看 env_block_ratio=0 分不出是「占空比没
     # 爬上来」还是「爬上来了但被显著性解除」——必须同时看这两个量。
     env_duty_max: float = 0.0
@@ -506,6 +516,13 @@ def evaluate_visual(
             mode,
         )
 
+    # Frigate 式运动级(100px EMA 背景模型):逐抽检帧喂入,状态跨窗携带。
+    # 否决判定在下面的触发判定之后——它回答「触发 bbox 处 100px 下是否真有运动」。
+    motion_state = baseline.motion if baseline is not None else None
+    if motion_state is None:
+        motion_state = MotionVetoState.create(grays[0])
+    frame_motion = [motion_state.step(g) for g in grays]
+
     # 阈值基准:先在所有帧对上取**最小**的候选尺度(最安静的那一对最能代表噪声底),再与跨窗
     # 跟踪值做「快降慢升」的最小值跟踪。全窗共用一个尺度,判定在窗内自洽。
     raw_scale = _raw_scale(baseline, grays)
@@ -566,6 +583,34 @@ def evaluate_visual(
                 best_diag = _replace_diag(d, verdict=VERDICT_LIGHT_RELAXED)
                 break
 
+    # Frigate 式运动否决(在回补之后:回补放行的光照窗同样要过这道闸)。触发(含回补放行)
+    # 后,若 100px 运动级在触发 bbox 处未见运动,判为噪声家族(高频微动/伪影/屏幕文字/光照)
+    # 压制。真机 428 窗标定:稳态 pct≤0.008,真实事件 cover 0.44~0.89。模型未校准或
+    # cold_start 时 fail-open。D2 复议已获同意。
+    motion_pct_max = max((p for p, _ in frame_motion), default=0.0)
+    motion_cover = 0.0
+    if (
+        changed
+        and config.motion_veto_enabled
+        and motion_state is not None
+        and motion_state.frames_seen >= config.motion_veto_warmup_frames
+        and best_diag.verdict in (VERDICT_TRIGGER, VERDICT_LIGHT_RELAXED)
+    ):
+        bbox = (
+            best_diag.max_block_x, best_diag.max_block_y,
+            best_diag.max_block_w, best_diag.max_block_h,
+        )
+        motion_cover = max(
+            (motion_state.cover(boxes, bbox, _DIFF_SIZE) for _, boxes in frame_motion),
+            default=0.0,
+        ) if bbox[2] else 0.0  # 回补窗无 bbox(块级信息被光变抑制吞掉)→ 退化为纯 pct 判定
+        if motion_cover < config.motion_veto_cover_max and motion_pct_max < config.motion_veto_pct_max:
+            changed = False
+            best_diag = _replace_diag(
+                best_diag, verdict=VERDICT_MOTION_VETO,
+                motion_pct_max=motion_pct_max, motion_cover=motion_cover,
+            )
+
     max_score = max(intra_max, cross_max)
 
     # 占空比统计取窗内**各块的最大**覆盖率/幅度(抑制之前的量):窗内任一帧对该块活跃就算活跃,
@@ -606,6 +651,7 @@ def evaluate_visual(
     new_baseline = VisualBaseline(
         frame=grays[-1], mode=mode, pending_switch=pending, diff_scale=scale,
         duty=duty, amp_base=amp_base, blink=blink, prev_active=active,
+        motion=motion_state,
     )
 
     # cold-start:无跨窗基准时静止画面所有判据都归零,会被当无变化丢掉,导致开机已存在的
@@ -632,6 +678,7 @@ def evaluate_visual(
             env_duty_max=duty_max, env_cov_max=cov_max,
             env_blink_max=blink_max, env_blink_at_block=blink_at,
             env_duty_at_block=duty_at,
+            motion_pct_max=motion_pct_max, motion_cover=motion_cover,
         ),
     )
     _maybe_dump(config, grays, baseline, result, frames[0] if frames else None, dump_tag)
@@ -924,6 +971,8 @@ def _maybe_dump(
         # 召回回补窗单独落盘:回补 = 新旧都放行的窗,不是分歧,但它是「光漂+微动」
         # 争议带的放行样本,量可控,留着标定 light_relax 两个阈值。
         or result.diag.verdict == VERDICT_LIGHT_RELAXED
+        # 运动否决窗单独落盘:D2 复议的代价面(被压的小幅真实事件)只能在这里人工复核。
+        or result.diag.verdict == VERDICT_MOTION_VETO
     ):
         return
     try:
