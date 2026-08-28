@@ -21,6 +21,7 @@ from miloco.perception.engine.gate.visual_gate import (
     VERDICT_LIGHT_BLOCKS,
     VERDICT_LIGHT_FRAME,
     VERDICT_MODE_SWITCH,
+    VERDICT_OFFSET_ONLY,
     VERDICT_TRIGGER,
     VisualBaseline,
     _preprocess,
@@ -82,10 +83,16 @@ def _lit(img: np.ndarray, alpha: float, half: bool = False) -> np.ndarray:
 
 
 def _with_person(img: np.ndarray, dx: int = 0) -> np.ndarray:
-    """dx 让人在窗间微动 —— blink 的用例需要「持续活跃」而非「一次性出现后静止」。"""
+    """dx 让人在窗间微动 —— blink 的用例需要「持续活跃」而非「一次性出现后静止」。
+
+    人形是**双符号**的:脸比墙亮(+)、身体比墙/地暗(−)。真实人经过 CMOS/编码后从来不是
+    单色块——布纹、肤色、光照面差异天然让 B−A 双向分布;单符号的「纯色矩形贴平坦墙」
+    在数学上与一次纯加性偏移完全同信号,会被加性偏移判据正确压掉(那是判据的职责,
+    不是 fixture 该迁就的形态,见 test_solid_object_on_flat_background_boundary)。
+    """
     out = img.copy()
     cv2.rectangle(out, (520 + dx, 330), (610 + dx, 590), (55, 60, 75), -1)
-    cv2.circle(out, (565 + dx, 305), 32, (95, 105, 130), -1)
+    cv2.circle(out, (565 + dx, 305), 32, (170, 185, 205), -1)
     return out
 
 
@@ -111,27 +118,24 @@ class TestLightChangeNotTriggered:
         assert r.diag.light_block_ratio > 0.3
         assert r.diag.legacy_diff_score > 0.3  # 旧判据同样误报
 
-    def test_local_light_on_textureless_region_is_known_false_positive(self):
-        """**已知边界,不是待修的 bug**:局部光变落在完全无纹理的区域上 → 误报。
+    def test_local_light_on_textureless_region_suppressed_by_offset(self):
+        """局部光变落在完全无纹理的区域上 → 由加性偏移判据收复(原「已知边界」)。
 
-        分块尺度上,低 SNR 块的①②都是空洞断言,只能靠「可信块(有纹理且仿射一致)拟合出的
-        光照变换定量预测该块亮度」来救援。若受照区**内部**一块纹理都没有(摄像头正对大片
-        白墙、斜向光带只扫过墙面),救援无从起步 → 响应原样保留 → 触发。
+        历史:PCT@分块 对低 SNR 块的①②是空洞断言,受照区内部毫无纹理时救援无从起步,
+        这里曾只能放行(v1 已知边界)。加性偏移判据启用后,纯平墙上的斜向光带 = 底座
+        stdA≈0 的纯光度偏移(coh=1.0 / cv=0 / std 守恒),四条全中 → 被拦。
 
-        为什么接受:①旧的裸帧差 gate 在同样输入上也误报(见 legacy_diff_score),故不构成
-        回归;②按 D2「优先不误拦、可以误放」,误报只是多跑一次下游;③真实房间的受照区几乎
-        总会包含一些家具/边缘,轴向半房照亮那例就是靠受照半边的家具救援成功的。
-
-        这条测试断言的是**当前的已知行为**。若哪天算法改进能拦住它,请连带更新方案文档
-        里的边界表,而不是默默把断言反过来。
+        与真实「阴影扫过家具」不冲突:那类事件的底座有纹理(stdA 守卫放行,26 窗账本里
+        真实光变收益窗 stdA=61.7)。真实房间受照区几乎总会包含家具/边缘,轴向半房照亮
+        那例靠受照半边的家具救援的逻辑不变。
         """
         wall = np.full((720, 1280, 3), 150, np.uint8)  # 无纹理:整幅白墙
         lit = wall.astype(np.float32).copy()
         yy, xx = np.mgrid[0:720, 0:1280]
         lit[(xx * 0.6 + yy) < 1280 * 0.35] *= 1.5
         r = _run(wall, np.clip(lit, 0, 255).astype(np.uint8))
-        assert r.changed  # 已知边界
-        assert r.diag.legacy_diff_score > 0.1  # 旧 gate 同样误报 → 非回归
+        assert not r.changed
+        assert r.diag.verdict == VERDICT_OFFSET_ONLY
 
     def test_scattered_noise_suppressed(self):
         """散碎噪点无紧凑结构 → 形态学 + 紧凑度/面积 过滤。"""
@@ -163,10 +167,14 @@ class TestRealChangeTriggered:
         assert r.diag.block_count >= 1
 
     def test_small_area_motion(self):
-        """约占画面 1% 的手臂。旧判据 score < change_threshold(0.005)→ 漏报。"""
+        """约占画面 0.6% 的手臂,横跨墙/地两个光照面(真实物体的常态)。
+
+        旧判据 score < change_threshold(0.005)→ 漏报。物体必须横跨明暗面:单一光照面上
+        的均匀色块与纯加性偏移同信号,会被加性偏移判据压掉(见 boundary 用例)。
+        """
         room = _room()
         moved = room.copy()
-        cv2.rectangle(moved, (300, 250), (430, 330), (95, 120, 175), -1)
+        cv2.rectangle(moved, (300, 340), (430, 380), (95, 120, 175), -1)
         r = _run(room, moved)
         assert r.changed
         assert r.diag.legacy_diff_score < GateConfig().change_threshold
@@ -198,18 +206,32 @@ class TestRealChangeTriggered:
         assert r.diag.struct_ratio > 0.5
 
     def test_low_contrast_object_triggered(self):
-        """~8 灰度级对比的物体。响应实心但带 ~13% 噪声空洞,依赖 CLOSE→OPEN 的形态学顺序。"""
+        """低对比物体横跨墙/地两个光照面:对墙 −12、对地 +30,真实物体跨越光照面的常态。
+
+        响应实心但带噪声空洞,依赖 CLOSE→OPEN 的形态学顺序;跨面双符号让它不会被
+        加性偏移判据当成伪影。
+        """
         room = _room()
         obj = room.copy()
-        cv2.rectangle(obj, (300, 250), (430, 330), (148, 153, 158), -1)
+        cv2.rectangle(obj, (300, 320), (430, 400), (95, 120, 175), -1)
         r = _run(room, obj)
         assert r.changed
 
-    def test_object_on_flat_background_triggered(self):
-        """平坦背景 + 物体:无可信块可供救援,响应原样保留 → 触发(保不漏方向)。"""
+    def test_solid_object_on_flat_background_boundary(self):
+        """**已知边界,按 D2 接受**:单色块贴纯平背景(单符号、块内方差≈0)→ 被压。
+
+        「均匀物体盖在均匀背景上」的 B−A 是常数,与编码伪影的整带电平阶跃在局部完全
+        同信号——这不是判据的缺陷,是两类事件在局部统计上不可分。真实世界经 CMOS +
+        编码后几乎不产生这种信号(26 窗人工核实账本:真实 blob coh ≤0.29;真实素材
+        场景最坏 coh 0.634,距阈值 0.90 余量 0.27)。被压的窗落 verdict=offset_only
+        并单独落盘,供人工复核首遇漏报。
+        """
         flat = np.full((720, 1280, 3), 110, np.uint8)
-        r = _run(flat, _with_person(flat))
-        assert r.changed
+        solid = flat.copy()
+        cv2.rectangle(solid, (300, 320), (430, 400), (150, 150, 150), -1)
+        r = _run(flat, solid)
+        assert not r.changed
+        assert r.diag.verdict == VERDICT_OFFSET_ONLY
 
 
 class TestDayNightBands:
@@ -253,7 +275,7 @@ class TestDayNightBands:
         rng = np.random.default_rng(13)
         room = _room()
         weak = room.copy()
-        cv2.rectangle(weak, (300, 250), (430, 330), (148, 153, 158), -1)
+        cv2.rectangle(weak, (300, 320), (430, 400), (95, 120, 175), -1)
         frames = _window(room, weak, rng)
         base = _preprocess(_noisy(room, rng))
         day = evaluate_visual(frames, GateConfig(), input_fps=3, prev_frame=base)
@@ -646,7 +668,7 @@ class TestDumpOnDisagree:
         monkeypatch.setattr(visual_gate_module, "_dump_count", 0, raising=False)
         room = _room()
         moved = room.copy()
-        cv2.rectangle(moved, (300, 250), (430, 330), (95, 120, 175), -1)
+        cv2.rectangle(moved, (300, 340), (430, 380), (95, 120, 175), -1)
         r, files = self._dump(tmp_path, True, room, moved)
         assert r.changed
         assert r.diag.legacy_diff_score < GateConfig().change_threshold
@@ -659,3 +681,54 @@ class TestDumpOnDisagree:
         r, files = self._dump(tmp_path, False, room, room)
         assert not r.changed
         assert len(files) >= 1, "关掉后静止窗也应落盘"
+
+
+class TestOffsetStdAGuard:
+    """加性偏移判据的底座纹理守卫(stdA):伪影长在平滑区,真实光度事件在高纹理。
+
+    26 窗人工核实账本的实测分布——伪影 stdA 9.0~31.4 / 真实光变收益窗 61.7 /
+    真实变化最低 34.7,阈值 35 取在空隙上。
+    """
+
+    @staticmethod
+    def _run_offset(gray_a, gray_b):
+        from miloco.perception.engine.gate.photometric import additive_offset_test
+
+        mask = np.ones(gray_a.shape, np.uint8)
+        return additive_offset_test(
+            gray_a, gray_b, mask, scale=1.0,
+            coh_min=0.90, cv_max=0.80, std_delta_k=3.0, std_a_max=35.0, min_px=100,
+        )
+
+    def test_smooth_base_offset_rejected(self):
+        """纯平墙上的电平阶跃(伪影签名):四条全中 → 判加性偏移。"""
+        a = np.full((200, 200), 100, np.uint8)
+        b = np.full((200, 200), 120, np.uint8)
+        off = self._run_offset(a, b)
+        assert off.is_offset
+        assert off.sign_coherence == 1.0
+        assert off.std_a == 0.0
+
+    def test_textured_base_offset_passes(self):
+        """同一 +20 阶跃落在高纹理底座上(阴影/反光移动的签名)→ stdA 守卫放行。"""
+        yy, xx = np.mgrid[0:200, 0:200]
+        a = (110 + 80 * np.sin(xx / 7.0) * np.cos(yy / 9.0)).astype(np.uint8)
+        assert a.std() > 35.0  # 底座确实高纹理
+        b = np.clip(a.astype(np.int16) + 20, 0, 255).astype(np.uint8)
+        off = self._run_offset(a, b)
+        assert not off.is_offset
+        assert off.std_a > 35.0  # 原始量落 trace,标定用
+        assert off.sign_coherence == 1.0  # 前三条仍然全中——是 stdA 单独救的
+
+    def test_too_small_mask_not_judged(self):
+        """<min_px 的块统计不可靠 → 不判(放行)。"""
+        a = np.full((200, 200), 100, np.uint8)
+        b = np.full((200, 200), 150, np.uint8)
+        from miloco.perception.engine.gate.photometric import additive_offset_test
+
+        off = additive_offset_test(
+            a, b, np.zeros((200, 200), np.uint8), scale=1.0,
+            coh_min=0.90, cv_max=0.80, std_delta_k=3.0, std_a_max=35.0, min_px=100,
+        )
+        assert not off.is_offset
+        assert off.std_a == 0.0

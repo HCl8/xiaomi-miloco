@@ -83,6 +83,18 @@ def _solid(r: int, g: int, b: int) -> np.ndarray:
     return f
 
 
+def _structural_change(base: np.ndarray) -> np.ndarray:
+    """双符号结构变化(亮块+暗块),供「gate 应放行」类用例做变化帧。
+
+    整幅 gray→white 是一次纯加性偏移(+155 全帧同号),加性偏移判据启用后会被正确
+    压掉——那里要测「真实变化放行」,fixture 必须是结构型信号。
+    """
+    f = base.copy()
+    f[10:40, 10:40] = [240, 240, 240]
+    f[10:40, 60:90] = [10, 10, 10]
+    return f
+
+
 def _make_snapshot(
     room_name: str,
     did: str,
@@ -314,9 +326,9 @@ async def test_batch_all_skipped():
 async def test_batch_partial_skip():
     """When some devices skip (gate) and others trigger, only triggered ones go to Omni."""
     gray = _solid(100, 100, 100)
-    white = _solid(255, 255, 255)
     static_frames = [gray] * 6
-    change_frames = [gray, gray, white, white, white, white]
+    change = _structural_change(gray)
+    change_frames = [gray, gray, change, change, change, change]
 
     snap_static = _make_snapshot("living-room", "cam-static", static_frames, np.zeros(16000, dtype=np.int16))
     snap_change = _make_snapshot("living-room", "cam-change", change_frames, np.zeros(16000, dtype=np.int16))
@@ -1432,8 +1444,8 @@ class TestGateHoldPipelineIntegration:
     async def test_C1_multi_device_independent_hold(self, monkeypatch):
         """两 device:cam-A visual 通过、cam-B 全静止;cam-A dict 入项、cam-B 不入。"""
         gray = _solid(100, 100, 100)
-        white = _solid(255, 255, 255)
-        frames_with_change = [gray, gray, white, white, white, white]
+        change = _structural_change(gray)
+        frames_with_change = [gray, gray, change, change, change, change]
         frames_static = [gray] * 6
         silent = np.zeros(16000, dtype=np.int16)
 

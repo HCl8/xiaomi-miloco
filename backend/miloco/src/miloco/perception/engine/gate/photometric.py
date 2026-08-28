@@ -542,12 +542,13 @@ def pct_blocks(
 
 
 class OffsetTest(NamedTuple):
-    """加性偏移判据的结果 + 三个原始量(全部落 trace,阈值靠它们的分布标定)。"""
+    """加性偏移判据的结果 + 四个原始量(全部落 trace,阈值靠它们的分布标定)。"""
 
     is_offset: bool
     sign_coherence: float
     shift_cv: float
     std_delta: float
+    std_a: float
 
 
 def additive_offset_test(
@@ -560,6 +561,7 @@ def additive_offset_test(
     cv_max: float,
     std_delta_k: float,
     min_px: int,
+    std_a_max: float,
 ) -> OffsetTest:
     """判「这个候选块的变化是不是一次纯加性光度偏移」。是 → 不是事件,不该触发。
 
@@ -586,12 +588,16 @@ def additive_offset_test(
       但位移随背景起伏、变异系数高。
     - **标准差守恒**:``|std(B)−std(A)|`` 小。纯加性偏移**必然保持标准差**(物理上精确);
       「均匀物体盖住有纹理背景」会让 std 大幅下降,据此排除。
+    - **底座纹理守卫**:``std(A[mask])`` 小(块本身是平滑区)。伪影条带永远长在平坦区
+      (stdA 9~31),而真实的光度型事件——阴影移动、反光消失——往往落在高纹理上;26 窗
+      全量人工核实账本里,唯一会被前三条误杀的真实收益窗(「亮光斑消失」stdA=68.2)恰好
+      被 stdA 单独保住,伪影侧最高 31.4,真实侧最低 34.7,阈值取 35。
 
-    三条都满足才判加性偏移。任一不满足 → 放行(宁误不漏)。
+    四条都满足才判加性偏移。任一不满足 → 放行(宁误不漏)。
     """
     m = blob_mask.astype(bool)
     if int(m.sum()) < min_px:
-        return OffsetTest(False, 0.0, 0.0, 0.0)
+        return OffsetTest(False, 0.0, 0.0, 0.0, 0.0)
     a = gray_a[m].astype(np.float32)
     b = gray_b[m].astype(np.float32)
     d = b - a
@@ -599,12 +605,14 @@ def additive_offset_test(
     mu = abs(float(d.mean()))
     cv = float(d.std()) / max(mu, _EPS)
     sd = abs(float(b.std()) - float(a.std()))
+    std_a = float(a.std())
     is_offset = (
         coh >= coh_min
         and cv <= cv_max
         and sd <= std_delta_k * max(scale, _MIN_SIGMA)
+        and std_a <= std_a_max
     )
-    return OffsetTest(is_offset, coh, cv, sd)
+    return OffsetTest(is_offset, coh, cv, sd, std_a)
 
 
 def saturation_mean(bgr: NDArray[np.uint8]) -> float:

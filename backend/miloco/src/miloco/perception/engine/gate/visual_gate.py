@@ -109,6 +109,7 @@ class _OffsetParams(NamedTuple):
     coh_min: float
     cv_max: float
     std_delta_k: float
+    std_a_max: float
     min_px: int
 
 
@@ -118,6 +119,7 @@ def _offset_params(config: GateConfig) -> _OffsetParams:
         coh_min=config.offset_coh_min,
         cv_max=config.offset_cv_max,
         std_delta_k=config.offset_std_delta_k,
+        std_a_max=config.offset_std_a_max,
         min_px=config.offset_min_px,
     )
 
@@ -392,10 +394,11 @@ class VisualDiag:
     light_block_ratio: float = 0.0
     # 被「持续变化源」抑制掉的块占比。这一层的收益直接看它 + env_suppressed 桶的计数。
     env_block_ratio: float = 0.0
-    # 加性偏移判据在「最大候选块」上的三个原始量(阈值靠它们的分布标定)+ 被它剔掉的块数。
+    # 加性偏移判据在「最大候选块」上的四个原始量(阈值靠它们的分布标定)+ 被它剔掉的块数。
     offset_sign_coh: float = 0.0
     offset_shift_cv: float = 0.0
     offset_std_delta: float = 0.0
+    offset_std_a: float = 0.0
     offset_rejected: int = 0
     # 最热块的占空比与响应覆盖率。抑制层不生效时,只看 env_block_ratio=0 分不出是「占空比没
     # 爬上来」还是「爬上来了但被显著性解除」——必须同时看这两个量。
@@ -745,7 +748,8 @@ def _evaluate_pair(
         off = additive_offset_test(
             a.gray, b.gray, (labels == i).astype(np.uint8), scale=scale,
             coh_min=band.offset.coh_min, cv_max=band.offset.cv_max,
-            std_delta_k=band.offset.std_delta_k, min_px=band.offset.min_px,
+            std_delta_k=band.offset.std_delta_k, std_a_max=band.offset.std_a_max,
+            min_px=band.offset.min_px,
         )
         if off_diag is None or ratio > max_ratio:
             off_diag = off
@@ -767,6 +771,7 @@ def _evaluate_pair(
         offset_sign_coh=off_diag.sign_coherence if off_diag else 0.0,
         offset_shift_cv=off_diag.shift_cv if off_diag else 0.0,
         offset_std_delta=off_diag.std_delta if off_diag else 0.0,
+        offset_std_a=off_diag.std_a if off_diag else 0.0,
     )
     if count == 0 and offset_rejected > 0:
         # 合格块全被加性偏移判据剔掉 → 归因给它,而不是笼统的「块不合格」。
@@ -844,7 +849,13 @@ def _maybe_dump(
         return
     if _dump_count >= config.gate_debug_dump_max:
         return
-    if config.gate_debug_dump_on_disagree and not _is_disagreement(config, result):
+    if config.gate_debug_dump_on_disagree and not (
+        _is_disagreement(config, result)
+        # offset 判据单独落盘:被它压掉的窗旧算法通常也不触发 → 不构成分歧 → 默认
+        # 落不下来。而它压掉的恰是「首遇漏报」的最可能来源(纯色物体贴平滑墙),必须
+        # 留证人工复核——样本量小(实测 ~3% 分歧窗),不会写爆磁盘。
+        or result.diag.verdict == VERDICT_OFFSET_ONLY
+    ):
         return
     try:
         import json
