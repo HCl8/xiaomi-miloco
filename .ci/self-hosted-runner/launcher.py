@@ -255,7 +255,10 @@ def container_running_job(name):
     # （"确定没在跑"），三处调用照样下手杀容器。
     if proc.returncode != 0:
         return None
-    lines = [ln for ln in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if ln.strip()]
+    # **只看 stdout**：`container logs` 把容器的日志打在它自己的 stdout 上，stderr 是 CLI 的
+    # 报错。把两条流拼起来的话，"最后一行"变成 stderr 的最后一行 —— 而"跑作业期间最后一行
+    # 恰好是 Running job:"这个位置性质就没了保证（runner 期间任何一条 stderr 都会顶掉它）。
+    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     if not lines:
         return None                      # 还没吐出任何日志（刚起来）→ 也算问不出来，别当"没在跑"
     return "Running job:" in lines[-1]
@@ -342,22 +345,31 @@ def start_container(cfg, jit, name, round_no):
     _hand_over_jit(cfg, jit, name)
 
 
-def image_digest(ref):
-    """镜像引用解析出的 digest；取不到返回 None。
+def image_info(ref):
+    """镜像引用解析出的 (digest, 构建它的 commit)；取不到的项为 None。
 
-    日志里只打配置里的字面值不够用：配置写 `latest` 时，两次构建之后同一条日志一模一样，
-    事后没法对齐"这次审查到底跑的是哪一版镜像"，只能去翻 registry。
+    日志里只打配置里的字面值不够用：配置写 `latest` 时，两次构建之后同一条日志一模一样。
+    digest 能区分"换没换"，但要对回"换成了哪个 commit"还得翻 registry —— 而镜像自己就带着
+    这个信息（build-runner-image.yml 打的 OCI label），直接读出来。
     """
     proc = _run(["image", "inspect", ref])
     if proc.returncode != 0:
-        return None
+        return None, None
     try:
         items = json.loads(proc.stdout)
     except ValueError:
-        return None
-    if isinstance(items, list) and items and isinstance(items[0].get("id"), str):
-        return items[0]["id"]
-    return None
+        return None, None
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None, None
+    top = items[0]
+    digest = top.get("id") if isinstance(top.get("id"), str) else None
+    revision = None
+    for variant in top.get("variants") or []:
+        labels = (((variant or {}).get("config") or {}).get("config") or {}).get("Labels") or {}
+        if labels.get("org.opencontainers.image.revision"):
+            revision = labels["org.opencontainers.image.revision"]
+            break
+    return digest, revision
 
 
 def sweep_stale_jit_files(cfg):
@@ -760,8 +772,10 @@ def main():
 
     sweep_stale_jit_files(cfg)
 
-    log.info("启动：镜像=%s digest=%s 网络=%s 仓库=%s 标签=%s 待命容器=%d 空闲回收=%ds",
-             cfg["image"], image_digest(cfg["image"]) or "未解析",
+    digest, revision = image_info(cfg["image"])
+    log.info("启动：镜像=%s digest=%s commit=%s 网络=%s 仓库=%s 标签=%s 待命容器=%d 空闲回收=%ds",
+             cfg["image"], digest or "未解析",
+             revision[:12] if revision else "未标注（镜像没带 revision label）",
              cfg["network"], cfg["github_repo"], ",".join(cfg["runner_labels"]),
              cfg["replicas"], cfg["idle_recycle_seconds"])
     # 标签是唯一让 GitHub 把作业派到这台机器上的东西：runner 报的标签与 workflow 的 runs-on
