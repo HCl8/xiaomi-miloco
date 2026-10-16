@@ -1,0 +1,120 @@
+name: PR Review (self-hosted)
+
+# 自托管路径的真实审查：与线上那份 pr-review.yml 跑同一个门禁脚本，
+# 只有"谁执行"不同 —— runs-on 指向自托管 runner，且不再声明 container:（容器由启动器起）。
+#
+# 触发：workflow_dispatch（手动，可指定 PR）或本仓内 PR 的推送。
+# 备注：线上那份用的是 pull_request_target（fork PR 也能审、且 PR 改不到工作流）；
+# 这里用 pull_request 是冒烟阶段的选择 —— 我们的 PR 都来自本仓分支，够用，也省掉一层授权设计。
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR 编号（留空则用触发事件里的）
+        required: false
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# ⚠️ 切到自托管之前必须先下线线上那份「每个 PR 各跑一次」的路径。
+# 两条路径并发审同一个 PR 时，共用同一条 review-pr-ci 评论和同一个 pr-review status context，
+# 而门禁「跑前记下评论更新时间、跑完比一次」这条防假绿判定，前提是**这条评论只有本次审查会写** ——
+# 并发时前提不成立。（本仓当前已把线上那两份手动关掉，只剩这条自托管路径；正式切换时
+# 线上那份只保留兜底 sweeper 的角色。）
+#
+# 同一 PR 连续 push 时取消上一次审查，只留最新。
+# 线上两份都有这一条，这份最初漏了 —— 而自托管下"一个 runner 一次一个作业"的串行保证不成立
+# （每个作业各起一个独立容器），两份审查并发时会把 PR 上唯一那条 review-pr-ci 评论互相覆盖，
+# 门禁读到的可能是另一个 commit 的结论。
+concurrency:
+  # 组名必须与线上那份（pr-review-<号>）**不同** —— concurrency 组是仓库级全局的，
+  # 同名时两份会互相取消，而云端兜底/sweeper 恰好会在最需要它的时候被自托管路径取消掉。
+  group: pr-review-selfhosted-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write # review-pr --ci 要发/改 PR 评论
+  statuses: write       # 把结论打成 pr-review commit status
+
+jobs:
+  review:
+    # 认专属标签，避免被 GitHub 托管的机器接走
+    runs-on: [self-hosted, prr-test]
+    timeout-minutes: 60
+    # 三重守卫：草稿不审（与线上一致，靠 ready_for_review 事件补审）；非本仓（fork）的 PR
+    # 不在自托管上审；手动触发没有 pull_request 上下文，放行 —— 单写 `draft == false`
+    # 会把手动触发也一起挡掉。
+    #
+    # ⚠️ 这个 `if` **不是安全边界，不要当边界引用**。`pull_request` 事件取的是 **PR 那一侧**的
+    # 工作流文件（证据：这份文件在 base 分支上并不存在，却照样被跑起来了），所以 fork 可以在
+    # 自己的 commit 里把这几行连同整个 job 一起改掉。它只挡住"不带恶意的 fork"这一类。
+    #
+    # 真正的边界有两层，都不在这个文件里：
+    #   ① 容器那层 —— 非 root、无宿主挂载、无容器 socket，出口由 pf 收口到宿主机两个端口；
+    #   ② 仓库设置 Actions → Fork pull request workflows → 要求外部协作者审批。
+    if: >-
+      github.event_name != 'pull_request'
+      || (github.event.pull_request.draft == false
+          && github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - name: 定 PR 编号
+        id: pr
+        env:
+          # 走 env 而不是把表达式直接插进 shell —— 输入值不该被当成代码执行
+          DISPATCH_PR: ${{ github.event.inputs.pr }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+        run: |
+          num="${DISPATCH_PR:-${EVENT_PR}}"
+          if [ -z "$num" ]; then
+            echo "::error::没拿到 PR 编号（手动触发时 pr 输入不能留空，否则会去 checkout refs/pull//merge）"
+            exit 1
+          fi
+          # 必须是纯数字。手动触发时 pr 是自由文本，它会被拼进 API 路径与 ref，
+          # 这里挡住，下游就不必各自再防一次。
+          case "$num" in
+            *[!0-9]*) echo "::error::PR 编号必须是纯数字，拿到的是：$num"; exit 1 ;;
+          esac
+          echo "num=${num}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: refs/pull/${{ steps.pr.outputs.num }}/merge
+          fetch-depth: 0
+
+      - name: 允许 git 访问工作区
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: AI 审查并按严重度门禁
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 走 env 而不是把表达式直接插进 shell —— 与上面「定 PR 编号」那步同一个理由：
+          # 输入值不该被当成代码执行（手动触发时 pr 是自由文本，`1; rm -rf /` 这种要原样当参数）。
+          PR_NUM: ${{ steps.pr.outputs.num }}
+          REPO: ${{ github.repository }}
+          # 这里**刻意不声明** ANTHROPIC_* / PR_AGENT_MODEL：
+          # 它们由宿主机的启动器注入容器（模型地址指向宿主机上的模型代理，
+          # 容器拿到的是一把假钥匙，真 key 不进容器）。
+          # 在这声明空值会把启动器注入的值覆盖掉 —— fork 上没有这些 secret。
+        run: |
+          git fetch origin main
+
+          # 跑 base 分支上的门禁脚本（与线上同一个文件，单一来源）。
+          # 用 git show 取 origin/main 版本而非工作区那份 —— PR 改不动这段判定逻辑。
+          if git show origin/main:.ci/pr-review-gate.sh \
+            | bash -s -- "$PR_NUM" "$REPO"; then
+            STATE=success
+            DESC="未发现严重/重要问题"
+          else
+            STATE=failure
+            DESC="发现严重/重要问题"
+          fi
+
+          # 结论必须打在 **PR head** 的 commit 上，不能打在检出到的工作区 HEAD 上 ——
+          # 上面 checkout 的是 refs/pull/<n>/merge，那是 GitHub 现算的合并提交：
+          # 它临时（base 一前进就换 SHA）、且 PR 的 check 全在 head 上。
+          # 打错地方的话，这条 status 既不显示在 PR 上，也当不了 required check（线上两份都是打 head）。
+          HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq .head.sha)
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            -f state="$STATE" -f context="pr-review" -f description="$DESC" >/dev/null
+
+          [ "$STATE" = success ]

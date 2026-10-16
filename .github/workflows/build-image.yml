@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [".ci/Dockerfile.pr-review"]
+    # .ci/pr-agent.sh 也要列上：Dockerfile.pr-review 把它 COPY 进镜像，改了它不重建的话
+    # 改动静默不生效（自托管那份镜像的 paths 里已经有它）。
+    paths:
+      - ".ci/Dockerfile.pr-review"
+      - ".ci/pr-agent.sh"
 
 permissions:
   contents: read
