@@ -47,8 +47,13 @@ jobs:
           else
             ok "看不到 macOS 的文件系统"
           fi
-          if [ -r /Users/mi/.ssh ] 2>/dev/null; then
-            bad "能读到宿主机用户目录"
+          # 通配扫，不写死某个用户名 —— 写死既是环境痕迹，也只覆盖那一个用户
+          host_ssh=""
+          for h in /Users/*/.ssh /home/*/.ssh; do
+            [ -r "$h" ] && { host_ssh="$h"; break; }
+          done 2>/dev/null || true
+          if [ -n "$host_ssh" ]; then
+            bad "能读到宿主机用户目录 $host_ssh"
           else
             ok "读不到宿主机的用户目录"
           fi
@@ -82,7 +87,7 @@ jobs:
             || bad "到不了 GitHub 转发代理"
           tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
             && ok "能到宿主机上的模型代理 $HOST_GW:$MODEL_PROXY_PORT" \
-            || bad "到不了模型代理（探针阶段可忽略，模型代理按需启动）"
+            || bad "到不了模型代理"
 
           echo "================ 6. 到不了别的地方 ================"
           tcp github.com 443 \

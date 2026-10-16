@@ -20,12 +20,11 @@ prreview/
 │                             18080 按域名白名单转发 GitHub
 │                             18081 把假钥匙换成真 key 后转发模型
 ├── launcher.py             启动器：池子 + 启动前自检 + 内存准入 + 定期清理
-├── fetch_image.py          从 CI 的 artifact 取镜像并 load（不需要 registry 凭据）
+├── pull_image.py           从 ghcr 取镜像（public 包，不需要 registry 凭据）
 ├── pf-setup.sh             装宿主机侧出口过滤（容器只能到宿主机）
-├── prreview.json           唯一配置文件（不含凭据）
+├── prreview.example.json   配置模板，拷成 prreview.json 再改（不含凭据）
 ├── probe.sh                隔离探针（可手工跑，也可以在 workflow 里跑）
 ├── install-launchd.sh      装两个 LaunchAgent（gateway + launcher）
-├── container/Dockerfile.runner   本地构建用的底座（CI 构建见 .ci/Dockerfile.pr-runner）
 ├── secrets/                chmod 600，全部不进 git
 │   ├── github-token        能申请 runner 登记凭据的那把凭据
 │   ├── model-key           模型真 key（只在宿主机网关手里）
@@ -53,9 +52,9 @@ prreview/
 
 3. **放凭据**（`~/prreview/secrets/`，全部 `chmod 600`）：见上表。
 
-4. **取镜像**：`python3 ~/prreview/fetch_image.py`
-   （走 GitHub 仓库的 artifact，不需要 registry 凭据。若把 ghcr 上的包设成 public，
-   也可以直接 `container image pull ghcr.io/<owner>/prr-review:latest`——那条能按 digest 钉住。）
+4. **取镜像**：`python3 ~/prreview/pull_image.py`
+   （包设成 public 时按匿名拉，不需要任何凭据。要钉版本优先用构建时按 commit 打的 tag，
+   比 `:latest` 稳。）
 
 5. **装出口过滤**（关键，见下节）：`bash ~/prreview/pf-setup.sh`
    然后 `bash ~/prreview/pf-setup.sh --persist`（macOS 开机不自动启用 pf）

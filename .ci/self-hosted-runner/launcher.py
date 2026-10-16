@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一次性 runner 启动器 —— 在 mac-mini 上跑，由 launchd 托管。
+"""一次性 runner 启动器 —— 跑在运行机上，由 launchd 托管。
 
 每一轮做同一件事：要一份一次性登记凭据 → 起一个容器把凭据交给它 → 等容器退出 → 补下一个。
 容器是本进程起的、参数是写死的，所以任务对容器形态没有话语权（挂不了宿主目录、提不了特权）。
@@ -123,9 +123,15 @@ def discover_guard_ports(cfg):
         fields = line.split()
         if len(fields) < 4:
             continue
-        tail = fields[3].rsplit(".", 1)[-1]          # '* .18080' / '127.0.0.1.22' → 端口
-        if tail.isdigit():
-            ports.add(int(tail))
+        addr, _, tail = fields[3].rpartition(".")    # '*.18080' → '*'+'18080'；'127.0.0.1.22' → '127.0.0.1'+'22'
+        if not tail.isdigit():
+            continue
+        # 只收「通配」或「就绑在网关地址上」的监听：只有这两种在防火墙缺位时真的够得着。
+        # 绑在 127.0.0.1 或别的地址上的端口，容器走网关地址本就碰不到 —— 拿它当靶子永远是
+        # "没连上"，那条断言等于没做（假绿）。
+        if addr not in ("*", cfg["host_gateway"]):
+            continue
+        ports.add(int(tail))
     # 只取前几个：这是"够不够得着"的抽样，不是端口清单。每个靶子都要等一次超时，
     # 取全部会让自检从几秒变成近一分钟。
     return sorted(p for p in ports if p not in mine)[:3]
@@ -543,11 +549,20 @@ def manage_pool(cfg):
                     log.error("停掉待命容器且不再起新的。隔离修法：bash ~/prreview/pf-setup.sh；"
                               "网关修法：launchctl kickstart -k gui/%s/com.prreview.gateway",
                               os.getuid())
+                    # 同一条判据：只收空闲的。自检没过不该牵连正在跑任务的容器 —— 杀它 = 掐断那个
+                    # 任务，且 GitHub 拒绝删"正在跑任务的 runner"记录（422），那条会占住该 PR 的
+                    # concurrency 组直到 job 自己超时（与退出收尾处同理）。
                     names = [n for n, _ in slots.values()]
-                    for name in names:
+                    busy = [n for n in names if container_running_job(n)]
+                    idle = [n for n in names if n not in busy]
+                    if busy:
+                        log.warning("%d 个容器正在跑任务，不杀它们，让它们跑完自己退出：%s",
+                                    len(busy), ", ".join(busy))
+                    for name in idle:
                         kill_and_delete(name)
-                    slots.clear()
-                    forget_runners(cfg, names)
+                    # 跑着任务的那几个槽留着，等容器自然结束由回收逻辑收（否则就成孤儿了）
+                    slots = {s: v for s, v in slots.items() if v[0] in busy}
+                    forget_runners(cfg, idle)
                     time.sleep(60)
                     continue
                 guard_checked_at = time.time()

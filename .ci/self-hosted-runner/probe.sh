@@ -21,10 +21,13 @@ echo "================ 2. 看不见宿主机 ================"
 { [ -e /Users ] || [ -e /System ]; } \
   && bad "能看到 macOS 的目录（/Users 或 /System 存在）" \
   || ok "看不到 macOS 的文件系统"
+host_ssh=""
 for h in /Users/*/.ssh /home/*/.ssh; do
-  [ -r "$h" ] && { bad "能读到宿主机用户目录 $h"; break; }
+  [ -r "$h" ] && { host_ssh="$h"; break; }
 done 2>/dev/null || true
-ok "读不到宿主机的用户目录"
+[ -n "$host_ssh" ] \
+  && bad "能读到宿主机用户目录 $host_ssh" \
+  || ok "读不到宿主机的用户目录"
 
 echo "================ 3. 没有容器运行时接口 ================"
 found=""
