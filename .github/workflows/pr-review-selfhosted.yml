@@ -1,0 +1,70 @@
+name: PR Review (self-hosted)
+
+# 内网自托管路径的真实审查：与线上那份 pr-review.yml 跑同一个门禁脚本，
+# 只有"谁执行"不同 —— runs-on 指向自托管 runner，且不再声明 container:（容器由启动器起）。
+#
+# 触发：workflow_dispatch（手动，可指定 PR）或本仓内 PR 的推送。
+# 备注：线上那份用的是 pull_request_target（fork PR 也能审、且 PR 改不到工作流）；
+# 这里用 pull_request 是冒烟阶段的选择 —— 我们的 PR 都来自本仓分支，够用，也省掉一层授权设计。
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR 编号（留空则用触发事件里的）
+        required: false
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write # review-pr --ci 要发/改 PR 评论
+  statuses: write       # 把结论打成 pr-review commit status
+
+jobs:
+  review:
+    # 认专属标签，避免被 GitHub 托管的机器接走
+    runs-on: [self-hosted, prr-test]
+    timeout-minutes: 60
+    steps:
+      - name: 定 PR 编号
+        id: pr
+        run: |
+          if [ -n "${{ github.event.inputs.pr }}" ]; then
+            echo "num=${{ github.event.inputs.pr }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "num=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: refs/pull/${{ steps.pr.outputs.num }}/merge
+          fetch-depth: 0
+
+      - name: 允许 git 访问工作区
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: AI 审查并按严重度门禁
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 这里**刻意不声明** ANTHROPIC_* / PR_AGENT_MODEL：
+          # 它们由宿主机的启动器注入容器（模型地址指向宿主机上的模型代理，
+          # 容器拿到的是一把假钥匙，真 key 不进容器）。
+          # 在这声明空值会把启动器注入的值覆盖掉 —— fork 上没有这些 secret。
+        run: |
+          git fetch origin main
+
+          # 跑 base 分支上的门禁脚本（与线上同一个文件，单一来源）。
+          # 用 git show 取 origin/main 版本而非工作区那份 —— PR 改不动这段判定逻辑。
+          if git show origin/main:.ci/pr-review-gate.sh \
+            | bash -s -- "${{ steps.pr.outputs.num }}" "${{ github.repository }}"; then
+            STATE=success
+            DESC="未发现严重/重要问题"
+          else
+            STATE=failure
+            DESC="发现严重/重要问题"
+          fi
+
+          gh api "repos/${{ github.repository }}/statuses/$(git rev-parse HEAD)" \
+            -f state="$STATE" -f context="pr-review" -f description="$DESC" >/dev/null
+
+          [ "$STATE" = success ]
