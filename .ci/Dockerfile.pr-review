@@ -14,8 +14,8 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-# pr-agent 的单一来源是 .ci/pr-agent——本文件和 .ci/Dockerfile.pr-runner 共用同一份，避免各存一份漂移
-COPY .ci/pr-agent /usr/local/bin/pr-agent
+# pr-agent 的单一来源是 .ci/pr-agent.sh——本文件和 .ci/Dockerfile.pr-runner 共用同一份，避免各存一份漂移
+COPY .ci/pr-agent.sh /usr/local/bin/pr-agent
 RUN chmod +x /usr/local/bin/pr-agent
 
 # UID 必须是 1001：GitHub-hosted runner 以 runner 用户(UID 1001)创建 /__w 及 _temp 下的

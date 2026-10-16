@@ -13,7 +13,15 @@ on:
         description: PR 编号（留空则用触发事件里的）
         required: false
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# 同一 PR 连续 push 时取消上一次审查，只留最新。
+# 线上两份都有这一条，这份最初漏了 —— 而自托管下"一个 runner 一次一个作业"的串行保证不成立
+# （每个作业各起一个独立容器），两份审查并发时会把 PR 上唯一那条 review-pr-ci 评论互相覆盖，
+# 门禁读到的可能是另一个 commit 的结论。
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -25,15 +33,23 @@ jobs:
     # 认专属标签，避免被 GitHub 托管的机器接走
     runs-on: [self-hosted, prr-test]
     timeout-minutes: 60
+    # 草稿 PR 不审（与线上一致，靠 ready_for_review 事件补审）。
+    # 手动触发没有 pull_request 上下文，得放行 —— 单写 `draft == false` 会把手动触发也一起挡掉。
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
       - name: 定 PR 编号
         id: pr
+        env:
+          # 走 env 而不是把表达式直接插进 shell —— 输入值不该被当成代码执行
+          DISPATCH_PR: ${{ github.event.inputs.pr }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
         run: |
-          if [ -n "${{ github.event.inputs.pr }}" ]; then
-            echo "num=${{ github.event.inputs.pr }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "num=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          num="${DISPATCH_PR:-${EVENT_PR}}"
+          if [ -z "$num" ]; then
+            echo "::error::没拿到 PR 编号（手动触发时 pr 输入不能留空，否则会去 checkout refs/pull//merge）"
+            exit 1
           fi
+          echo "num=${num}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -64,7 +80,12 @@ jobs:
             DESC="发现严重/重要问题"
           fi
 
-          gh api "repos/${{ github.repository }}/statuses/$(git rev-parse HEAD)" \
+          # 结论必须打在 **PR head** 的 commit 上，不能打在检出到的工作区 HEAD 上 ——
+          # 上面 checkout 的是 refs/pull/<n>/merge，那是 GitHub 现算的合并提交：
+          # 它临时（base 一前进就换 SHA）、且 PR 的 check 全在 head 上。
+          # 打错地方的话，这条 status 既不显示在 PR 上，也当不了 required check（线上两份都是打 head）。
+          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.num }}" --jq .head.sha)
+          gh api "repos/${{ github.repository }}/statuses/$HEAD_SHA" \
             -f state="$STATE" -f context="pr-review" -f description="$DESC" >/dev/null
 
           [ "$STATE" = success ]

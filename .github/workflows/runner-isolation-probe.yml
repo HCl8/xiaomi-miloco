@@ -61,14 +61,19 @@ jobs:
           [ -z "$found" ] && ok "没有可用的容器运行时 socket" || bad "发现 socket:$found"
 
           echo "================ 4. 任务之间互不可见 ================"
+          residue=""
           for m in /tmp/prr-probe-marker "$HOME/.prr-probe-marker"; do
-            if [ -e "$m" ]; then
-              bad "看到上一个任务留下的 ${m}（容器没有一次性销毁？）"
-            fi
+            [ -e "$m" ] && residue="${residue} ${m}"
           done
+          if [ -n "$residue" ]; then
+            bad "看到上一个任务留下的${residue}（容器没有一次性销毁？）"
+          else
+            ok "没有发现上一次任务的残留"
+          fi
+          # 埋本次标记：下一次在别的容器里跑，应当看不到它
           date > "$HOME/.prr-probe-marker" 2>/dev/null || true
           date > /tmp/prr-probe-marker 2>/dev/null || true
-          ok "没有发现上一次任务的残留（已埋下本次标记，下一次运行会验）"
+          ok "已埋下本次标记（下一次运行会验）"
 
           echo "================ 5. 唯一的出口是宿主机 ================"
           tcp "$HOST_GW" "$GH_PROXY_PORT" \

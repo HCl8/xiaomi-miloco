@@ -60,15 +60,16 @@ FROM runner-base
 
 USER root
 
-# Actions 以 root 克隆仓库、容器以 agent(1001) 运行；不关掉 dubious ownership 检查，
-# gh pr diff / git diff / git log 会全部报错
-RUN git config --global --add safe.directory '*'
-
 # 单一来源：两个 Dockerfile 共用同一个包装脚本，避免各存一份漂移
-COPY .ci/pr-agent /usr/local/bin/pr-agent
+COPY .ci/pr-agent.sh /usr/local/bin/pr-agent
 RUN chmod 0755 /usr/local/bin/pr-agent
 
 USER agent
+
+# 必须在切到 agent 之后设 —— 否则写的是 /root/.gitconfig，而 agent 读的是 /home/agent/.gitconfig，
+# 等于没设（实测踩过：容器里 agent 的全局配置里根本没有这一条）。
+# 作用是关掉 dubious ownership 检查，不然 gh pr diff / git diff / git log 会全部报错。
+RUN git config --global --add safe.directory '*'
 
 # 审查 CLI 装到 agent 用户下。
 # NOTE(intentional): 刻意不 pin 版本——镜像按周期重建，借此跟进上游；每次重建前本地验证一遍。
