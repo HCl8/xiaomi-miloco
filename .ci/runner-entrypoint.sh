@@ -31,7 +31,7 @@ for _ in $(seq 1 "${PRR_JIT_WAIT_SECONDS:-90}"); do
 done
 
 if [ ! -s "$JIT_FILE" ]; then
-    echo "没等到登记凭据（$JIT_FILE）：启动器是不是没拷进来？" >&2
+    echo "没等到登记凭据（${JIT_FILE}）：启动器是不是没拷进来？" >&2
     exit 64
 fi
 

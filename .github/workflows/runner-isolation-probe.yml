@@ -63,7 +63,7 @@ jobs:
           echo "================ 4. 任务之间互不可见 ================"
           for m in /tmp/prr-probe-marker "$HOME/.prr-probe-marker"; do
             if [ -e "$m" ]; then
-              bad "看到上一个任务留下的 $m（容器没有一次性销毁？）"
+              bad "看到上一个任务留下的 ${m}（容器没有一次性销毁？）"
             fi
           done
           date > "$HOME/.prr-probe-marker" 2>/dev/null || true
