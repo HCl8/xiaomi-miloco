@@ -244,23 +244,24 @@ def container_running_job(name):
 
 
 def container_state(name):
-    """返回容器状态字符串（running/stopped/...）；容器不存在返回 None。
+    """容器状态：running/stopped/... ；**确实没有这个容器**返回 None ；**问不出来**返回 "unknown"。
 
-    不能只看 `container inspect` 的退出码：容器停止之后它照样返回 0，
-    于是看护循环会以为它还活着，一直空等到回收时限。实测踩过这个坑 ——
-    表现是"跑完一个任务后启动器五十分钟才补下一个"，"始终保有一个空闲容器"直接失效。
+    三态必须分开，两个方向都踩过/会踩：
+      - 只看 `container inspect` 的退出码不行：容器停止之后它照样返回 0，看护循环会以为它
+        还活着、一直空等到回收时限（实测踩过：跑完一个任务后启动器五十分钟才补下一个）。
+      - 把"问不出来"并进"已经没了"同样不行：调用方据此收容器，于是 inspect 偶发失败或输出
+        形状变了，就会掐掉一个正在跑任务的容器 —— 白赔一个作业，还留下一条 GitHub 拒绝删
+        （422）的 runner 记录堵住该 PR 的 concurrency 组。
     """
     proc = _run(["inspect", name])
     if proc.returncode != 0:
-        return None
+        blob = ((proc.stderr or "") + (proc.stdout or "")).lower()
+        # CLI 对不存在的容器报 `container not found: <名字>`
+        return None if ("not found" in blob or "no such" in blob) else "unknown"
     try:
         return json.loads(proc.stdout)[0]["status"]["state"]
     except (ValueError, KeyError, IndexError, TypeError):
-        return None
-
-
-def container_alive(name):
-    return container_state(name) == "running"
+        return "unknown"
 
 
 def kill_and_delete(name):
@@ -579,9 +580,15 @@ def manage_pool(cfg):
             # 回收：容器已经结束的、或空等超时的。收掉容器时顺手把它的 runner 记录也删了 ——
             # 被我们杀掉的容器不会自己注销，不删就堆着。
             for slot, (name, deadline) in list(slots.items()):
-                if not container_alive(name):
-                    log.info("槽 %d：容器 %s 已结束，日志尾部如下\n%s",
-                             slot, name, tail_container_log(name))
+                state = container_state(name)
+                if state == "unknown":
+                    # "问不出来"不是"已经没了"。这一支里动手就是拿没问到当没有，可能掐掉一个
+                    # 正在跑任务的容器。留着，下一轮再问。
+                    log.warning("槽 %d：容器 %s 状态查不出来，本轮不动它", slot, name)
+                    continue
+                if state != "running":
+                    log.info("槽 %d：容器 %s 已结束（state=%s），日志尾部如下\n%s",
+                             slot, name, state, tail_container_log(name))
                     kill_and_delete(name)
                     del slots[slot]
                     forget_runners(cfg, [name])
