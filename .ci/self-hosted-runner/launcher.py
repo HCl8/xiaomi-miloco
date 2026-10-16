@@ -102,8 +102,12 @@ GUARD_PROBE = (
 )
 
 
-def discover_guard_ports(cfg):
+def discover_guard_ports(cfg, restrict=None):
     """宿主机正在监听的 TCP 端口（去掉我们自己的两个网关端口）。
+
+    `restrict` 给了就只在其中挑（配置里的 guard_ports 走这条）。**配置给的靶子也要过同一道
+    筛**：写进来一个绑在回环上的端口，容器走网关地址永远够不着，那条自检就成了永远绿的摆设
+    —— 而它本该是"够不够得着"的实测。
 
     出口自检要证明的是"容器够不着宿主机上那些与本方案无关的服务"，所以靶子应当由
     **这台机器实际在听什么**决定，而不是写死两个端口 —— 写死既在代码里留下环境痕迹，
@@ -139,6 +143,8 @@ def discover_guard_ports(cfg):
         if addr not in ("*", cfg["host_gateway"]):
             continue
         ports.add(int(tail))
+    if restrict is not None:
+        ports &= {int(p) for p in restrict}
     # 只取前几个：这是"够不够得着"的抽样，不是端口清单。每个靶子都要等一次超时，
     # 取全部会让自检从几秒变成近一分钟。
     return sorted(p for p in ports if p not in mine)[:3]
@@ -154,16 +160,7 @@ def check_egress_guard(cfg):
     探测哪几个端口由配置给（guard_ports），函数本身不写死。
     返回 (ok, 说明)。
     """
-    mine = {int(cfg["github_proxy_port"])}
-    if cfg.get("model_proxy_port"):
-        mine.add(int(cfg["model_proxy_port"]))
-    ports = cfg.get("guard_ports")
-    if ports is not None:
-        # 配置里显式给的靶子也要剔掉网关自己的两个端口：拿它们当靶子必然"够得着"，
-        # 那条自检就永远过不了 —— 而原因与隔离无关。
-        ports = [p for p in ports if int(p) not in mine]
-    if ports is None:
-        ports = discover_guard_ports(cfg)
+    ports = discover_guard_ports(cfg, cfg.get("guard_ports"))
     if ports is None:
         # 探测失败 ≠ 没有目标。宁可挡住，也不假装检查过了
         return False, "探不到宿主机在监听哪些端口（netstat 失败），无法完成出口自检"

@@ -33,8 +33,10 @@
     "arm64",
     "prr-test"
   ],
-  "_comment_guard": "起 runner 之前先做两项自检：隔离还在不在（安全）、网关还活着没（可用性）",
+  "_comment_guard": "起 runner 之前先做两项自检：隔离还在不在（安全）、网关还活着没（可用性）。任一项不过就停掉待命容器且不再起新的 —— 这是**故意的 fail-closed**：自检不过时这台机器不该接公网上来的任务。遇上它先看日志里那两行具体说明（出口/网关各自给了修法），别把这个键改成 false 了事，那等于把这道门整个摘掉。",
   "require_egress_guard": true,
+  "_comment_guard_ports": "可选。留空就现探（从 netstat 里挑通配/网关地址上的监听，取前 3 个）。填了也不能乱填：这些端口同样要过\"绑在通配或网关地址上\"那道筛，绑在回环上的会被剔掉 —— 那种靶子容器永远够不着，自检会变成永远绿的摆设",
+  "guard_ports": null,
   "guard_recheck_seconds": 900,
   "name_prefix": "prr",
   "log_dir": "~/prreview/logs",
