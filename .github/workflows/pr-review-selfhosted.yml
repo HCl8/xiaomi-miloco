@@ -20,7 +20,9 @@ on:
 # （每个作业各起一个独立容器），两份审查并发时会把 PR 上唯一那条 review-pr-ci 评论互相覆盖，
 # 门禁读到的可能是另一个 commit 的结论。
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
+  # 组名必须与线上那份（pr-review-<号>）**不同** —— concurrency 组是仓库级全局的，
+  # 同名时两份会互相取消，而云端兜底/sweeper 恰好会在最需要它的时候被自托管路径取消掉。
+  group: pr-review-selfhosted-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: true
 
 permissions:
