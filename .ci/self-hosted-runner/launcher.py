@@ -161,8 +161,11 @@ def check_egress_guard(cfg):
         # 探测失败 ≠ 没有目标。宁可挡住，也不假装检查过了
         return False, "探不到宿主机在监听哪些端口（netstat 失败），无法完成出口自检"
     if not ports:
-        # 确实是"这台机器除网关外没在听别的" → 没有无关服务要防，自检自然成立
-        return True, "宿主机除网关外没有其它监听端口，无可测目标"
+        # 一个靶子都筛不出来 → **判失败**，与 pf-setup.sh 的 judge（要求至少一个端口靶子）
+        # 在同条件下判决一致。不能当"没有可测目标"放过：真正的"这台机器只听了网关"与
+        # "我们的解析坏了/输出格式变了"在这里长得一模一样，而后者会让这条安全检查
+        # 静默失效（一个探针容器都没跑，日志上却是"自检通过"）。
+        return False, "筛不出可测的宿主端口（netstat 输出没有通配/网关地址上的监听？），无法完成出口自检"
     probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
                                ports=" ".join(str(p) for p in ports))
     args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],

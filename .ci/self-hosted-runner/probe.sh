@@ -71,18 +71,35 @@ tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
   || bad "到不了模型代理"
 
 echo "================ 6. 到不了别的地方 ================"
-tcp github.com 443 \
-  && bad "直连 github.com:443 通了（应该没有路由）" \
-  || ok "直连 github.com:443 不通"
-# 靶子默认用 RFC 5737 的保留地址（本就没有路由）。真实部署可以设 PRR_INTRANET_TARGET
-# 指向一台内网机器来加强这条断言 —— 但别把那个地址写进脚本，这个是公开仓的文件。
-INTRANET_TARGET="${PRR_INTRANET_TARGET:-192.0.2.1}"
-tcp "$INTRANET_TARGET" 443 \
-  && bad "$INTRANET_TARGET:443 通了（有路由泄漏！）" \
-  || ok "$INTRANET_TARGET:443 不通"
-tcp example.com 80 \
-  && bad "example.com:80 通了（公网可达！）" \
-  || ok "公网 example.com:80 不通"
+# 用**字面 IP**。主机名要先解析，而"解析不出来"与"连不上"在结果上长得一样 —— 拿主机名
+# 当靶子，这条断言在容器里恒绿，什么都证明不了。1.1.1.1 不经过 DNS，不通就是不通。
+tcp 1.1.1.1 443 \
+  && bad "直连 1.1.1.1:443 通了（公网可达！）" \
+  || ok "直连 1.1.1.1:443 不通（字面公网 IP，不经 DNS）"
+
+resolve() { getent hosts "$1" 2>/dev/null | awk '{print $1; exit}'; }
+check_host() {   # check_host <主机名> <端口>
+  if [ -z "$(resolve "$1")" ]; then
+    printf '  \033[33mSKIP\033[0m  %s 在容器里解析不出来，这条没测到东西（不代表出口被挡）\n' "$1"
+    return
+  fi
+  tcp "$1" "$2" \
+    && bad "直连 $1:$2 通了（应该没有路由）" \
+    || ok "直连 $1:$2 不通"
+}
+check_host github.com 443
+check_host example.com 80
+
+# 内网那条不给靶子就 SKIP：以前默认的 RFC 5737 保留地址（192.0.2.1）全网本就没有路由，
+# 无论 pf 在不在都不通 —— 一条恒绿的断言等于没做。真实部署用 PRR_INTRANET_TARGET 指一台
+# 内网机器来真正加强它（别把那个地址写进脚本，这个是公开仓的文件）。
+if [ -n "${PRR_INTRANET_TARGET:-}" ]; then
+  tcp "$PRR_INTRANET_TARGET" 443 \
+    && bad "$PRR_INTRANET_TARGET:443 通了（有路由泄漏！）" \
+    || ok "$PRR_INTRANET_TARGET:443 不通"
+else
+  printf '  \033[33mSKIP\033[0m  没给 PRR_INTRANET_TARGET，内网可达性这条没测\n'
+fi
 
 echo "======================================================="
 [ "$fail" -eq 0 ] && echo "结论：全部通过" || echo "结论：有断言失败"
