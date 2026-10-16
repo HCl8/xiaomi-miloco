@@ -7,8 +7,9 @@
 # 改审查工具不用重建装 runner 的那层，也便于分别审计。
 #
 # 这个镜像由 .github/workflows/build-runner-image.yml 在 CI 上按多架构构建并推 ghcr，
-# 内网机器只负责 pull。**不在内网本地构建**：内网把 claude.ai 指到自签的内网 ALB，
-# 容器信任库里没有那张 CA，取不到审查 CLI（实测报 unable to get local issuer certificate）。
+# 运行机只负责取用。**不在运行机上本地构建**：运行机到上游安装源的 TLS 链在容器里
+# 验不过（实测报 `unable to get local issuer certificate`），取不到审查 CLI。
+# 构建放在能正常访问上游的环境做，运行机就只剩"取镜像"这一件事。
 
 ARG BASE_IMAGE=debian:trixie
 

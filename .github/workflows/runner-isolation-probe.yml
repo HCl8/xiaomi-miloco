@@ -1,6 +1,6 @@
 name: Runner Isolation Probe
 
-# 目的：把"任务跑在一次性容器里、容器碰不到内网和公网"这几条说法，变成可以自己跑的实测。
+# 目的：把"任务跑在一次性容器里、容器碰不到宿主以外的网络"这几条说法，变成可以自己跑的实测。
 # 触发方式本身也是安全设计：只留维护者能发起的方式，**绝不接 pull_request_target**——
 # 否则外部人就能反复往这台机器投递任务。
 on:
@@ -19,12 +19,13 @@ jobs:
     steps:
       - name: 逐条断言
         env:
-          # 容器唯一的出口：宿主机在那个内网段里的网关地址
+          # 容器唯一的出口：容器网络里宿主机的网关地址
           HOST_GW: "192.168.100.1"
           GH_PROXY_PORT: "18080"
           MODEL_PROXY_PORT: "18081"
-          # 这几个是"必须连不上"的靶子
-          INTRANET_HOST: "10.108.154.89"
+          # 一个保证不可路由的保留地址（RFC 5737 的 TEST-NET-1）：能连上就说明有路由泄漏。
+          # 刻意不写任何真实网络地址 —— 这个文件在公开仓里。
+          UNROUTABLE_HOST: "192.0.2.1"
         run: |
           fail=0
           ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
@@ -87,9 +88,9 @@ jobs:
           tcp github.com 443 \
             && bad "直连 github.com:443 通了（应该没有路由）" \
             || ok "直连 github.com:443 不通"
-          tcp "$INTRANET_HOST" 443 \
-            && bad "内网 $INTRANET_HOST:443 通了（内网可达！）" \
-            || ok "内网 $INTRANET_HOST:443 不通"
+          tcp "$UNROUTABLE_HOST" 443 \
+            && bad "$UNROUTABLE_HOST:443 通了（有路由泄漏！）" \
+            || ok "$UNROUTABLE_HOST:443 不通（保留地址，本就没有路由）"
           tcp example.com 80 \
             && bad "example.com:80 通了（公网可达！）" \
             || ok "公网 example.com:80 不通"

@@ -1,6 +1,6 @@
 name: PR Review (self-hosted)
 
-# 内网自托管路径的真实审查：与线上那份 pr-review.yml 跑同一个门禁脚本，
+# 自托管路径的真实审查：与线上那份 pr-review.yml 跑同一个门禁脚本，
 # 只有"谁执行"不同 —— runs-on 指向自托管 runner，且不再声明 container:（容器由启动器起）。
 #
 # 触发：workflow_dispatch（手动，可指定 PR）或本仓内 PR 的推送。
