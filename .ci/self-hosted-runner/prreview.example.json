@@ -1,6 +1,6 @@
 {
   "_comment": "整套部署的唯一配置文件。不含任何凭据 —— 凭据只以文件路径的形式出现。",
-  "image": "prr-review:latest",
+  "image": "ghcr.io/OWNER/prr-review:latest",
   "network": "prr-int",
   "_comment_pool": "同时维持几个待命容器。每个一次性 runner 只接一个任务，所以并发 >1 才扛得住多任务排队。实测一个空闲槽在宿主上约 0.4-0.65 GB（随内存上限动态增长，不是全额预留）：6 个待命时宿主可回收仍有 ~9.9 GB，所以放到 8。注意这是'正常时候宽裕'的取值 —— 8 个同时中签约 19 GB，超过 16 GB 时会走压缩/换页降级",
   "replicas": 8,
@@ -37,5 +37,6 @@
   "guard_recheck_seconds": 900,
   "name_prefix": "prr",
   "log_dir": "~/prreview/logs",
-  "_comment_upstream": "换成你自己的模型网关地址。容器里的真 key 由这个网关持有，容器只拿假钥匙"
+  "_comment_upstream": "换成你自己的模型网关地址。容器里的真 key 由这个网关持有，容器只拿假钥匙",
+  "_comment_image": "构建在 CI 完成、推到 ghcr，运行机只用这一条路拉。想钉死版本就写成 <镜像>@sha256:...（pull_image.py 会把 digest 打出来）"
 }

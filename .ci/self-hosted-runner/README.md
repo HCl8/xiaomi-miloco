@@ -62,7 +62,10 @@
 1. 建一个 host-only 容器网络（容器碰不到公网，只能到宿主机）
 2. 写 `prreview.json`（照 `prreview.example.json` 改；凭据只以**文件路径**形式出现在配置里）
 3. `pf-setup.sh` 装出口过滤，然后 `--persist` 让它开机生效
-4. `install-launchd.sh` 装两个常驻服务（网关 + 启动器）
+4. **取镜像**：`python3 pull_image.py` —— 从 ghcr 拉。包是 public 就零凭据
+   （公开仓出来的镜像没有秘密，正常就是把它设成 public）；私有包才需要
+   `registry_token_file` + `--login-user`。脚本会把 digest 打出来，好写进配置钉死。
+5. `install-launchd.sh` 装两个常驻服务（网关 + 启动器）
 
 ## 已知限制
 
