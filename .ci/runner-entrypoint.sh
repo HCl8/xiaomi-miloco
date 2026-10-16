@@ -3,11 +3,11 @@
 #
 # 存在的唯一理由：把一次性登记凭据安全地交给 runner 程序。
 #
-# 凭据怎么进来（两选一）：
+# 凭据进来的方式（两选一）：
 #   1. 参数里已经给了 --jitconfig —— 原样放行
 #   2. 等启动器把凭据**拷进容器文件系统**（默认 /opt/runner/.jitconfig），读完立刻删
 #
-# 为什么不用那两种更顺手的写法（都是实测踩出来的）：
+# 另外两种更顺手的写法不能用的原因（都实测过）：
 #   - `container run ... --jitconfig <blob>`：凭据进宿主机的进程命令行，ps aux 人人可见。
 #   - `container run -e PRR_JITCONFIG`：不进命令行，但容器运行时会把它写进
 #     ~/Library/Application Support/com.apple.container/containers/<name>/config.json

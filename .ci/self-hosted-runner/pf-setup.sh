@@ -1,10 +1,9 @@
 #!/bin/bash
 # 给这套 runner 的专属网段加一层宿主机侧出口过滤（pf）。
 #
-# 为什么需要这一层：Apple container 的 host-only 网络里，容器能碰到宿主机上所有监听端口
-# （这台机器实测 13 个，含 sshd 22、屏幕共享 5900）。而 hostOnly 的定义本身就是
-# "同一子网内互通"，宿主就在那个子网里、是网关 —— 所以从 container 的设置里关不掉。
-# 唯一能收口的位置是宿主机。
+# 这一层解决的是：在 host-only 网络里，容器能碰到宿主机上**所有**监听端口的服务。
+# hostOnly 的定义本身就是"同一子网内互通"，宿主就在那个子网里、是网关 ——
+# 所以从 container 的设置里关不掉，唯一能收口的位置是宿主机。
 #
 # 规则只匹配「源 = prr-int 的网段」，机器上其它容器在别的网段，一条都不匹配。
 #
@@ -31,11 +30,17 @@ CONTAINER=/usr/local/bin/container
 LOG_DIR="$HOME/prreview/logs"
 LOG="$LOG_DIR/pf-setup.log"
 
-# "必须连不上"的靶子：宿主机上与本方案无关的端口（sshd、屏幕共享）、宿主机的对外地址、
-# 以及公网。宿主机地址运行时探出来，不写死 —— 这个脚本要放进公开仓。
+# "必须连不上"的靶子：宿主机上与本方案无关的服务端口、宿主机的对外地址、以及公网。
+# 端口和地址都**现探**，正文里不写死任何具体值 —— 测的本来就该是"这台机器实际暴露了什么"。
 HOST_OWN_ADDR="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^127\.' | head -1)"
-BLOCK_TARGETS=("192.168.100.1:22" "192.168.100.1:5900" "1.1.1.1:443")
-[ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:22")
+_excl="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' '|')"
+BLOCK_TARGETS=("1.1.1.1:443")
+for _p in $(netstat -an -f inet 2>/dev/null \
+            | awk '/LISTEN/{n=split($4,a,"."); print a[n]}' \
+            | sort -un | grep -vE "^(${_excl})$" | head -3); do
+    BLOCK_TARGETS+=("192.168.100.1:${_p}")
+    [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
+done
 
 mkdir -p "$LOG_DIR"
 exec > >(tee "$LOG") 2>&1

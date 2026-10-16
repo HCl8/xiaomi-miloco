@@ -3,7 +3,7 @@
 #   1. com.prreview.gateway   宿主机出网网关（一个进程两个端口：GitHub 转发 + 模型代理）
 #   2. com.prreview.launcher  一次性 runner 启动器
 #
-# 为什么网关和启动器不合成一个进程：寿命不同。启动器会频繁重启（部署、改代码），
+# 网关和启动器分成两个进程的理由：寿命不同。启动器会频繁重启（部署、改代码），
 # 每次重启都会掐断正在飞的请求；网关重启的代价只是几十毫秒的 502。两者不该互相承担。
 #
 # 幂等：重复跑等于重装。凭据文件不在这里创建，见 README。
@@ -42,7 +42,7 @@ write_agent() {  # write_agent <label> <plist路径> <可执行> <参数...>
         echo '  <key>KeepAlive</key><true/>'
         echo '  <key>ThrottleInterval</key><integer>30</integer>'
         # 收到 TERM 之后要给足时间收尾：启动器要杀掉并删掉它管的每一个容器，
-        # 默认宽限期不够，会被强杀 → 留下一批孤儿容器（实测踩过）
+        # 默认宽限期不够，会被强杀 → 留下一批孤儿容器
         echo '  <key>ExitTimeOut</key><integer>60</integer>'
         echo "  <key>StandardOutPath</key><string>$PRR_DIR/logs/$label.out</string>"
         echo "  <key>StandardErrorPath</key><string>$PRR_DIR/logs/$label.err</string>"
@@ -55,7 +55,7 @@ bootstrap() {
     cp "$plist" "$AGENTS/$label.plist"
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
     # 必须等它真的从域里消失再 bootstrap —— 只 sleep 一秒会撞上 "Bootstrap failed: 5:
-    # Input/output error"（实测踩过两次），服务起不来还不容易看出来。
+    # Input/output error"，服务起不来还不容易看出来。
     # 启动器要收干净它管的容器，可能花十几秒。
     for _ in $(seq 1 40); do
         launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || break
