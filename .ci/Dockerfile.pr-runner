@@ -50,6 +50,11 @@ RUN cd /opt/runner && ./bin/installdependencies.sh
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && chown -R agent:agent /opt/runner
 
+# 入口包装：把一次性登记凭据从环境变量转成 --jitconfig。
+# 直接传参数会让凭据出现在宿主机的进程命令行里（ps aux 人人可见）。
+COPY .ci/runner-entrypoint.sh /opt/runner/entrypoint.sh
+RUN chmod 0755 /opt/runner/entrypoint.sh
+
 # ---------------------------------------------------------------- 阶段二：审查环境
 FROM runner-base
 
@@ -73,4 +78,4 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/home/agent/.local/bin:${PATH}"
 
 WORKDIR /opt/runner
-ENTRYPOINT ["/usr/bin/tini", "--", "/opt/runner/run.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/runner/entrypoint.sh"]

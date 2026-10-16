@@ -12,6 +12,7 @@ on:
     paths:
       - ".ci/Dockerfile.pr-runner"
       - ".ci/pr-agent"
+      - ".ci/runner-entrypoint.sh"
       - ".github/workflows/build-runner-image.yml"
 
 permissions:
