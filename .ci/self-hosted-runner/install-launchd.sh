@@ -82,7 +82,7 @@ bootstrap com.prreview.gateway "$PRR_DIR/logs/gateway.plist"
 echo "== 装启动器 =="
 if [ -r "$PRR_DIR/secrets/github-token" ]; then
     write_agent com.prreview.launcher "$PRR_DIR/logs/launcher.plist" \
-        "$PY" "$PRR_DIR/launcher.py"
+        "$PY" "$PRR_DIR/launcher.py" --config "$CONF"
     bootstrap com.prreview.launcher "$PRR_DIR/logs/launcher.plist"
 else
     echo "  跳过：缺 secrets/github-token（能申请 runner 登记凭据的那把凭据）"

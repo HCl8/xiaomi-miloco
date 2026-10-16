@@ -17,6 +17,11 @@ jobs:
     runs-on: [self-hosted, prr-test]
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # 断言本体只有一份：仓库里的 .ci/self-hosted-runner/probe.sh。
+      # 这里以前内联了同一套断言的副本，两份漂移过 —— 同一台机器、同一个坏状态，
+      # 手工跑脚本会打「全部通过」，而这里 FAIL。改成调脚本，这类漂移从结构上不可能再发生。
       - name: 逐条断言
         env:
           # 容器唯一的出口：容器网络里宿主机的网关地址
@@ -25,85 +30,5 @@ jobs:
           MODEL_PROXY_PORT: "18081"
           # 一个保证不可路由的保留地址（RFC 5737 的 TEST-NET-1）：能连上就说明有路由泄漏。
           # 刻意不写任何真实网络地址 —— 这个文件在公开仓里。
-          UNROUTABLE_HOST: "192.0.2.1"
-        run: |
-          fail=0
-          ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
-          bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
-
-          tcp() {  # tcp <host> <port>  连通返回 0
-            timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
-          }
-
-          echo "================ 1. 任务确实跑在容器里 ================"
-          [ "$(uname -s)" = "Linux" ] \
-            && ok "内核是 Linux（宿主是 macOS，说明任务不在宿主上）" \
-            || bad "内核不是 Linux：$(uname -s)"
-          echo "     hostname=$(hostname)  kernel=$(uname -r)"
-
-          echo "================ 2. 看不见宿主机 ================"
-          if [ -e /Users ] || [ -e /System ]; then
-            bad "能看到 macOS 的目录（/Users 或 /System 存在）"
-          else
-            ok "看不到 macOS 的文件系统"
-          fi
-          # 通配扫，不写死某个用户名 —— 写死既是环境痕迹，也只覆盖那一个用户
-          host_ssh=""
-          for h in /Users/*/.ssh /home/*/.ssh; do
-            [ -r "$h" ] && { host_ssh="$h"; break; }
-          done 2>/dev/null || true
-          if [ -n "$host_ssh" ]; then
-            bad "能读到宿主机用户目录 $host_ssh"
-          else
-            ok "读不到宿主机的用户目录"
-          fi
-
-          echo "================ 3. 没有容器运行时接口 ================"
-          found=""
-          for s in /var/run/docker.sock /run/docker.sock \
-                   /run/containerd/containerd.sock /var/run/podman/podman.sock; do
-            [ -e "$s" ] && found="$found $s"
-          done
-          [ -z "$found" ] && ok "没有可用的容器运行时 socket" || bad "发现 socket:$found"
-
-          echo "================ 4. 任务之间互不可见 ================"
-          residue=""
-          for m in /tmp/prr-probe-marker "$HOME/.prr-probe-marker"; do
-            [ -e "$m" ] && residue="${residue} ${m}"
-          done
-          if [ -n "$residue" ]; then
-            bad "看到上一个任务留下的${residue}（容器没有一次性销毁？）"
-          else
-            ok "没有发现上一次任务的残留"
-          fi
-          # 埋本次标记：下一次在别的容器里跑，应当看不到它
-          date > "$HOME/.prr-probe-marker" 2>/dev/null || true
-          date > /tmp/prr-probe-marker 2>/dev/null || true
-          ok "已埋下本次标记（下一次运行会验）"
-
-          echo "================ 5. 唯一的出口是宿主机 ================"
-          tcp "$HOST_GW" "$GH_PROXY_PORT" \
-            && ok "能到宿主机上的 GitHub 转发代理 $HOST_GW:$GH_PROXY_PORT" \
-            || bad "到不了 GitHub 转发代理"
-          tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
-            && ok "能到宿主机上的模型代理 $HOST_GW:$MODEL_PROXY_PORT" \
-            || bad "到不了模型代理"
-
-          echo "================ 6. 到不了别的地方 ================"
-          tcp github.com 443 \
-            && bad "直连 github.com:443 通了（应该没有路由）" \
-            || ok "直连 github.com:443 不通"
-          tcp "$UNROUTABLE_HOST" 443 \
-            && bad "$UNROUTABLE_HOST:443 通了（有路由泄漏！）" \
-            || ok "$UNROUTABLE_HOST:443 不通（保留地址，本就没有路由）"
-          tcp example.com 80 \
-            && bad "example.com:80 通了（公网可达！）" \
-            || ok "公网 example.com:80 不通"
-
-          echo "======================================================"
-          if [ "$fail" -eq 0 ]; then
-            echo "结论：全部通过"
-          else
-            echo "结论：有断言失败，见上面 FAIL 行"
-          fi
-          exit "$fail"
+          PRR_INTRANET_TARGET: "192.0.2.1"
+        run: bash .ci/self-hosted-runner/probe.sh

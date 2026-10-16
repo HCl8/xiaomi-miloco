@@ -1,7 +1,8 @@
 #!/bin/bash
 # 隔离探针：把"任务跑在一次性容器里、容器碰不到内网和公网"这几条说法逐条实测。
-# 和 .github/workflows/runner-isolation-probe.yml 里跑的是同一套断言，
-# 单独抽成脚本是为了能在容器里手工跑一遍、把明细直接看到。
+# 断言本体只有这一份 —— .github/workflows/runner-isolation-probe.yml 检出仓库后直接调本脚本，
+# 不再内联一份副本。曾经是两份，漂移过一次（同一台机器、同一个坏状态，一边打通过一边 FAIL）。
+# 手工跑也是它：bash probe.sh（明细直接看得到）。
 fail=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }

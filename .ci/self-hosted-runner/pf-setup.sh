@@ -18,7 +18,11 @@ set -uo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 SUBNET="${PRR_SUBNET:-192.168.100.0/24}"
+# 容器侧看到的宿主机地址，就是这个网段的网关地址。改 SUBNET 时必须一起改，否则下面
+# 「必须连不上」的靶子会指向一个不存在的地址 —— 永远「不通」，block 侧恒判通过。
+HOST_GW="${PRR_HOST_GATEWAY:-192.168.100.1}"
 PORTS="${PRR_PORTS:-18080, 18081}"
+ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与判定用的空格分隔形式
 IMAGE="${PRR_IMAGE:-prr-review:latest}"
 NETWORK="${PRR_NETWORK:-prr-int}"
 ANCHOR=prreview
@@ -38,7 +42,7 @@ BLOCK_TARGETS=("1.1.1.1:443")
 for _p in $(netstat -an -f inet 2>/dev/null \
             | awk '/LISTEN/{n=split($4,a,"."); print a[n]}' \
             | sort -un | grep -vE "^(${_excl})$" | head -3); do
-    BLOCK_TARGETS+=("192.168.100.1:${_p}")
+    BLOCK_TARGETS+=("${HOST_GW}:${_p}")
     [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
 done
 
@@ -114,9 +118,9 @@ detect_gw_iface() {
     "$CONTAINER" run --detach --name "$tmp" --arch arm64 --network "$NETWORK" \
         --entrypoint /bin/sleep "$IMAGE" 120 >/dev/null 2>&1
     sleep 2
-    GW_IFACE=$(ifconfig -a 2>/dev/null | awk '
+    GW_IFACE=$(ifconfig -a 2>/dev/null | awk -v gw="$HOST_GW" '
         /^[a-z][a-z0-9]*:/ { iface=$1; sub(":", "", iface) }
-        /inet / { if ($2 == "192.168.100.1") print iface }
+        /inet / { if ($2 == gw) print iface }
     ' | head -1)
     "$CONTAINER" kill "$tmp" >/dev/null 2>&1
     "$CONTAINER" delete "$tmp" >/dev/null 2>&1
@@ -180,22 +184,29 @@ load_pf() {
 }
 
 probe() {
+    local allow="" p
+    for p in $ALLOW_PORTS; do allow="$allow \"${HOST_GW}:${p}\""; done
     "$CONTAINER" run --rm --arch arm64 --network "$NETWORK" --entrypoint /bin/bash "$IMAGE" -c "
-      for t in \"192.168.100.1:18080\" \"192.168.100.1:18081\" $(printf '"%s" ' "${BLOCK_TARGETS[@]}"); do
+      for t in $allow $(printf '"%s" ' "${BLOCK_TARGETS[@]}"); do
         printf '%s ' \"\$t\"
         timeout 5 bash -c \"exec 3<>/dev/tcp/\${t/:/\\/}\" 2>/dev/null && echo 通 || echo 不通
       done" 2>/dev/null | grep -v '^\['
 }
 
 judge() {
-    local allow_ok=1 block_ok=1 n=0 target result
+    local allow_ok=1 block_ok=1 n=0 target result p is_allow
     while read -r target result; do
         case "$result" in 通|不通) ;; *) continue ;; esac
         n=$((n + 1))
-        case "$target" in
-            *:18080|*:18081) [ "$result" = "通" ] || allow_ok=0 ;;
-            *)               [ "$result" = "不通" ] || block_ok=0 ;;
-        esac
+        is_allow=0
+        for p in $ALLOW_PORTS; do
+            case "$target" in *":$p") is_allow=1 ;; esac
+        done
+        if [ "$is_allow" = 1 ]; then
+            [ "$result" = "通" ]   || allow_ok=0
+        else
+            [ "$result" = "不通" ] || block_ok=0
+        fi
     done
     [ "$n" -ge 4 ] || return 1
     [ "$allow_ok" = 1 ] && [ "$block_ok" = 1 ]

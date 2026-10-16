@@ -13,6 +13,7 @@
 只用标准库：这台机器上没有 Homebrew，系统 python3 是 3.9，引第三方依赖等于给自己加部署负担。
 """
 
+import argparse
 import json
 import logging
 import os
@@ -469,7 +470,7 @@ def maintain(cfg, have_slots):
     不清理快照会一直堆。
 
     镜像那一步有前提：**只在至少有一个容器在跑的时候清**。否则我们自己的镜像会变成
-    "无引用"被一起删掉，而重新取镜像要走 CI artifact，不是随手能补的。
+    "无引用"被一起删掉，而重新取镜像要走 ghcr（pull_image.py），不是随手能补的。
     """
     log.info("定期清理：删掉已停止的容器")
     proc = _run(["prune"])
@@ -499,6 +500,13 @@ def start_slot(cfg, slot, seq):
     jit = mint_jit(cfg, name)
     try:
         start_container(cfg, jit, name, seq)
+    except Exception:
+        # 起容器是两步（先 run，再 cp 凭据进去），第二步失败时容器已经创建好了。调用方只会
+        # 记一条 warning 就去补下一个槽，这个容器不在池子里、此后没人认识它 —— 不就地收掉，
+        # 就得等定期清理（最长一小时）才轮到它。
+        kill_and_delete(name)
+        forget_runners(cfg, [name])
+        raise
     finally:
         del jit                      # 凭据不再需要，尽早从内存里去掉
     return name
@@ -578,10 +586,19 @@ def manage_pool(cfg):
                     del slots[slot]
                     forget_runners(cfg, [name])
                 elif time.time() >= deadline:
-                    log.info("槽 %d：空等超时，回收 %s（避免凭据过期后还挂着）", slot, name)
-                    kill_and_delete(name)
-                    del slots[slot]
-                    forget_runners(cfg, [name])
+                    # 空等超时的回收**只看时钟是不够的**：作业可能正好落在容器生命的最后一段，
+                    # 这时容器还在跑任务，按时钟收掉就是把它掐断。判据与另外两处（自检不过、
+                    # 进程退出收尾）一致：正在跑任务的不收。
+                    if container_running_job(name):
+                        # 截止时刻往后推，免得每轮轮询都去读一次容器日志。任务跑完 runner 会自己
+                        # 退出，那时由上面「已结束」那条分支收，推后的截止时刻不会真的用到。
+                        slots[slot] = (name, time.time() + 60)
+                        log.info("槽 %d：容器 %s 已过空等时限但正在跑任务，放它跑完", slot, name)
+                    else:
+                        log.info("槽 %d：空等超时，回收 %s（避免凭据过期后还挂着）", slot, name)
+                        kill_and_delete(name)
+                        del slots[slot]
+                        forget_runners(cfg, [name])
 
             # 补齐空的槽 —— 但先看宿主内存水位：宁可少接活，也不把机器压进压缩/换页
             free_gb = host_reclaimable_gb()
@@ -634,7 +651,12 @@ def manage_pool(cfg):
 
 
 def main():
-    cfg_path = Path(os.environ.get("PRR_CONF", DEFAULT_CONFIG))
+    # 必须能接受 --config：launchd 的 LaunchAgent **不继承调用方 shell 的环境变量**，
+    # 只靠 PRR_CONF 的话，装机时用了非默认路径就会变成「网关读你指定的那份、启动器读默认
+    # 路径」，读不到就退出，KeepAlive 每 30 秒再拉起来挂一次。
+    ap = argparse.ArgumentParser(description="一次性 runner 启动器")
+    ap.add_argument("--config", default=os.environ.get("PRR_CONF", str(DEFAULT_CONFIG)))
+    cfg_path = Path(ap.parse_args().config)
     try:
         cfg = load_config(cfg_path)
     except (OSError, ValueError) as exc:
