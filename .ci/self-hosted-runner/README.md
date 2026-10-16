@@ -34,6 +34,14 @@ prreview/
 
 ## 装法
 
+0. **把本目录放到 `~/prreview/`**，再把 `prreview.example.json` 拷成 `prreview.json`、
+   改掉里面的镜像引用与仓库名：
+   ```bash
+   mkdir -p ~/prreview && cp -R <本目录>/. ~/prreview/
+   cp ~/prreview/prreview.example.json ~/prreview/prreview.json
+   ```
+   下面各步的路径都按 `~/prreview/` 写。
+
 1. **装 Apple container**（需要管理员密码）：
    ```bash
    curl -fL -o /tmp/container.pkg \
@@ -56,10 +64,15 @@ prreview/
    （包设成 public 时按匿名拉，不需要任何凭据。要钉版本优先用构建时按 commit 打的 tag，
    比 `:latest` 稳。）
 
-5. **装出口过滤**（关键，见下节）：`bash ~/prreview/pf-setup.sh`
+5. **装服务**：`bash ~/prreview/install-launchd.sh`
+   （这一步必须在装出口过滤**之前**：`pf-setup.sh` 的探针要连网关那两个端口，网关没起来
+   时两个「应当能通」的靶子必然不通，会把一份正确的规则判成坏的。）
+
+6. **装出口过滤**（关键，见下节）：`bash ~/prreview/pf-setup.sh`
    然后 `bash ~/prreview/pf-setup.sh --persist`（macOS 开机不自动启用 pf）
 
-6. **装服务**：`bash ~/prreview/install-launchd.sh`
+   这一步之前启动器是**故意不干活**的：它起容器前会实测"容器还够不够得着宿主机上与本方案
+   无关的端口"，够得着说明这层还没装，于是停掉待命容器、不再起新的并报警。
 
 ## 出口过滤的必要性
 

@@ -33,7 +33,7 @@ git show "origin/main:.agents/commands/review-pr.md" \
 
 # 写死 Bash 子命令白名单到 .claude/settings.json。
 # dontAsk 模式下只有 permissions.allow 名单内的命令能执行，其余自拒；
-# 与 --tools "Bash,Read,Glob,Grep" 工具白名单形成纵深防御。
+# 与 .ci/pr-agent.sh 的 --tools 白名单形成纵深防御（那边是"有哪些工具"，这里是"能执行什么"）。
 # Edit(//tmp/**) 放行的是**所有写文件工具**在 /tmp 下的写入（路径规则只认 Edit(...)；
 # 写成 Write(//tmp/**) 会被接受但永不匹配，等于没写）。注释正文动辄几 KB、又超过单条命令
 # 长度上限，只能落到文件里再 `gh api -F body=@文件`。dontAsk 模式下不在名单里的写入一律自拒，

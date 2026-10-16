@@ -190,8 +190,9 @@ class GitHubProxy(BaseHTTPRequestHandler):
                         return
                     if pending[dst]:                      # 没发完 → 盯上它的可写事件
                         sel.modify(dst, selectors.EVENT_READ | selectors.EVENT_WRITE, dst)
-        except OSError:
-            pass
+        except OSError as exc:
+            # 别静默：这一层是唯一的出口，链断了要能在日志里看见原因
+            LOG.warning("隧道断开：%s", exc)
         finally:
             sel.close()
             try:

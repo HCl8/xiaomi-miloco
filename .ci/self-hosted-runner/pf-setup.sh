@@ -23,8 +23,11 @@ SUBNET="${PRR_SUBNET:-192.168.100.0/24}"
 HOST_GW="${PRR_HOST_GATEWAY:-192.168.100.1}"
 PORTS="${PRR_PORTS:-18080, 18081}"
 ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与判定用的空格分隔形式
-IMAGE="${PRR_IMAGE:-prr-review:latest}"
+# 镜像引用不在这里写死默认值：没人记得住它到底是什么，而写错的表现是探针起不来容器、
+# 被判成"规则过宽"。留空，等一下从配置文件里取（与 launcher 读同一份，单一来源）。
+IMAGE="${PRR_IMAGE:-}"
 NETWORK="${PRR_NETWORK:-prr-int}"
+CONF="${PRR_CONF:-$HOME/prreview/prreview.json}"
 ANCHOR=prreview
 ANCHOR_FILE="/etc/pf.anchors/$ANCHOR"
 PF_CONF=/etc/pf.conf
@@ -60,6 +63,20 @@ say()   { printf '  %s\n' "$*"; }
 head1() { printf '\n=== %s ===\n' "$*"; }
 die()   { printf '\n!! 错误: %s\n' "$*"; printf '!! 已中止。回滚：bash %s --rollback\n' "$0"; exit 1; }
 
+# 镜像引用：给 PRR_IMAGE 就用给的，否则读配置里那份（与 launcher 同一个键）
+if [ -z "$IMAGE" ]; then
+    IMAGE="$(CONF="$CONF" python3 -c '
+import json, os
+try:
+    print(json.load(open(os.environ["CONF"])).get("image", ""))
+except Exception:
+    print("")
+' 2>/dev/null)"
+fi
+[ -n "$IMAGE" ] || die "没拿到镜像引用：给 PRR_IMAGE，或在 $CONF 里写 image"
+
+# 探针要连网关的两个端口，所以**必须先把服务装起来再跑本脚本**（README 的装法顺序）。
+# 顺序反了的话两个放行靶子必然不通，会把一份正确的规则判成坏的。
 [ "$(id -u)" = 0 ] && die "别用 root 跑：脚本内部自己 sudo。容器命令必须用你自己的账号（container 的守护进程是按用户起的）"
 command -v "$CONTAINER" >/dev/null || die "找不到 $CONTAINER"
 
