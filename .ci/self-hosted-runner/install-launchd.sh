@@ -19,6 +19,21 @@ CONTAINER_BIN=/usr/local/bin/container
 
 say() { printf '  %s\n' "$*"; }
 
+# 端口从配置读，别在这里再写一份 —— 写死的话改了配置这里的自检会去敲一个没人听的端口，
+# 自检红了却与真实故障无关（或者反过来，端口写错了自检照样绿）。
+cfg_get() {     # cfg_get <键> <默认值>
+    CONF="$CONF" KEY="$1" DEF="${2:-}" python3 -c '
+import json, os
+try:
+    v = json.load(open(os.environ["CONF"])).get(os.environ["KEY"])
+except Exception:
+    v = None
+print(v if v not in (None, "") else os.environ["DEF"])
+' 2>/dev/null
+}
+GH_PORT="$(cfg_get github_proxy_port 18080)"
+MODEL_PORT="$(cfg_get model_proxy_port 18081)"
+
 [ -x "$CONTAINER_BIN" ] || { echo "找不到 Apple container CLI（${CONTAINER_BIN}），先装它" >&2; exit 1; }
 [ -r "$CONF" ] || { echo "找不到配置 $CONF" >&2; exit 1; }
 
@@ -92,10 +107,10 @@ fi
 echo
 echo "== 自检 =="
 sleep 4
-printf "  网关 18080 转发 GitHub: "
-curl -s -o /dev/null -w "%{http_code}\n" --max-time 8 -x http://127.0.0.1:18080 https://api.github.com || echo "  连不上"
-printf "  网关 18081 模型存活探针: "
-curl -s --max-time 8 http://127.0.0.1:18081/healthz; echo
+printf "  网关 %s 转发 GitHub: " "$GH_PORT"
+curl -s -o /dev/null -w "%{http_code}\n" --max-time 8 -x "http://127.0.0.1:$GH_PORT" https://api.github.com || echo "  连不上"
+printf "  网关 %s 模型存活探针: " "$MODEL_PORT"
+curl -s --max-time 8 "http://127.0.0.1:$MODEL_PORT/healthz"; echo
 echo
 echo "== 当前状态 =="
 launchctl list 2>/dev/null | grep -E "prreview" | sed 's/^/  /' || echo "  （无）"

@@ -21,8 +21,10 @@ SUBNET="${PRR_SUBNET:-192.168.100.0/24}"
 # 容器侧看到的宿主机地址，就是这个网段的网关地址。改 SUBNET 时必须一起改，否则下面
 # 「必须连不上」的靶子会指向一个不存在的地址 —— 永远「不通」，block 侧恒判通过。
 HOST_GW="${PRR_HOST_GATEWAY:-192.168.100.1}"
-PORTS="${PRR_PORTS:-18080, 18081}"
-ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与判定用的空格分隔形式
+# 放行哪两个端口**必须与网关实际监听的一致**，所以留空、等一下从配置文件取（与 launcher
+# 同一个键）。写死默认值的后果：配置改了端口，代理听着新端口、pf 只放行旧端口，容器发往
+# GitHub 的连接在 pf 层被丢掉，表现成 gh api 全部超时，而日志里没有一处提示是端口不一致。
+PORTS="${PRR_PORTS:-}"
 # 镜像引用不在这里写死默认值：没人记得住它到底是什么，而写错的表现是探针起不来容器、
 # 被判成"规则过宽"。留空，等一下从配置文件里取（与 launcher 读同一份，单一来源）。
 IMAGE="${PRR_IMAGE:-}"
@@ -36,6 +38,32 @@ DAEMON=/Library/LaunchDaemons/com.prreview.pf.plist
 CONTAINER=/usr/local/bin/container
 LOG_DIR="$HOME/prreview/logs"
 LOG="$LOG_DIR/pf-setup.log"
+
+say()   { printf '  %s\n' "$*"; }
+head1() { printf '\n=== %s ===\n' "$*"; }
+die()   { printf '\n!! 错误: %s\n' "$*"; printf '!! 已中止。回滚：bash %s --rollback\n' "$0"; exit 1; }
+
+mkdir -p "$LOG_DIR"
+exec > >(tee "$LOG") 2>&1
+
+# 镜像引用与两个代理端口都从配置文件读（与 launcher 同一份，单一来源）。环境变量仍可覆盖。
+# 这两个值必须取对：镜像写错 → 探针起不来容器、被判成"规则过宽"；端口写错 → 代理听着新端口、
+# pf 只放行旧端口，容器发往 GitHub 的连接在 pf 层被丢掉，表现成 gh api 全部超时。
+cfg_get() {     # cfg_get <键> → 值（读不到打空串）
+    CONF="$CONF" KEY="$1" python3 -c '
+import json, os
+try:
+    print(json.load(open(os.environ["CONF"])).get(os.environ["KEY"], ""))
+except Exception:
+    print("")
+' 2>/dev/null
+}
+[ -n "$IMAGE" ] || IMAGE="$(cfg_get image)"
+[ -n "$IMAGE" ] || die "没拿到镜像引用：给 PRR_IMAGE，或在 $CONF 里写 image"
+[ -n "$PORTS" ] || PORTS="$(cfg_get github_proxy_port), $(cfg_get model_proxy_port)"
+printf '%s' "$PORTS" | grep -qE '^[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*[0-9]+[[:space:]]*$' \
+    || die "没拿到有效的代理端口（形如 \"18080, 18081\"）：给 PRR_PORTS，或在 $CONF 里写 github_proxy_port / model_proxy_port"
+ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与判定用的空格分隔形式
 
 # "必须连不上"的靶子：宿主机上与本方案无关的服务端口、宿主机的对外地址、以及公网。
 # 端口和地址都**现探**，正文里不写死任何具体值 —— 测的本来就该是"这台机器实际暴露了什么"。
@@ -55,25 +83,6 @@ for _p in $(netstat -an -f inet 2>/dev/null \
     BLOCK_TARGETS+=("${HOST_GW}:${_p}")
     [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
 done
-
-mkdir -p "$LOG_DIR"
-exec > >(tee "$LOG") 2>&1
-
-say()   { printf '  %s\n' "$*"; }
-head1() { printf '\n=== %s ===\n' "$*"; }
-die()   { printf '\n!! 错误: %s\n' "$*"; printf '!! 已中止。回滚：bash %s --rollback\n' "$0"; exit 1; }
-
-# 镜像引用：给 PRR_IMAGE 就用给的，否则读配置里那份（与 launcher 同一个键）
-if [ -z "$IMAGE" ]; then
-    IMAGE="$(CONF="$CONF" python3 -c '
-import json, os
-try:
-    print(json.load(open(os.environ["CONF"])).get("image", ""))
-except Exception:
-    print("")
-' 2>/dev/null)"
-fi
-[ -n "$IMAGE" ] || die "没拿到镜像引用：给 PRR_IMAGE，或在 $CONF 里写 image"
 
 # 探针要连网关的两个端口，所以**必须先把服务装起来再跑本脚本**（README 的装法顺序）。
 # 顺序反了的话两个放行靶子必然不通，会把一份正确的规则判成坏的。

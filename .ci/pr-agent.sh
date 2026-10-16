@@ -20,9 +20,20 @@ HINT="投递长文本（PR 评论正文等）时：先写到 /tmp 下的文件�
 HINT="$HINT 单条 Bash 命令过长会被拒绝执行，不要试图把整篇正文塞进一条命令。"
 [ -n "${PR_AGENT_FALLBACK_USED:-}" ] && HINT="$HINT 本次为降级模型。"
 
+# 门禁启动前会把白名单写进 .claude/settings.json，但**非交互（-p）模式下项目级 settings
+# 不会被自动加载** —— 实测那份文件里的规则完全不参与判定，真正生效的只有 skill 自己的
+# allowed-tools（所以白名单外的 `gh issue list`、`git ls-tree` 会被拒，而它们本该被
+# 门禁的 `Bash(gh *)` / `Bash(git *)` 覆盖）。显式 --settings 喂给它，走 CLI 这条确定生效的路。
+SETTINGS_FILE="${PRR_SETTINGS_FILE:-$PWD/.claude/settings.json}"
+SETTINGS_ARGS=()
+if [ -r "$SETTINGS_FILE" ]; then
+    SETTINGS_ARGS=(--settings "$SETTINGS_FILE")
+fi
+
 stdbuf -oL claude \
   --permission-mode dontAsk \
   --tools "Bash,Read,Glob,Grep,Write" \
+  "${SETTINGS_ARGS[@]}" \
   --append-system-prompt "$HINT" \
   --verbose --output-format stream-json -p "$@" \
   | jq --unbuffered -rc '

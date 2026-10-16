@@ -328,6 +328,24 @@ def start_container(cfg, jit, name, round_no):
     _hand_over_jit(cfg, jit, name)
 
 
+def image_digest(ref):
+    """镜像引用解析出的 digest；取不到返回 None。
+
+    日志里只打配置里的字面值不够用：配置写 `latest` 时，两次构建之后同一条日志一模一样，
+    事后没法对齐"这次审查到底跑的是哪一版镜像"，只能去翻 registry。
+    """
+    proc = _run(["image", "inspect", ref])
+    if proc.returncode != 0:
+        return None
+    try:
+        items = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    if isinstance(items, list) and items and isinstance(items[0].get("id"), str):
+        return items[0]["id"]
+    return None
+
+
 def sweep_stale_jit_files(cfg):
     """清掉上次被强杀时留下的临时凭据文件。
 
@@ -711,8 +729,9 @@ def main():
 
     sweep_stale_jit_files(cfg)
 
-    log.info("启动：镜像=%s 网络=%s 仓库=%s 待命容器=%d 空闲回收=%ds",
-             cfg["image"], cfg["network"], cfg["github_repo"],
+    log.info("启动：镜像=%s digest=%s 网络=%s 仓库=%s 待命容器=%d 空闲回收=%ds",
+             cfg["image"], image_digest(cfg["image"]) or "未解析",
+             cfg["network"], cfg["github_repo"],
              cfg["replicas"], cfg["idle_recycle_seconds"])
 
     # 池子循环万一因为意外异常退出，重建它 —— 但不能空转刷日志，所以加个间隔

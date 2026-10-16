@@ -32,8 +32,13 @@ git show "origin/main:.agents/commands/review-pr.md" \
   > .claude/commands/review-pr.md
 
 # 写死 Bash 子命令白名单到 .claude/settings.json。
-# dontAsk 模式下只有 permissions.allow 名单内的命令能执行，其余自拒；
-# 与 .ci/pr-agent.sh 的 --tools 白名单形成纵深防御（那边是"有哪些工具"，这里是"能执行什么"）。
+# dontAsk 模式下只有 permissions.allow 名单内的命令能执行，其余自拒。
+#
+# ⚠️ 这份文件**不会被自动加载**：非交互（-p）模式下项目级 settings 不参与判定，实测
+# `.claude/settings.json` 里的规则一条都不生效，真正生效的只有 skill 自己的 allowed-tools
+# （`.agents/commands/review-pr.md` 的 front-matter，同样取自 origin/main，所以"PR 改不动
+# 白名单"这条性质仍然成立，只是承担它的文件不是这一份）。
+# 所以 .ci/pr-agent.sh 用 `--settings` 把这份文件显式喂给 CLI —— CLI 参数这条通道确定生效。
 # Edit(//tmp/**) 放行的是**所有写文件工具**在 /tmp 下的写入（路径规则只认 Edit(...)；
 # 写成 Write(//tmp/**) 会被接受但永不匹配，等于没写）。注释正文动辄几 KB、又超过单条命令
 # 长度上限，只能落到文件里再 `gh api -F body=@文件`。dontAsk 模式下不在名单里的写入一律自拒，
