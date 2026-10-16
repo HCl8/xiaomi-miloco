@@ -1,0 +1,98 @@
+name: Runner Isolation Probe
+
+# 目的：把"任务跑在一次性容器里、容器碰不到内网和公网"这几条说法，变成可以自己跑的实测。
+# 触发方式本身也是安全设计：只留维护者能发起的方式，**绝不接 pull_request_target**——
+# 否则外部人就能反复往这台机器投递任务。
+on:
+  workflow_dispatch:
+  push:
+    branches: [prr-smoke]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    # 认专属标签，避免被 GitHub 托管的机器接走
+    runs-on: [self-hosted, prr-test]
+    timeout-minutes: 10
+    steps:
+      - name: 逐条断言
+        env:
+          # 容器唯一的出口：宿主机在那个内网段里的网关地址
+          HOST_GW: "192.168.100.1"
+          GH_PROXY_PORT: "18080"
+          MODEL_PROXY_PORT: "18081"
+          # 这几个是"必须连不上"的靶子
+          INTRANET_HOST: "10.108.154.89"
+        run: |
+          fail=0
+          ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
+          bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+
+          tcp() {  # tcp <host> <port>  连通返回 0
+            timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+          }
+
+          echo "================ 1. 任务确实跑在容器里 ================"
+          [ "$(uname -s)" = "Linux" ] \
+            && ok "内核是 Linux（宿主是 macOS，说明任务不在宿主上）" \
+            || bad "内核不是 Linux：$(uname -s)"
+          echo "     hostname=$(hostname)  kernel=$(uname -r)"
+
+          echo "================ 2. 看不见宿主机 ================"
+          if [ -e /Users ] || [ -e /System ]; then
+            bad "能看到 macOS 的目录（/Users 或 /System 存在）"
+          else
+            ok "看不到 macOS 的文件系统"
+          fi
+          if [ -r /Users/mi/.ssh ] 2>/dev/null; then
+            bad "能读到宿主机用户目录"
+          else
+            ok "读不到宿主机的用户目录"
+          fi
+
+          echo "================ 3. 没有容器运行时接口 ================"
+          found=""
+          for s in /var/run/docker.sock /run/docker.sock \
+                   /run/containerd/containerd.sock /var/run/podman/podman.sock; do
+            [ -e "$s" ] && found="$found $s"
+          done
+          [ -z "$found" ] && ok "没有可用的容器运行时 socket" || bad "发现 socket:$found"
+
+          echo "================ 4. 任务之间互不可见 ================"
+          for m in /tmp/prr-probe-marker "$HOME/.prr-probe-marker"; do
+            if [ -e "$m" ]; then
+              bad "看到上一个任务留下的 $m（容器没有一次性销毁？）"
+            fi
+          done
+          date > "$HOME/.prr-probe-marker" 2>/dev/null || true
+          date > /tmp/prr-probe-marker 2>/dev/null || true
+          ok "没有发现上一次任务的残留（已埋下本次标记，下一次运行会验）"
+
+          echo "================ 5. 唯一的出口是宿主机 ================"
+          tcp "$HOST_GW" "$GH_PROXY_PORT" \
+            && ok "能到宿主机上的 GitHub 转发代理 $HOST_GW:$GH_PROXY_PORT" \
+            || bad "到不了 GitHub 转发代理"
+          tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
+            && ok "能到宿主机上的模型代理 $HOST_GW:$MODEL_PROXY_PORT" \
+            || bad "到不了模型代理（探针阶段可忽略，模型代理按需启动）"
+
+          echo "================ 6. 到不了别的地方 ================"
+          tcp github.com 443 \
+            && bad "直连 github.com:443 通了（应该没有路由）" \
+            || ok "直连 github.com:443 不通"
+          tcp "$INTRANET_HOST" 443 \
+            && bad "内网 $INTRANET_HOST:443 通了（内网可达！）" \
+            || ok "内网 $INTRANET_HOST:443 不通"
+          tcp example.com 80 \
+            && bad "example.com:80 通了（公网可达！）" \
+            || ok "公网 example.com:80 不通"
+
+          echo "======================================================"
+          if [ "$fail" -eq 0 ]; then
+            echo "结论：全部通过"
+          else
+            echo "结论：有断言失败，见上面 FAIL 行"
+          fi
+          exit "$fail"
