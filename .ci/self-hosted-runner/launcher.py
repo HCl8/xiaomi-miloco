@@ -33,6 +33,8 @@ from pathlib import Path
 import prrlib
 
 CONTAINER = os.environ.get("PRR_CONTAINER_BIN", "/usr/local/bin/container")
+# 容器侧入口包装等待的凭据路径，必须与 .ci/runner-entrypoint.sh 的默认值一致
+JIT_PATH = "/opt/runner/.jitconfig"
 DEFAULT_CONFIG = Path.home() / "prreview" / "prreview.json"
 GITHUB_API = "https://api.github.com"
 
@@ -342,7 +344,10 @@ def sweep_stale_jit_files(cfg):
 
 def _hand_over_jit(cfg, jit, name):
     """把凭据拷进容器。临时文件用 mkstemp 建（天生 0600），拷完立刻 unlink。"""
-    target = "%s:%s" % (name, cfg.get("jit_path", "/opt/runner/.jitconfig"))
+    # 路径写死，不做成配置项：容器侧入口包装读的也是这个常量（`PRR_JIT_FILE` 只是给镜像
+    # 自己留的兜底），启动器又不会把那个环境变量传进去 —— 做成配置项只会让人以为能改，
+    # 改了却是"拷到新路径、入口包装还在老的路上等"，表现成 90 秒超时。
+    target = "%s:%s" % (name, JIT_PATH)
     fd, tmp = tempfile.mkstemp(prefix=".prr-jit-", dir=str(Path(cfg["log_dir"]).parent))
     try:
         with os.fdopen(fd, "w") as fh:

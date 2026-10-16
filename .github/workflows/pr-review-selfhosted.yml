@@ -51,7 +51,7 @@ jobs:
     #
     # 真正的边界有两层，都不在这个文件里：
     #   ① 容器那层 —— 非 root、无宿主挂载、无容器 socket，出口由 pf 收口到宿主机两个端口；
-    #   ② 仓库设置 Actions → Fork pull request workflows → 要求外部协作者审批（见方案 Step 8）。
+    #   ② 仓库设置 Actions → Fork pull request workflows → 要求外部协作者审批。
     if: >-
       github.event_name != 'pull_request'
       || (github.event.pull_request.draft == false

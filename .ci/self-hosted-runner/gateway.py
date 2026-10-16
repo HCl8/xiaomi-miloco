@@ -35,6 +35,10 @@ import prrlib
 
 LOG = logging.getLogger("gateway")
 
+# 隧道里单方向允许积压的未发字节上限。对端不收时断开，别把这层（跑在宿主机上、
+# 和整台机器共用内存）拖垮。
+MAX_PENDING = 8 * 1024 * 1024
+
 # ---- 运行时配置（main 里填）----
 ALLOWED_NETS = []
 MODEL_UPSTREAM = None
@@ -178,6 +182,12 @@ class GitHubProxy(BaseHTTPRequestHandler):
                     except OSError:
                         return
                     pending[dst] = buf[sent:]
+                    if len(pending[dst]) > MAX_PENDING:
+                        # 对端一直不收（对端 socket 可读事件照常注册着，字节只进不出）。
+                        # 断开比把宿主机内存吃光强 —— 这层在宿主上，和整台机器共用内存。
+                        LOG.warning("对端长时间不收，待写缓冲超过 %d 字节，断开这条隧道",
+                                    MAX_PENDING)
+                        return
                     if pending[dst]:                      # 没发完 → 盯上它的可写事件
                         sel.modify(dst, selectors.EVENT_READ | selectors.EVENT_WRITE, dst)
         except OSError:
