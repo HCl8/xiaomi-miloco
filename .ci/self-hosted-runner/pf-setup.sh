@@ -68,18 +68,13 @@ ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与�
 # "必须连不上"的靶子：宿主机上与本方案无关的服务端口、宿主机的对外地址、以及公网。
 # 端口和地址都**现探**，正文里不写死任何具体值 —— 测的本来就该是"这台机器实际暴露了什么"。
 HOST_OWN_ADDR="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^127\.' | head -1)"
-_excl="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' '|')"
 BLOCK_TARGETS=("1.1.1.1:443")
 # 只取「通配」或「就绑在网关地址上」的监听当靶子：绑在回环或别的地址上的端口，容器走网关
-# 地址本就碰不到，拿它当靶子永远是"不通"，那条断言等于没做（判定恒通过）。判据与 launcher.py
-# 的出口自检保持一致。
-for _p in $(netstat -an -f inet 2>/dev/null \
-            | awk -v gw="$HOST_GW" '/LISTEN/{
-                  n = split($4, a, ".");
-                  p = a[n];
-                  addr = substr($4, 1, length($4) - length(p) - 1);
-                  if (p ~ /^[0-9]+$/ && (addr == "*" || addr == gw)) print p }' \
-            | sort -un | grep -vE "^(${_excl})$" | head -3); do
+# 地址本就碰不到，拿它当靶子永远是"不通"，那条断言等于没做（判定恒通过）。
+# 判据本体在 prrlib.guard_ports 里 —— 与 launcher.py 的出口自检**共用同一份实现**
+# （以前这里是一段 awk、那边是一段 Python，靠注释手工同步，迟早漂移）。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+for _p in $(python3 "$SCRIPT_DIR/prrlib.py" --guard-ports "$HOST_GW" --exclude "$PORTS" 2>/dev/null); do
     BLOCK_TARGETS+=("${HOST_GW}:${_p}")
     [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
 done

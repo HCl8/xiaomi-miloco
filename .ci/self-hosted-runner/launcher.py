@@ -73,8 +73,9 @@ def load_config(path):
     # 出口自检：起 runner 之前先实测"宿主机上那些无关服务封住了没"。默认开。
     cfg.setdefault("require_egress_guard", True)
     cfg.setdefault("guard_recheck_seconds", 900)
-    # 出口自检探哪几个端口：默认由 discover_guard_ports 现探（这台机器在听什么就测什么），
-    # 想固定就显式给 guard_ports。
+    # 出口自检探哪几个端口：默认现探（这台机器在听什么就测什么）。给 guard_ports 是**收窄**
+    # 候选集，不是"想测哪几个就测哪几个"—— 它同样要过"绑在通配或网关地址上"那道筛，
+    # 绑在回环上的会被剔掉（那种靶子容器永远够不着，自检会变成永远绿的摆设）。
     # 池子：同时维持几个待命容器。每个容器只接一个任务，所以要 >1 才能扛并发。
     cfg.setdefault("replicas", 1)
     cfg.setdefault("poll_seconds", 5)
@@ -115,39 +116,15 @@ def discover_guard_ports(cfg, restrict=None):
 
     返回 None 表示**探测本身失败**（跟"确实没有别的端口"是两回事）：安全检查不能因为
     工具出错就放行，所以这两种情况必须分开，由调用方区别对待。
+
+    判据本体在 `prrlib.guard_ports` 里 —— 装机脚本 `pf-setup.sh` 要的是同一份判据，
+    以前 bash 的 awk 和这里的 Python 各写一遍、靠注释手工同步。
     """
-    try:
-        proc = subprocess.run(["netstat", "-an", "-f", "inet"],
-                              capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    out = proc.stdout
     mine = {int(cfg["github_proxy_port"])}
     if cfg.get("model_proxy_port"):
         mine.add(int(cfg["model_proxy_port"]))
-    ports = set()
-    for line in out.splitlines():
-        if "LISTEN" not in line:
-            continue
-        fields = line.split()
-        if len(fields) < 4:
-            continue
-        addr, _, tail = fields[3].rpartition(".")    # '*.18080' → '*'+'18080'；'127.0.0.1.22' → '127.0.0.1'+'22'
-        if not tail.isdigit():
-            continue
-        # 只收「通配」或「就绑在网关地址上」的监听：只有这两种在防火墙缺位时真的够得着。
-        # 绑在 127.0.0.1 或别的地址上的端口，容器走网关地址本就碰不到 —— 拿它当靶子永远是
-        # "没连上"，那条断言等于没做（假绿）。
-        if addr not in ("*", cfg["host_gateway"]):
-            continue
-        ports.add(int(tail))
-    if restrict is not None:
-        ports &= {int(p) for p in restrict}
-    # 只取前几个：这是"够不够得着"的抽样，不是端口清单。每个靶子都要等一次超时，
-    # 取全部会让自检从几秒变成近一分钟。
-    return sorted(p for p in ports if p not in mine)[:3]
+    ports, ok = prrlib.guard_ports(cfg["host_gateway"], exclude=mine, only=restrict)
+    return ports if ok else None
 
 
 def check_egress_guard(cfg):
@@ -169,7 +146,12 @@ def check_egress_guard(cfg):
         # 在同条件下判决一致。不能当"没有可测目标"放过：真正的"这台机器只听了网关"与
         # "我们的解析坏了/输出格式变了"在这里长得一模一样，而后者会让这条安全检查
         # 静默失效（一个探针容器都没跑，日志上却是"自检通过"）。
-        return False, "筛不出可测的宿主端口（netstat 输出没有通配/网关地址上的监听？），无法完成出口自检"
+        # 区分两种"没靶子"：配置给的被筛空了，还是现探本身没拿到东西。混成一句
+        # "netstat 没探到东西"会把人指向错误的排查方向。
+        if cfg.get("guard_ports"):
+            return False, ("配置里的 guard_ports 一个都没通过筛选（只收绑在通配或网关地址上的"
+                           "监听），这条自检没靶子可测")
+        return False, "现探不出可测的宿主端口（netstat 输出里没有通配/网关地址上的监听？），无法完成出口自检"
     probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
                                ports=" ".join(str(p) for p in ports))
     args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
