@@ -62,14 +62,15 @@ def main():
         raise SystemExit(
             "拉取失败。若是私有包：把包设成 public，或在配置里给 registry_token_file + --login-user")
 
-    # 把 digest 打出来，好写进配置钉住
+    # 打出摘要，方便核对拉到的是哪一份
     listing = run(["image", "list"])
     for line in (listing.stdout or "").splitlines():
         parts = line.split()
         if len(parts) >= 3 and reference.split(":")[0] in parts[0]:
-            print("digest: %s" % parts[-1])
-            print("想钉住的话，把配置里的 image 换成 %s@%s"
-                  % (reference.split(":")[0], parts[-1]))
+            print("digest(短): %s" % parts[-1])
+            print("要钉死版本，优先用构建时按 commit 打的 tag（:latest 会随重建前移，"
+                  "而 :<commit-sha> 不可变）；按 digest 也行，但多架构镜像的索引 digest "
+                  "要从 `container image inspect` 里取，别用上面这个短摘要拼引用。")
             break
 
 
