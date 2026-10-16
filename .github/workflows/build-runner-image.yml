@@ -1,0 +1,51 @@
+name: Build Runner Image
+
+# 构建"一次性审查容器"的镜像（runner 底座 + 审查环境），多架构，推 ghcr。
+#
+# 为什么在 CI 构建、不在内网本地构建：内网把 claude.ai 指到一张自签的内网 ALB 证书，
+# 容器信任库里没有那张 CA，取不到审查 CLI（实测报 unable to get local issuer certificate）。
+# 顺带的好处：镜像可复现、可审计，内网机器只负责 pull。
+on:
+  workflow_dispatch:
+  push:
+    branches: [prr-smoke]
+    paths:
+      - ".ci/Dockerfile.pr-runner"
+      - ".ci/pr-agent"
+      - ".github/workflows/build-runner-image.yml"
+
+permissions:
+  contents: read
+  packages: write     # 推 ghcr
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # ghcr 的镜像名必须全小写，而 GitHub 用户名可能有大写
+      - name: 算镜像名
+        id: img
+        run: |
+          owner="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner}/prr-review" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: .ci/Dockerfile.pr-runner
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.img.outputs.name }}:latest
+            ${{ steps.img.outputs.name }}:${{ github.sha }}
