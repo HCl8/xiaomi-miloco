@@ -69,6 +69,11 @@ jobs:
             echo "::error::没拿到 PR 编号（手动触发时 pr 输入不能留空，否则会去 checkout refs/pull//merge）"
             exit 1
           fi
+          # 必须是纯数字。手动触发时 pr 是自由文本，它会被拼进 API 路径与 ref，
+          # 这里挡住，下游就不必各自再防一次。
+          case "$num" in
+            *[!0-9]*) echo "::error::PR 编号必须是纯数字，拿到的是：$num"; exit 1 ;;
+          esac
           echo "num=${num}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

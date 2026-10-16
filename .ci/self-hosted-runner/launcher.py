@@ -67,7 +67,9 @@ def load_config(path):
     cfg.setdefault("name_prefix", "prr")
     cfg.setdefault("log_dir", str(Path.home() / "prreview" / "logs"))
     cfg.setdefault("runner_group_id", 1)
-    cfg.setdefault("runner_labels", ["self-hosted", "linux", "arm64"])
+    # 默认值必须与 workflow 的 `runs-on` 对得上（那边是 [self-hosted, prr-test]）。
+    # 对不上时 GitHub 不报错，只是永远不派活 —— 这台机器会一直"空闲且正常"。
+    cfg.setdefault("runner_labels", ["self-hosted", "linux", "arm64", "prr-test"])
     # 出口自检：起 runner 之前先实测"宿主机上那些无关服务封住了没"。默认开。
     cfg.setdefault("require_egress_guard", True)
     cfg.setdefault("guard_recheck_seconds", 900)
@@ -241,10 +243,20 @@ def _run(args, **kw):
 
 
 def container_running_job(name):
-    """容器里的 runner 是不是正在跑任务（看它日志最后一行）。"""
+    """容器里的 runner 是不是正在跑任务（看它日志最后一行）。
+
+    三态：True 在跑 / False 明确没在跑 / **None 问不出来**（读日志失败）。调用方必须把
+    None 当"可能正在跑"：把"没问到"当"没在跑"，下手就掐断一个在跑的作业，还会留下一条
+    GitHub 拒绝删（422）的 runner 记录，占住该 PR 的 concurrency 组直到 job 超时。
+    """
     proc = _run(["logs", name])
-    lines = [ln for ln in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if ln.strip()]
-    return bool(lines) and "Running job:" in lines[-1]
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None                      # 一个字都没读到（容器没了 / 读日志失败）→ 问不出来
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    return "Running job:" in lines[-1]
 
 
 def container_state(name):
@@ -435,8 +447,11 @@ def forget_runners(cfg, names):
         return
     base, headers = _runners_api(cfg)
     try:
-        with urllib.request.urlopen(urllib.request.Request(base, headers=headers),
-                                    timeout=20) as resp:
+        # 必须带 per_page：不带的话一次只回 30 条，名字落在后面的记录会被漏掉，
+        # 表现成"这几条 runner 记录怎么也清不掉"
+        with urllib.request.urlopen(
+                urllib.request.Request(base + "?per_page=100", headers=headers),
+                timeout=20) as resp:
             runners = json.load(resp).get("runners", [])
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.warning("查 runner 记录失败，这几条留到定期清理再收：%s", exc)
@@ -484,8 +499,10 @@ def cleanup_runner_records(cfg):
         return
     base, headers = _runners_api(cfg)
     try:
-        with urllib.request.urlopen(urllib.request.Request(base, headers=headers),
-                                    timeout=30) as resp:
+        # 同 forget_runners：不带 per_page 只看得到第一页 30 条
+        with urllib.request.urlopen(
+                urllib.request.Request(base + "?per_page=100", headers=headers),
+                timeout=30) as resp:
             runners = json.load(resp).get("runners", [])
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.warning("查 runner 记录失败：%s", exc)
@@ -606,7 +623,8 @@ def manage_pool(cfg):
                     # 任务，且 GitHub 拒绝删"正在跑任务的 runner"记录（422），那条会占住该 PR 的
                     # concurrency 组直到 job 自己超时（与退出收尾处同理）。
                     names = [n for n, _ in slots.values()]
-                    busy = [n for n in names if container_running_job(n)]
+                    # `is not False`：查不出来的一律当"可能正在跑"，不动它
+                    busy = [n for n in names if container_running_job(n) is not False]
                     idle = [n for n in names if n not in busy]
                     if busy:
                         log.warning("%d 个容器正在跑任务，不杀它们，让它们跑完自己退出：%s",
@@ -640,7 +658,7 @@ def manage_pool(cfg):
                     # 空等超时的回收**只看时钟是不够的**：作业可能正好落在容器生命的最后一段，
                     # 这时容器还在跑任务，按时钟收掉就是把它掐断。判据与另外两处（自检不过、
                     # 进程退出收尾）一致：正在跑任务的不收。
-                    if container_running_job(name):
+                    if container_running_job(name) is not False:
                         # 截止时刻往后推，免得每轮轮询都去读一次容器日志。任务跑完 runner 会自己
                         # 退出，那时由上面「已结束」那条分支收，推后的截止时刻不会真的用到。
                         slots[slot] = (name, time.time() + 60)
@@ -688,7 +706,7 @@ def manage_pool(cfg):
         # 一次性 runner 跑完一个任务就自己退出并注销，所以"放它跑完"是有界的（上界就是 job
         # 本身的超时）。停下来的容器由定期清理的 `container prune` 收走。
         names = [n for n, _ in slots.values()]
-        busy = [n for n in names if container_running_job(n)]
+        busy = [n for n in names if container_running_job(n) is not False]   # 查不出来的一律不动
         idle = [n for n in names if n not in busy]
         if busy:
             log.info("%d 个容器正在跑任务，不杀它们，让它们跑完自己退出：%s",
@@ -729,10 +747,13 @@ def main():
 
     sweep_stale_jit_files(cfg)
 
-    log.info("启动：镜像=%s digest=%s 网络=%s 仓库=%s 待命容器=%d 空闲回收=%ds",
+    log.info("启动：镜像=%s digest=%s 网络=%s 仓库=%s 标签=%s 待命容器=%d 空闲回收=%ds",
              cfg["image"], image_digest(cfg["image"]) or "未解析",
-             cfg["network"], cfg["github_repo"],
+             cfg["network"], cfg["github_repo"], ",".join(cfg["runner_labels"]),
              cfg["replicas"], cfg["idle_recycle_seconds"])
+    # 标签是唯一让 GitHub 把作业派到这台机器上的东西：runner 报的标签与 workflow 的 runs-on
+    # 对不上时**不报错**，表现是作业一直排队、这台机器一直空闲。所以把它打出来，对得上眼见为实。
+    log.info("（workflow 的 runs-on 必须包含上面这些标签，否则作业永远排队、这里看着一切正常）")
 
     # 池子循环万一因为意外异常退出，重建它 —— 但不能空转刷日志，所以加个间隔
     while not _stopping:

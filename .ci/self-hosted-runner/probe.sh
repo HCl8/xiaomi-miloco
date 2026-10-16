@@ -10,7 +10,7 @@ tcp() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 HOST_GW="${HOST_GW:-192.168.100.1}"
 GH_PROXY_PORT="${GH_PROXY_PORT:-18080}"
-MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-}"
+MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18081}"   # 显式设成空串才会跳过这条（见下面的 SKIP）
 
 echo "================ 1. 任务确实跑在容器里 ================"
 [ "$(uname -s)" = "Linux" ] \
