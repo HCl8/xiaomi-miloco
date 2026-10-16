@@ -18,7 +18,8 @@ on:
 # ⚠️ 切到自托管之前必须先下线线上那份「每个 PR 各跑一次」的路径。
 # 两条路径并发审同一个 PR 时，共用同一条 review-pr-ci 评论和同一个 pr-review status context，
 # 而门禁「跑前记下评论更新时间、跑完比一次」这条防假绿判定，前提是**这条评论只有本次审查会写** ——
-# 并发时前提不成立。本次是冒烟，两条并存；正式切换时线上那份只保留兜底 sweeper 的角色。
+# 并发时前提不成立。（本仓当前已把线上那两份手动关掉，只剩这条自托管路径；正式切换时
+# 线上那份只保留兜底 sweeper 的角色。）
 #
 # 同一 PR 连续 push 时取消上一次审查，只留最新。
 # 线上两份都有这一条，这份最初漏了 —— 而自托管下"一个 runner 一次一个作业"的串行保证不成立
@@ -40,12 +41,17 @@ jobs:
     # 认专属标签，避免被 GitHub 托管的机器接走
     runs-on: [self-hosted, prr-test]
     timeout-minutes: 60
-    # 三重守卫：草稿不审（与线上一致，靠 ready_for_review 事件补审）；**fork PR 不在这台机器上审**；
-    # 手动触发没有 pull_request 上下文，放行 —— 单写 `draft == false` 会把手动触发也一起挡掉。
+    # 三重守卫：草稿不审（与线上一致，靠 ready_for_review 事件补审）；非本仓（fork）的 PR
+    # 不在自托管上审；手动触发没有 pull_request 上下文，放行 —— 单写 `draft == false`
+    # 会把手动触发也一起挡掉。
     #
-    # 挡 fork 的必要性：`pull_request`（不是 `pull_request_target`）用的**是 PR 那一侧的工作流文件**，
-    # 所以 fork 能把这份工作流连同 job 的 if 一起改掉，让任意代码跑在这台机器上。隔离网兜在容器那层，
-    # 但没必要让外部人来投递。fork PR 交给线上那份 `pull_request_target` 审。
+    # ⚠️ 这个 `if` **不是安全边界，不要当边界引用**。`pull_request` 事件取的是 **PR 那一侧**的
+    # 工作流文件（证据：这份文件在 base 分支上并不存在，却照样被跑起来了），所以 fork 可以在
+    # 自己的 commit 里把这几行连同整个 job 一起改掉。它只挡住"不带恶意的 fork"这一类。
+    #
+    # 真正的边界有两层，都不在这个文件里：
+    #   ① 容器那层 —— 非 root、无宿主挂载、无容器 socket，出口由 pf 收口到宿主机两个端口；
+    #   ② 仓库设置 Actions → Fork pull request workflows → 要求外部协作者审批（见方案 Step 8）。
     if: >-
       github.event_name != 'pull_request'
       || (github.event.pull_request.draft == false

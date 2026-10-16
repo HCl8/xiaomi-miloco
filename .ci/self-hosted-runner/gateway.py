@@ -125,23 +125,61 @@ class GitHubProxy(BaseHTTPRequestHandler):
         self._tunnel(upstream)
 
     def _tunnel(self, upstream):
+        """两个 socket 之间双向搬字节。
+
+        写这一侧**不能用 `sendall`**：两个 socket 都是非阻塞的，sendall 发不完会抛
+        BlockingIOError，而那时前半截已经发出去了 —— 重试会重复发前缀，被外层 except 吞掉
+        则表现为"对端一慢就静默拆掉整条连接"。所以自己记一份没发完的尾巴，等 socket 可写
+        再接着发。
+
+        `pending[x]` = 还要**写给** x 的字节。
+        """
         downstream = self.connection
         downstream.setblocking(False)
         upstream.setblocking(False)
         sel = selectors.DefaultSelector()
-        sel.register(downstream, selectors.EVENT_READ, upstream)
-        sel.register(upstream, selectors.EVENT_READ, downstream)
+        peers = {downstream: upstream, upstream: downstream}
+        pending = {downstream: b"", upstream: b""}
+        for sock in (downstream, upstream):
+            sel.register(sock, selectors.EVENT_READ, sock)
         try:
             while True:
-                for key, _ in sel.select(timeout=600):
-                    src, dst = key.fileobj, key.data
+                for key, mask in sel.select(timeout=600):
+                    sock = key.fileobj
+                    if mask & selectors.EVENT_WRITE:
+                        buf = pending[sock]
+                        if not buf:                       # 已经发完了，回去只等可读
+                            sel.modify(sock, selectors.EVENT_READ, sock)
+                            continue
+                        try:
+                            sent = sock.send(buf)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except OSError:
+                            return
+                        pending[sock] = buf[sent:]
+                        if not pending[sock]:
+                            sel.modify(sock, selectors.EVENT_READ, sock)
+                        continue
                     try:
-                        data = src.recv(65536)
+                        data = sock.recv(65536)
                     except (BlockingIOError, InterruptedError):
                         continue
+                    except OSError:
+                        return
                     if not data:
                         return
-                    dst.sendall(data)
+                    dst = peers[sock]
+                    buf = pending[dst] + data
+                    try:
+                        sent = dst.send(buf)
+                    except (BlockingIOError, InterruptedError):
+                        sent = 0
+                    except OSError:
+                        return
+                    pending[dst] = buf[sent:]
+                    if pending[dst]:                      # 没发完 → 盯上它的可写事件
+                        sel.modify(dst, selectors.EVENT_READ | selectors.EVENT_WRITE, dst)
         except OSError:
             pass
         finally:

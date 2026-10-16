@@ -13,10 +13,17 @@ if [ -n "${PR_AGENT_MODEL:-}" ]; then
     export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-$PR_AGENT_MODEL}"
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-$PR_AGENT_MODEL}"
 fi
+# 单条 Bash 命令有长度上限（实测约 1.2 KB 以上一律拒绝），长正文一条命令发不出去。
+# 所以提示它走"写文件 + gh api 读文件"。Write 只在 /tmp 下被放行（见 pr-review-gate.sh 里的
+# 权限规则，路径规则要写成 Edit(...) 才生效 —— Write(...) 形式的规则不会被匹配）。
+HINT="投递长文本（PR 评论正文等）时：先写到 /tmp 下的文件，再用 gh api -F body=@<文件> 发送；"
+HINT="$HINT 单条 Bash 命令过长会被拒绝执行，不要试图把整篇正文塞进一条命令。"
+[ -n "${PR_AGENT_FALLBACK_USED:-}" ] && HINT="$HINT 本次为降级模型。"
+
 stdbuf -oL claude \
   --permission-mode dontAsk \
-  --tools "Bash,Read,Glob,Grep" \
-  ${PR_AGENT_FALLBACK_USED:+--append-system-prompt "审查报告末尾 <sub> 行里的版本号后追加 (降级模式)"} \
+  --tools "Bash,Read,Glob,Grep,Write" \
+  --append-system-prompt "$HINT" \
   --verbose --output-format stream-json -p "$@" \
   | jq --unbuffered -rc '
       def T: if length>300 then .[:300]+"…" else . end;

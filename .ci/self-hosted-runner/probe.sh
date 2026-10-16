@@ -56,6 +56,10 @@ if [ -n "$MODEL_PROXY_PORT" ]; then
   tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
     && ok "能到宿主机上的模型代理 $HOST_GW:$MODEL_PROXY_PORT" \
     || bad "到不了模型代理"
+else
+  # 显式打一条 SKIP。不给端口就整条不出现的话，手工跑会静默少一条断言，
+  # 看着还是"结论：全部通过"。
+  printf '  \033[33mSKIP\033[0m  没给 MODEL_PROXY_PORT，这条没测（workflow 里会给 18081）\n'
 fi
 
 echo "================ 6. 到不了别的地方 ================"

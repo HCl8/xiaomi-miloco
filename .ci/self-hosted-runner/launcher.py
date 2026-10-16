@@ -5,8 +5,10 @@
 容器是本进程起的、参数是写死的，所以任务对容器形态没有话语权（挂不了宿主目录、提不了特权）。
 
 两条不能破的性质：
-  1. 凭据只在内存里过一遍，不落盘、不进日志、不进任何进程的命令行参数
-     （命令行参数在宿主机 ps 里人人可见，见 _start_container 的注释）。
+  1. 凭据不进日志、不进任何进程的命令行参数（命令行参数在宿主机 ps 里人人可见）、
+     也不经环境变量（会写进容器记录 config.json）。交给容器时在 ~/prreview 下用 mkstemp
+     建一个 0600 临时文件过一手，拷完立刻 unlink —— 那是磁盘上唯一一次落地的窗口，
+     进程被 SIGKILL 才会留下残留，所以启动时顺手清扫一遍。
   2. 容器寿命不超过凭据寿命：空等超过 idle_recycle_seconds 就主动回收重来，
      堵上"凭据 1 小时过期"和"容器可能空等很久"之间的缝。
 
@@ -324,6 +326,20 @@ def start_container(cfg, jit, name, round_no):
     _hand_over_jit(cfg, jit, name)
 
 
+def sweep_stale_jit_files(cfg):
+    """清掉上次被强杀时留下的临时凭据文件。
+
+    正常路径上那个 mkstemp 文件在 finally 里必然被 unlink，只有 SIGKILL / 断电才会留残。
+    入口包装读不到凭据会一直等到超时，所以残留不影响功能，但它是一份躺在盘上的凭据。
+    """
+    for p in Path(cfg["log_dir"]).parent.glob(".prr-jit-*"):
+        try:
+            p.unlink()
+            log.warning("清掉上次残留的临时凭据文件 %s", p.name)
+        except OSError as exc:
+            log.warning("清不掉残留的 %s：%s", p.name, exc)
+
+
 def _hand_over_jit(cfg, jit, name):
     """把凭据拷进容器。临时文件用 mkstemp 建（天生 0600），拷完立刻 unlink。"""
     target = "%s:%s" % (name, cfg.get("jit_path", "/opt/runner/.jitconfig"))
@@ -452,8 +468,13 @@ def cleanup_runner_records(cfg):
         log.warning("查 runner 记录失败：%s", exc)
         return
 
+    # 只认本实例铸出来的记录（名字前缀）。runner 列表是**仓库级**的：别的机器、别人手工注册的
+    # runner 也在里面，名字同样可能不在本机容器清单里 —— 不按前缀认领就会把别人的删掉。
+    prefix = cfg["name_prefix"] + "-"
     gone = [r for r in runners
-            if r.get("status") != "online" and r.get("name") not in live]
+            if r.get("status") != "online"
+            and str(r.get("name", "")).startswith(prefix)
+            and r.get("name") not in live]
     for r in gone:
         req = urllib.request.Request("%s/%s" % (base, r["id"]), headers=headers, method="DELETE")
         try:
@@ -682,6 +703,8 @@ def main():
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+
+    sweep_stale_jit_files(cfg)
 
     log.info("启动：镜像=%s 网络=%s 仓库=%s 待命容器=%d 空闲回收=%ds",
              cfg["image"], cfg["network"], cfg["github_repo"],

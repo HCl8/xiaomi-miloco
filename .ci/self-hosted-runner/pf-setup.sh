@@ -39,8 +39,15 @@ LOG="$LOG_DIR/pf-setup.log"
 HOST_OWN_ADDR="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^127\.' | head -1)"
 _excl="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' '|')"
 BLOCK_TARGETS=("1.1.1.1:443")
+# 只取「通配」或「就绑在网关地址上」的监听当靶子：绑在回环或别的地址上的端口，容器走网关
+# 地址本就碰不到，拿它当靶子永远是"不通"，那条断言等于没做（判定恒通过）。判据与 launcher.py
+# 的出口自检保持一致。
 for _p in $(netstat -an -f inet 2>/dev/null \
-            | awk '/LISTEN/{n=split($4,a,"."); print a[n]}' \
+            | awk -v gw="$HOST_GW" '/LISTEN/{
+                  n = split($4, a, ".");
+                  p = a[n];
+                  addr = substr($4, 1, length($4) - length(p) - 1);
+                  if (p ~ /^[0-9]+$/ && (addr == "*" || addr == gw)) print p }' \
             | sort -un | grep -vE "^(${_excl})$" | head -3); do
     BLOCK_TARGETS+=("${HOST_GW}:${_p}")
     [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
@@ -208,7 +215,10 @@ judge() {
             [ "$result" = "不通" ] || block_ok=0
         fi
     done
-    [ "$n" -ge 4 ] || return 1
+    # 下限 = 两个允许靶子 + 至少一个"必须不通"的靶子（1.1.1.1 恒定在）。
+    # 上面按绑定地址筛过之后，端口靶子可能一个都不剩 —— 那不是异常，是这台机器确实没有
+    # 从网关地址够得着的无关服务。
+    [ "$n" -ge 3 ] || return 1
     [ "$allow_ok" = 1 ] && [ "$block_ok" = 1 ]
 }
 
