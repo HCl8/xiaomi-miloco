@@ -61,12 +61,14 @@ jobs:
 
       # 同一份 Dockerfile 再出一份 arm64 的 OCI tar。缓存命中，所以这一步很快。
       # 内网机器拿它 `container image load`，全程不需要 registry 凭据。
+      # tags 必须给：不给的话 load 进去是个无名镜像，启动器没法引用它。
       - name: 导出 arm64 OCI tar
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: .ci/Dockerfile.pr-runner
           platforms: linux/arm64
+          tags: prr-review:latest
           outputs: type=oci,dest=/tmp/prr-review-arm64.tar
           cache-from: type=gha,scope=prr-review-multi
 
