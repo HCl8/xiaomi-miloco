@@ -547,22 +547,27 @@ def manage_pool(cfg):
                     break
                 time.sleep(0.5)
     finally:
-        # 收尾：把自己起的容器都收掉，别留孤儿（收到 TERM 时 launchd 会等着我们做完）。
+        # 收尾：**空闲的容器收掉，正在跑任务的放它跑完**（收到 TERM 时 launchd 会等着我们做完）。
         #
-        # ⚠️ 有容器正在跑任务时收掉它 = 掐断那个任务，而且后果不止于此：GitHub 会**拒绝删除
-        # "正在跑任务的 runner"记录**（422），那条记录会一直占着它所在的 concurrency 组，
-        # 把同一 PR 的后续 run 全堵在 pending —— 直到那个 job 自己超时（实测踩过）。
-        # 所以重启启动器前，先确认池子里没有人在忙。
+        # 为什么不杀正在跑任务的：杀了 = 掐断那个任务，而且后果远不止于此 ——
+        # GitHub 会**拒绝删除"正在跑任务的 runner"记录**（422），那条记录会一直占着它所在的
+        # concurrency 组，把同一 PR 的后续 run 全堵在 pending，直到那个 job 自己超时
+        # （实测：任务跑 11 秒时重启，之后卡了近一小时）。
+        #
+        # 一次性 runner 跑完一个任务就自己退出并注销，所以"放它跑完"是有界的（上界就是 job
+        # 本身的超时）。停下来的容器由定期清理的 `container prune` 收走。
         names = [n for n, _ in slots.values()]
         busy = [n for n in names if container_running_job(n)]
+        idle = [n for n in names if n not in busy]
         if busy:
-            log.warning("有 %d 个容器正在跑任务，收掉它们等于掐断那些任务（而且它们的 runner 记录"
-                        "会一直占着 concurrency 组直到 job 超时）：%s", len(busy), ", ".join(busy))
-        for slot, (name, _) in list(slots.items()):
-            log.info("退出中：收掉槽 %d 的容器 %s", slot, name)
+            log.info("%d 个容器正在跑任务，不杀它们，让它们跑完自己退出：%s",
+                     len(busy), ", ".join(busy))
+        for name in idle:
+            log.info("退出中：收掉空闲容器 %s", name)
             kill_and_delete(name)
-            del slots[slot]
-        forget_runners(cfg, names)
+        slots.clear()
+        # 只清空闲那批的记录；跑着任务的那批会在自己退出时注销，此刻删也删不掉（422）
+        forget_runners(cfg, idle)
 
 
 def main():
