@@ -34,8 +34,12 @@ git show "origin/main:.agents/commands/review-pr.md" \
 # 写死 Bash 子命令白名单到 .claude/settings.json。
 # dontAsk 模式下只有 permissions.allow 名单内的命令能执行，其余自拒；
 # 与 --tools "Bash,Read,Glob,Grep" 工具白名单形成纵深防御。
+# Edit(//tmp/**) 放行的是**所有写文件工具**在 /tmp 下的写入（路径规则只认 Edit(...)；
+# 写成 Write(//tmp/**) 会被接受但永不匹配，等于没写）。注释正文动辄几 KB、又超过单条命令
+# 长度上限，只能落到文件里再 `gh api -F body=@文件`。dontAsk 模式下不在名单里的写入一律自拒，
+# 所以这等于"只许写 /tmp"。
 cat > .claude/settings.json <<'SETEOF'
-{"permissions": {"allow": ["Bash(jq *)", "Bash(gh *)", "Bash(git *)", "Bash(md5sum *)", "Bash(diff *)"]}}
+{"permissions": {"allow": ["Bash(jq *)", "Bash(gh *)", "Bash(git *)", "Bash(md5sum *)", "Bash(diff *)", "Edit(//tmp/**)"]}}
 SETEOF
 
 # 跑审查：主模型失败时降级到备用模型/endpoint 重试一次。
@@ -43,6 +47,18 @@ SETEOF
 # < /dev/null 必须：本脚本以 `git show ...:pr-review-gate.sh | bash` 方式（脚本走 bash stdin）调用，
 # 而审查 CLI 的 -p 模式在非 TTY 下会读 stdin 当输入，会把 bash 尚未读完的后续脚本（含下面的门禁逻辑）吞掉，
 # 导致 pr-agent 后整段门禁被静默跳过、门禁恒放行。隔到 /dev/null 杜绝它消费脚本流。
+# 跑审查之前，先把"现有那条 review-pr-ci 评论"的更新时间记下来 —— 末尾判定要拿它比对。
+# 必须比对的原因：这条评论是**可复用的**（每次审查都改同一条，不新增）。所以"本次审查
+# 什么都没产出"和"本次审查产出了结论"在只看 body 时长得一模一样：
+# 上次结论是红的就**假红**，上次结论是绿的则**假绿** —— 没被审过的 commit 拿到绿灯，
+# 直接能合进去。判定必须能区分"这是本次的结论"和"这是上次留下的"。
+comment_stamp() {
+  gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate 2>/dev/null \
+    | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->"))] | last | (.updated_at // "")' 2>/dev/null \
+    || echo ""
+}
+STAMP_BEFORE="$(comment_stamp)"
+
 REVIEW_OK=0
 if /usr/local/bin/pr-agent "/review-pr $PR_NUMBER --ci" < /dev/null; then
   REVIEW_OK=1
@@ -64,11 +80,19 @@ if [ "$REVIEW_OK" -ne 1 ]; then
   exit 1
 fi
 
-# 拉刚发布的 review-pr-ci 评论；gh api 瞬断时 || 回退空串，交给下方空值分支放行
+# 拉 review-pr-ci 评论；gh api 瞬断时 || 回退空串，交给下面判空分支阻断
 NOTE_BODY=$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
   | jq -rs 'add | .[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .body') || NOTE_BODY=""
 if [ -z "$NOTE_BODY" ]; then
   echo "[FAIL] 未找到 review-pr-ci 评论（审查结果未产出），阻断 merge"
+  exit 1
+fi
+
+# 这条评论必须**被本次审查更新过**。没更新说明本次审查没产出结果，
+# 那它承载的就是上一次的结论 —— 不能当本次结论用（假绿会放过没审过的 commit）。
+STAMP_AFTER="$(comment_stamp)"
+if [ -z "$STAMP_AFTER" ] || [ "$STAMP_AFTER" = "$STAMP_BEFORE" ]; then
+  echo "[FAIL] review-pr-ci 评论未被本次审查更新（本次结果未产出，读到的会是旧结论），阻断 merge"
   exit 1
 fi
 
