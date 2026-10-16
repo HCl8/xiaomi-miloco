@@ -1,10 +1,14 @@
 name: Build Runner Image
 
-# 构建"一次性审查容器"的镜像（runner 底座 + 审查环境），多架构，推 ghcr。
+# 构建"一次性审查容器"的镜像（runner 底座 + 审查环境），推 ghcr，并额外产出一份 OCI tar 当 artifact。
 #
 # 为什么在 CI 构建、不在内网本地构建：内网把 claude.ai 指到一张自签的内网 ALB 证书，
 # 容器信任库里没有那张 CA，取不到审查 CLI（实测报 unable to get local issuer certificate）。
-# 顺带的好处：镜像可复现、可审计，内网机器只负责 pull。
+# 顺带的好处：镜像可复现、可审计，内网机器只负责取用。
+#
+# 为什么同时给 OCI tar：ghcr 上的包默认私有，内网机器要拉就需要一个带 read:packages 的凭据。
+# tar 走仓库自己的 artifact，用现有 token 就能取，不需要动 registry 的可见性。
+# 两条路并存——registry 那条更强（能按 digest 钉住），tar 这条零配置。
 on:
   workflow_dispatch:
   push:
@@ -41,7 +45,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      # 多架构推 registry：amd64 供云端兜底路径，arm64 供内网那台机器
+      - name: 构建并推 registry
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: .ci/Dockerfile.pr-runner
@@ -50,3 +56,24 @@ jobs:
           tags: |
             ${{ steps.img.outputs.name }}:latest
             ${{ steps.img.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=prr-review-multi
+          cache-to: type=gha,mode=max,scope=prr-review-multi
+
+      # 同一份 Dockerfile 再出一份 arm64 的 OCI tar。缓存命中，所以这一步很快。
+      # 内网机器拿它 `container image load`，全程不需要 registry 凭据。
+      - name: 导出 arm64 OCI tar
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: .ci/Dockerfile.pr-runner
+          platforms: linux/arm64
+          outputs: type=oci,dest=/tmp/prr-review-arm64.tar
+          cache-from: type=gha,scope=prr-review-multi
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: prr-review-arm64-oci
+          path: /tmp/prr-review-arm64.tar
+          retention-days: 14
+          if-no-files-found: error
