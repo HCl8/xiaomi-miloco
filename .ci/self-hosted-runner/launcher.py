@@ -154,7 +154,14 @@ def check_egress_guard(cfg):
     探测哪几个端口由配置给（guard_ports），函数本身不写死。
     返回 (ok, 说明)。
     """
+    mine = {int(cfg["github_proxy_port"])}
+    if cfg.get("model_proxy_port"):
+        mine.add(int(cfg["model_proxy_port"]))
     ports = cfg.get("guard_ports")
+    if ports is not None:
+        # 配置里显式给的靶子也要剔掉网关自己的两个端口：拿它们当靶子必然"够得着"，
+        # 那条自检就永远过不了 —— 而原因与隔离无关。
+        ports = [p for p in ports if int(p) not in mine]
     if ports is None:
         ports = discover_guard_ports(cfg)
     if ports is None:
@@ -644,9 +651,18 @@ def manage_pool(cfg):
                 detail = "出口[%s] 网关[%s]" % (egress_detail, gateway_detail)
                 if not (egress_ok and gateway_ok):
                     log.error("启动前自检没过：%s", detail)
-                    log.error("停掉待命容器且不再起新的。隔离修法：bash ~/prreview/pf-setup.sh；"
-                              "网关修法：launchctl kickstart -k gui/%s/com.prreview.gateway",
-                              os.getuid())
+                    # 修法要按**具体哪一条**给。以前不管哪种失败都写"隔离修法：pf-setup.sh"，
+                    # 而"筛不出可测的宿主端口"根本不是 pf 的问题（是端口探测没拿到东西），
+                    # 照着去重跑 pf-setup 只会白跑一趟，还错过真正的线索。
+                    log.error("停掉待命容器且不再起新的，按下面具体那条修：")
+                    if not egress_ok:
+                        log.error("  出口自检不过（%s）。提示是「能连到宿主机端口」→ "
+                                  "bash ~/prreview/pf-setup.sh；提示是「筛不出可测的宿主端口」→ "
+                                  "那是端口探测没拿到东西，先看 netstat -an -f inet 的输出。",
+                                  egress_detail)
+                    if not gateway_ok:
+                        log.error("  网关自检不过（%s）。修法：launchctl kickstart -k gui/%s/com.prreview.gateway",
+                                  gateway_detail, os.getuid())
                     # 同一条判据：只收空闲的。自检没过不该牵连正在跑任务的容器 —— 杀它 = 掐断那个
                     # 任务，且 GitHub 拒绝删"正在跑任务的 runner"记录（422），那条会占住该 PR 的
                     # concurrency 组直到 job 自己超时（与退出收尾处同理）。

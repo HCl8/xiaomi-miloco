@@ -4,8 +4,10 @@
 # 不再内联一份副本。曾经是两份，漂移过一次（同一台机器、同一个坏状态，一边打通过一边 FAIL）。
 # 手工跑也是它：bash probe.sh（明细直接看得到）。
 fail=0
-ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
-bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+skipped=0
+ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+skip() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; skipped=$((skipped + 1)); }
 tcp() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 HOST_GW="${HOST_GW:-192.168.100.1}"
@@ -73,22 +75,24 @@ tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
 echo "================ 6. 到不了别的地方 ================"
 # 用**字面 IP**。主机名要先解析，而"解析不出来"与"连不上"在结果上长得一样 —— 拿主机名
 # 当靶子，这条断言在容器里恒绿，什么都证明不了。1.1.1.1 不经过 DNS，不通就是不通。
+# 两个**字面公网 IP**。主机名要先解析，而"解析不出来"与"连不上"在结果上长得一样 ——
+# 拿主机名当靶子，这条断言在容器里恒绿，什么都证明不了。字面 IP 不经 DNS，不通就是不通。
+# （容器是有默认路由的：`0.0.0.0/0 via 192.168.100.1`，所以"不通"正是这层规则在起作用。）
 tcp 1.1.1.1 443 \
   && bad "直连 1.1.1.1:443 通了（公网可达！）" \
   || ok "直连 1.1.1.1:443 不通（字面公网 IP，不经 DNS）"
+tcp 8.8.8.8 53 \
+  && bad "直连 8.8.8.8:53 通了（公网可达！）" \
+  || ok "直连 8.8.8.8:53 不通（字面公网 IP，不经 DNS）"
 
+# DNS 本身也该是不可用的：容器的流量一律按 IP 走宿主机那两个端口，不该有能解析的地方。
+# 这条与上面那两条方向相反 —— 解析**成功**才是问题（说明有我们没料到的出网路径）。
 resolve() { getent hosts "$1" 2>/dev/null | awk '{print $1; exit}'; }
-check_host() {   # check_host <主机名> <端口>
-  if [ -z "$(resolve "$1")" ]; then
-    printf '  \033[33mSKIP\033[0m  %s 在容器里解析不出来，这条没测到东西（不代表出口被挡）\n' "$1"
-    return
-  fi
-  tcp "$1" "$2" \
-    && bad "直连 $1:$2 通了（应该没有路由）" \
-    || ok "直连 $1:$2 不通"
-}
-check_host github.com 443
-check_host example.com 80
+if [ -n "$(resolve github.com)" ]; then
+  bad "容器里能解析 github.com —— DNS 通了，说明有没料到的出网路径"
+else
+  ok "容器里解析不了 github.com（没有可用的 DNS）"
+fi
 
 # 内网那条不给靶子就 SKIP：以前默认的 RFC 5737 保留地址（192.0.2.1）全网本就没有路由，
 # 无论 pf 在不在都不通 —— 一条恒绿的断言等于没做。真实部署用 PRR_INTRANET_TARGET 指一台
@@ -98,9 +102,17 @@ if [ -n "${PRR_INTRANET_TARGET:-}" ]; then
     && bad "$PRR_INTRANET_TARGET:443 通了（有路由泄漏！）" \
     || ok "$PRR_INTRANET_TARGET:443 不通"
 else
-  printf '  \033[33mSKIP\033[0m  没给 PRR_INTRANET_TARGET，内网可达性这条没测\n'
+  skip "没给 PRR_INTRANET_TARGET，内网可达性这条没测"
 fi
 
 echo "======================================================="
-[ "$fail" -eq 0 ] && echo "结论：全部通过" || echo "结论：有断言失败"
+# "全部通过"不能说满：SKIP 的那些**一条证据都没产生**，把它们和真跑过的断言混在同一个
+# "通过"里，读的人会以为覆盖得比实际多。
+if [ "$fail" -ne 0 ]; then
+  echo "结论：有断言失败"
+elif [ "$skipped" -ne 0 ]; then
+  echo "结论：没有失败，但有 $skipped 条没测到东西（见上面 SKIP）"
+else
+  echo "结论：全部通过"
+fi
 exit "$fail"
