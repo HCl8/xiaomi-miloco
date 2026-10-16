@@ -180,6 +180,13 @@ def _run(args, **kw):
     return subprocess.run([CONTAINER] + args, capture_output=True, text=True, **kw)
 
 
+def container_running_job(name):
+    """容器里的 runner 是不是正在跑任务（看它日志最后一行）。"""
+    proc = _run(["logs", name])
+    lines = [ln for ln in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if ln.strip()]
+    return bool(lines) and "Running job:" in lines[-1]
+
+
 def container_state(name):
     """返回容器状态字符串（running/stopped/...）；容器不存在返回 None。
 
@@ -540,8 +547,17 @@ def manage_pool(cfg):
                     break
                 time.sleep(0.5)
     finally:
-        # 收尾：把自己起的容器都收掉，别留孤儿（收到 TERM 时 launchd 会等着我们做完）
+        # 收尾：把自己起的容器都收掉，别留孤儿（收到 TERM 时 launchd 会等着我们做完）。
+        #
+        # ⚠️ 有容器正在跑任务时收掉它 = 掐断那个任务，而且后果不止于此：GitHub 会**拒绝删除
+        # "正在跑任务的 runner"记录**（422），那条记录会一直占着它所在的 concurrency 组，
+        # 把同一 PR 的后续 run 全堵在 pending —— 直到那个 job 自己超时（实测踩过）。
+        # 所以重启启动器前，先确认池子里没有人在忙。
         names = [n for n, _ in slots.values()]
+        busy = [n for n in names if container_running_job(n)]
+        if busy:
+            log.warning("有 %d 个容器正在跑任务，收掉它们等于掐断那些任务（而且它们的 runner 记录"
+                        "会一直占着 concurrency 组直到 job 超时）：%s", len(busy), ", ".join(busy))
         for slot, (name, _) in list(slots.items()):
             log.info("退出中：收掉槽 %d 的容器 %s", slot, name)
             kill_and_delete(name)
