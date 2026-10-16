@@ -126,7 +126,9 @@ def discover_guard_ports(cfg):
         tail = fields[3].rsplit(".", 1)[-1]          # '* .18080' / '127.0.0.1.22' → 端口
         if tail.isdigit():
             ports.add(int(tail))
-    return sorted(p for p in ports if p not in mine)
+    # 只取前几个：这是"够不够得着"的抽样，不是端口清单。每个靶子都要等一次超时，
+    # 取全部会让自检从几秒变成近一分钟。
+    return sorted(p for p in ports if p not in mine)[:3]
 
 
 def check_egress_guard(cfg):
