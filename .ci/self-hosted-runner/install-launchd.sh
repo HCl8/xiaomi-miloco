@@ -19,7 +19,7 @@ CONTAINER_BIN=/usr/local/bin/container
 
 say() { printf '  %s\n' "$*"; }
 
-[ -x "$CONTAINER_BIN" ] || { echo "找不到 Apple container CLI（$CONTAINER_BIN），先装它" >&2; exit 1; }
+[ -x "$CONTAINER_BIN" ] || { echo "找不到 Apple container CLI（${CONTAINER_BIN}），先装它" >&2; exit 1; }
 [ -r "$CONF" ] || { echo "找不到配置 $CONF" >&2; exit 1; }
 
 mkdir -p "$AGENTS" "$PRR_DIR/logs"
