@@ -82,6 +82,10 @@ jobs:
       - name: AI 审查并按严重度门禁
         env:
           GH_TOKEN: ${{ github.token }}
+          # 走 env 而不是把表达式直接插进 shell —— 与上面「定 PR 编号」那步同一个理由：
+          # 输入值不该被当成代码执行（手动触发时 pr 是自由文本，`1; rm -rf /` 这种要原样当参数）。
+          PR_NUM: ${{ steps.pr.outputs.num }}
+          REPO: ${{ github.repository }}
           # 这里**刻意不声明** ANTHROPIC_* / PR_AGENT_MODEL：
           # 它们由宿主机的启动器注入容器（模型地址指向宿主机上的模型代理，
           # 容器拿到的是一把假钥匙，真 key 不进容器）。
@@ -92,7 +96,7 @@ jobs:
           # 跑 base 分支上的门禁脚本（与线上同一个文件，单一来源）。
           # 用 git show 取 origin/main 版本而非工作区那份 —— PR 改不动这段判定逻辑。
           if git show origin/main:.ci/pr-review-gate.sh \
-            | bash -s -- "${{ steps.pr.outputs.num }}" "${{ github.repository }}"; then
+            | bash -s -- "$PR_NUM" "$REPO"; then
             STATE=success
             DESC="未发现严重/重要问题"
           else
@@ -104,8 +108,8 @@ jobs:
           # 上面 checkout 的是 refs/pull/<n>/merge，那是 GitHub 现算的合并提交：
           # 它临时（base 一前进就换 SHA）、且 PR 的 check 全在 head 上。
           # 打错地方的话，这条 status 既不显示在 PR 上，也当不了 required check（线上两份都是打 head）。
-          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.num }}" --jq .head.sha)
-          gh api "repos/${{ github.repository }}/statuses/$HEAD_SHA" \
+          HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq .head.sha)
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="$STATE" -f context="pr-review" -f description="$DESC" >/dev/null
 
           [ "$STATE" = success ]

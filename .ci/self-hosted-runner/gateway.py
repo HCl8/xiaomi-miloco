@@ -317,7 +317,10 @@ class ModelProxy(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                chunk = resp.read(8192)
+                # 必须用 read1：read(n) 会**阻塞到攒够 n 字节或流结束**（chunked 时逐块拼、
+                # 非 chunked 时走 BufferedReader.read），于是模型的 SSE 变成一坨一坨地到，
+                # 中间整段整段地停。read1 是"有多少给多少"。
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
