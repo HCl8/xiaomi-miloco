@@ -55,5 +55,10 @@ jobs:
           tags: |
             ${{ steps.img.outputs.name }}:latest
             ${{ steps.img.outputs.name }}:${{ github.sha }}
+          # 镜像自己带上"我是哪个 commit 构建的"：配置里写 :latest 时，换了镜像从名字上
+          # 看不出来（启动日志现在会打 digest，但 digest 只有翻 registry 才能对回 commit）。
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=prr-review
           cache-to: type=gha,mode=max,scope=prr-review

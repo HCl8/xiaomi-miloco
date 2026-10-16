@@ -250,12 +250,14 @@ def container_running_job(name):
     GitHub 拒绝删（422）的 runner 记录，占住该 PR 的 concurrency 组直到 job 超时。
     """
     proc = _run(["logs", name])
-    out = (proc.stdout or "").strip()
-    if not out:
-        return None                      # 一个字都没读到（容器没了 / 读日志失败）→ 问不出来
-    lines = [ln for ln in out.splitlines() if ln.strip()]
-    if not lines:
+    # **先看退出码**：这才是"这次调用成没成"的主判据。只看 stdout 空不空等于假设
+    # CLI 把报错写在别的流上 —— 那是实现细节，赌错了就在"命令失败"时返回 False
+    # （"确定没在跑"），三处调用照样下手杀容器。
+    if proc.returncode != 0:
         return None
+    lines = [ln for ln in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if ln.strip()]
+    if not lines:
+        return None                      # 还没吐出任何日志（刚起来）→ 也算问不出来，别当"没在跑"
     return "Running job:" in lines[-1]
 
 
@@ -424,6 +426,26 @@ def host_reclaimable_gb():
     return total * ps / 1024 ** 3 if total else None
 
 
+def _list_runners(base, headers, timeout=30):
+    """列出**全部** runner 记录（跟着 Link 头翻页）。
+
+    这个列表是仓库级的、记录会随容器 churn 堆积，一页装不下很正常。不带 per_page 只看得到
+    30 条，带了但只取一页则只看到 100 条 —— 两种都会漏，表现成"这几条记录怎么也清不掉"。
+    """
+    out = []
+    url = base + "?per_page=100"
+    for _ in range(20):                      # 兜底上限，别在异常情况下无限翻
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+            out.extend(json.load(resp).get("runners", []))
+            link = resp.headers.get("Link", "") or ""
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not m:
+            break
+        url = m.group(1)
+    return out
+
+
 def _runners_api(cfg):
     token = Path(cfg["github_token_file"]).read_text().strip()
     base = "%s/repos/%s/actions/runners" % (GITHUB_API, cfg["github_repo"])
@@ -447,12 +469,7 @@ def forget_runners(cfg, names):
         return
     base, headers = _runners_api(cfg)
     try:
-        # 必须带 per_page：不带的话一次只回 30 条，名字落在后面的记录会被漏掉，
-        # 表现成"这几条 runner 记录怎么也清不掉"
-        with urllib.request.urlopen(
-                urllib.request.Request(base + "?per_page=100", headers=headers),
-                timeout=20) as resp:
-            runners = json.load(resp).get("runners", [])
+        runners = _list_runners(base, headers, timeout=20)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.warning("查 runner 记录失败，这几条留到定期清理再收：%s", exc)
         return
@@ -499,11 +516,7 @@ def cleanup_runner_records(cfg):
         return
     base, headers = _runners_api(cfg)
     try:
-        # 同 forget_runners：不带 per_page 只看得到第一页 30 条
-        with urllib.request.urlopen(
-                urllib.request.Request(base + "?per_page=100", headers=headers),
-                timeout=30) as resp:
-            runners = json.load(resp).get("runners", [])
+        runners = _list_runners(base, headers)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.warning("查 runner 记录失败：%s", exc)
         return

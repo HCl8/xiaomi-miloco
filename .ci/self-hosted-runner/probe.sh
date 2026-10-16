@@ -10,7 +10,21 @@ tcp() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 HOST_GW="${HOST_GW:-192.168.100.1}"
 GH_PROXY_PORT="${GH_PROXY_PORT:-18080}"
-MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18081}"   # 显式设成空串才会跳过这条（见下面的 SKIP）
+MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18081}"
+
+# 这三个值在配置里是单一来源（启动器、网关、pf 规则、装机自检都读那一份），而这里是它们的
+# 第二份 —— 容器里读不到宿主上的配置文件。好在启动器把配置里的网关地址与两个端口注入成了
+# 环境变量，拿它对一次：对不上就说"取值漂了"，别报成"到不了代理"那种与真实故障无关的红。
+hostport() { printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#/.*$##'; }
+check_injected() {   # check_injected <变量名> <值> <期望的 host:port>
+    [ -n "$2" ] || return 0
+    [ "$(hostport "$2")" = "$3" ] && return 0
+    printf '\n!! 靶子与启动器注入的不一致：%s=%s，脚本默认 %s\n' "$1" "$2" "$3" >&2
+    printf '!! 改 probe.sh 顶部的默认值，或 export HOST_GW / GH_PROXY_PORT / MODEL_PROXY_PORT 后重跑。\n' >&2
+    exit 2
+}
+check_injected HTTP_PROXY "${HTTP_PROXY:-}" "$HOST_GW:$GH_PROXY_PORT"
+check_injected ANTHROPIC_BASE_URL "${ANTHROPIC_BASE_URL:-}" "$HOST_GW:$MODEL_PROXY_PORT"
 
 echo "================ 1. 任务确实跑在容器里 ================"
 [ "$(uname -s)" = "Linux" ] \
@@ -52,15 +66,9 @@ echo "================ 5. 唯一的出口是宿主机 ================"
 tcp "$HOST_GW" "$GH_PROXY_PORT" \
   && ok "能到宿主机上的 GitHub 转发代理 $HOST_GW:$GH_PROXY_PORT" \
   || bad "到不了 GitHub 转发代理"
-if [ -n "$MODEL_PROXY_PORT" ]; then
-  tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
-    && ok "能到宿主机上的模型代理 $HOST_GW:$MODEL_PROXY_PORT" \
-    || bad "到不了模型代理"
-else
-  # 显式打一条 SKIP。不给端口就整条不出现的话，手工跑会静默少一条断言，
-  # 看着还是"结论：全部通过"。
-  printf '  \033[33mSKIP\033[0m  没给 MODEL_PROXY_PORT，这条没测（workflow 里会给 18081）\n'
-fi
+tcp "$HOST_GW" "$MODEL_PROXY_PORT" \
+  && ok "能到宿主机上的模型代理 $HOST_GW:$MODEL_PROXY_PORT" \
+  || bad "到不了模型代理"
 
 echo "================ 6. 到不了别的地方 ================"
 tcp github.com 443 \

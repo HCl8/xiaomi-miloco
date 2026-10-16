@@ -354,6 +354,9 @@ def main():
     cfg = prrlib.load_json_config(args.config, required=(
         "github_proxy_port", "model_proxy_port", "model_upstream",
         "model_key_file", "container_token_file",
+        # allow_cidrs 必须必填：漏了它 parse_cidrs 得到空列表，而空列表的含义是"来源不限"
+        # —— 等于把这层唯一的准入关掉（谁能连到 18080 就能借这台机器出网到 GitHub）。
+        "allow_cidrs",
     ))
     log_path = args.log or (prrlib.expand(cfg["log_dir"]) + "/gateway.log"
                             if cfg.get("log_dir") else None)
