@@ -137,10 +137,15 @@ def check_egress_guard(cfg):
     探测哪几个端口由配置给（guard_ports），函数本身不写死。
     返回 (ok, 说明)。
     """
-    ports = discover_guard_ports(cfg, cfg.get("guard_ports"))
+    # `or None`：`guard_ports: []` 与没给这个键当同一件事（写空数组多半是"没意见"）。
+    # 不归一的话，空数组会被当成"配置给了靶子"传下去 → 收窄成空集 → 判失败，
+    # 而报出来的成因还是"配置给的被筛空"，与实际发生的事对不上。
+    restrict = cfg.get("guard_ports") or None
+    ports = discover_guard_ports(cfg, restrict)
     if ports is None:
         # 探测失败 ≠ 没有目标。宁可挡住，也不假装检查过了
-        return False, "探不到宿主机在监听哪些端口（netstat 失败），无法完成出口自检"
+        return False, ("探不到宿主机在监听哪些端口（netstat 跑不起来），无法完成出口自检"
+                       " —— 先确认 netstat 能跑（PATH/权限）")
     if not ports:
         # 一个靶子都筛不出来 → **判失败**，与 pf-setup.sh 的 judge（要求至少一个端口靶子）
         # 在同条件下判决一致。不能当"没有可测目标"放过：真正的"这台机器只听了网关"与
@@ -148,10 +153,13 @@ def check_egress_guard(cfg):
         # 静默失效（一个探针容器都没跑，日志上却是"自检通过"）。
         # 区分两种"没靶子"：配置给的被筛空了，还是现探本身没拿到东西。混成一句
         # "netstat 没探到东西"会把人指向错误的排查方向。
-        if cfg.get("guard_ports"):
+        if restrict is not None:
             return False, ("配置里的 guard_ports 一个都没通过筛选（只收绑在通配或网关地址上的"
-                           "监听），这条自检没靶子可测")
-        return False, "现探不出可测的宿主端口（netstat 输出里没有通配/网关地址上的监听？），无法完成出口自检"
+                           "监听），这条自检没靶子可测 —— 改配置里的 guard_ports，"
+                           "或把它设成 null 走现探；重跑 pf-setup.sh 不解决这个")
+        return False, ("现探不出可测的宿主端口（netstat 输出里没有通配/网关地址上的监听？），"
+                       "无法完成出口自检 —— 先看 netstat -an -f inet 的输出，"
+                       "重跑 pf-setup.sh 不解决这个")
     probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
                                ports=" ".join(str(p) for p in ports))
     args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
@@ -164,7 +172,8 @@ def check_egress_guard(cfg):
         return True, "宿主端口已封住"
     hit = [ln for ln in (proc.stdout or "").splitlines() if ln.startswith("reachable:")]
     if hit:
-        return False, "从容器里能连到宿主机端口 %s —— pf 那层不在了" % ", ".join(hit)
+        return False, ("从容器里能连到宿主机端口 %s —— pf 那层不在了。"
+                       "修法：bash ~/prreview/pf-setup.sh") % ", ".join(hit)
     return False, "自检异常退出(%d): %s" % (proc.returncode, (proc.stderr or proc.stdout).strip()[:200])
 
 
@@ -635,10 +644,11 @@ def manage_pool(cfg):
                     # 照着去重跑 pf-setup 只会白跑一趟，还错过真正的线索。
                     log.error("停掉待命容器且不再起新的，按下面具体那条修：")
                     if not egress_ok:
-                        log.error("  出口自检不过（%s）。提示是「能连到宿主机端口」→ "
-                                  "bash ~/prreview/pf-setup.sh；提示是「筛不出可测的宿主端口」→ "
-                                  "那是端口探测没拿到东西，先看 netstat -an -f inet 的输出。",
-                                  egress_detail)
+                        # 这里**只原样打出来**，不再按文案分流 —— 分流要匹配消息里的字面量，
+                        # 而消息一改分流就静默失效（上一版就是这么坏的：它引用的那句
+                        # "筛不出可测的宿主端口"当轮就被改掉了）。修法由 check_egress_guard
+                        # 写在 detail 里，谁产生的消息谁负责说清怎么办。
+                        log.error("  出口自检不过 —— %s", egress_detail)
                     if not gateway_ok:
                         log.error("  网关自检不过（%s）。修法：launchctl kickstart -k gui/%s/com.prreview.gateway",
                                   gateway_detail, os.getuid())
