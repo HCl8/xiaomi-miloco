@@ -76,13 +76,15 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
         run: |
-          # 这个 PR 上还在排队/在跑的自托管审查任务
+          # 这个 PR 上还没结束的自托管审查任务。判据是 `.status != "completed"`，
+          # **不能只列 queued / in_progress**：GitHub 还有 pending / requested / waiting
+          # 这些中间态（触发后、被 runner 领走前就是 pending），漏掉它们会让取消落空。
           active() {
             gh api "repos/$REPO/actions/runs?per_page=100" --paginate \
               --jq '[.workflow_runs[]
                      | select(.path == ".github/workflows/pr-review-selfhosted.yml")
                      | select(any(.pull_requests[]?; .number == '"$PR"'))
-                     | select(.status == "queued" or .status == "in_progress")
+                     | select(.status != "completed")
                      | .id] | .[]' 2>/dev/null
           }
           ids="$(active || true)"
