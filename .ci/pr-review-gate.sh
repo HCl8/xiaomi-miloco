@@ -8,7 +8,7 @@
 # 文件会被当命令执行。故启动前清掉这些文件，只从 base 取回可信版本；调用前须已 fetch origin/main。
 #
 # 用法: pr-review-gate.sh <pr-number> <repo-slug>
-# 退出码: 0=放行（无严重/重要问题，或 infra 故障放行不阻塞）, 1=发现严重或重要问题
+# 退出码: 0=放行；1=不放行（发现严重或重要问题，或基础设施故障——两者都不该 merge）
 set -uo pipefail
 
 PR_NUMBER="$1"

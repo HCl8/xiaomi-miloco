@@ -35,7 +35,7 @@
   ],
   "_comment_guard": "起 runner 前先自检隔离（安全）与网关（可用性），任一不过就停掉待命容器且不再起新的；这是故意的 fail-closed，别改成 false 绕过。",
   "require_egress_guard": true,
-  "_comment_guard_ports": "可选；留空则现探。填了也须绑在通配或网关地址上——绑在回环上的靶子容器够不着，自检会永远通过。",
+  "_comment_guard_ports": "可选；留空则现探。填了也须绑在通配或网关地址上——绑在回环上的会被剔掉，一个都不剩就判失败。",
   "guard_ports": null,
   "guard_recheck_seconds": 900,
   "name_prefix": "prr",

@@ -75,8 +75,7 @@ jobs:
           PR: ${{ github.event.issue.number }}
         run: |
           # 这个 PR 上还没结束的自托管审查任务。判据 status != "completed"：pending /
-          # requested / waiting 也是未结束，只列 queued/in_progress 会漏。认领取
-          # pull_requests[].number 与 head_sha 的并集（手动 dispatch 时前者为空）。
+          # requested / waiting 也是未结束，只列 queued/in_progress 会漏。
           active() {
             gh api "repos/$REPO/actions/runs?per_page=100" --paginate \
               --jq '.workflow_runs[]
@@ -167,6 +166,11 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'cloud'
     runs-on: ubuntu-latest
+    # 同样与自托管审查共用组：路由判完之后又推了新 commit 时，后来的那条取消这条，
+    # 不会出现云端与自托管两条同时写同一条评论和同一个 status。
+    concurrency:
+      group: pr-review-selfhosted-${{ github.event.issue.number }}
+      cancel-in-progress: true
     timeout-minutes: 60
     container:
       image: ghcr.io/xiaomi/xiaomi-miloco/pr-review:trixie
