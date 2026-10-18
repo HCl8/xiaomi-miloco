@@ -1,6 +1,12 @@
-# 维护者手动触发的 PR 审查：在 PR 评论里发 "/review" 即对该 PR 跑一次 /review-pr。
+# 维护者手动触发的 PR 审查：在 PR 评论里发 "/review" 即对该 PR 跑一次审查。
 # 用途：维护者手动对任意 PR（含 fork）跑审查；在 base 仓上下文里通过 issue_comment 触发。
 # 安全边界 = 评论者须有 write+ 权限 + 钉死触发时刻的 head SHA。
+#
+# 用哪条 runner 由**触发那一刻有没有正在跑的自托管任务**决定：
+#   有（排队中 / 在跑）→ 取消它，等它真的停下，然后改用公共 runner
+#   没有              → 用自托管 runner
+# 这样"机器挂了、作业卡在队列里"时，维护者发一句 /review 就能切到公共 runner，
+# 而不需要去仓库设置里手动开关 workflow（那种开关一开就是全仓生效，还会留下两个写者）。
 name: PR Review (command)
 
 on:
@@ -11,6 +17,7 @@ permissions:
   contents: read
   pull-requests: write # 发 / 改 review-pr-ci 评论、加 reaction
   statuses: write # 把门禁结论打到 head SHA 的 commit status
+  actions: write # 取消进行中的自托管审查任务
   packages: read # 拉 ghcr 上的审查镜像
 
 concurrency:
@@ -32,6 +39,7 @@ jobs:
     outputs:
       head_sha: ${{ steps.gate.outputs.head_sha }}
       matched: ${{ steps.check.outputs.matched }}
+      where: ${{ steps.route.outputs.where }}
     steps:
       - name: 校验评论命令
         id: check
@@ -59,6 +67,50 @@ jobs:
           HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
 
+      # 决定走哪条 runner，并清掉会让两条路径同时写的那个前提
+      - name: 决定用哪条 runner
+        if: steps.check.outputs.matched == 'true'
+        id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          # 这个 PR 上还在排队/在跑的自托管审查任务
+          active() {
+            gh api "repos/$REPO/actions/runs?per_page=100" --paginate \
+              --jq '[.workflow_runs[]
+                     | select(.path == ".github/workflows/pr-review-selfhosted.yml")
+                     | select(any(.pull_requests[]?; .number == '"$PR"'))
+                     | select(.status == "queued" or .status == "in_progress")
+                     | .id] | .[]' 2>/dev/null
+          }
+          ids="$(active || true)"
+          if [ -z "$ids" ]; then
+            echo "没有进行中的自托管任务 → 用自托管 runner"
+            echo "where=self" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "发现进行中的自托管任务，先取消："
+          printf '%s\n' "$ids" | while read -r id; do
+            [ -n "$id" ] || continue
+            echo "  run $id"
+            gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+          done
+          # **必须等它真的停下**：取消是异步的。不等就往下走，那一刻两个写者同时存在，
+          # 共用一条 review-pr-ci 评论和同一个 pr-review status，门禁的防假绿判定会失效。
+          for _ in $(seq 1 30); do
+            [ -z "$(active)" ] && break
+            sleep 2
+          done
+          left="$(active || true)"
+          if [ -n "$left" ]; then
+            echo "::error::取消后仍有任务未停下（$left），为免两个写者同时存在，本次中止；稍后重发 /review"
+            exit 1
+          fi
+          echo "已全部停下 → 改用公共 runner"
+          echo "where=cloud" >> "$GITHUB_OUTPUT"
+
       - name: 回应 👀 表示已收到
         if: success() && steps.check.outputs.matched == 'true'
         env:
@@ -67,10 +119,34 @@ jobs:
           gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content=eyes >/dev/null 2>&1 || true
 
-  # needs: authorize —— authorize 被 if 跳过（非授权人）或评论不匹配时本 job 也随之跳过
-  review:
+  # 自托管：容器由启动器提供，模型地址与假钥匙也由它注入 —— 这里**刻意不声明** ANTHROPIC_*，
+  # 声明空值会把注入的值覆盖掉。
+  review_self:
     needs: authorize
-    if: needs.authorize.outputs.matched == 'true'
+    if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'self'
+    runs-on: [self-hosted, prr-test]
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          fetch-depth: 0
+
+      - name: 审查并按严重度门禁
+        env:
+          PR: ${{ github.event.issue.number }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          git fetch origin main
+          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO"
+
+  # 公共 runner：审查环境来自 ghcr 上的镜像，模型凭据来自仓库 secrets。
+  review_cloud:
+    needs: authorize
+    if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'cloud'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
@@ -89,42 +165,14 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          # 钉死 head SHA：refs/pull/<n>/head 在 base 仓里对 fork PR 也可拉；fetch-depth 0 供命令内 merge-base 比对
           ref: refs/pull/${{ github.event.issue.number }}/head
           fetch-depth: 0
 
-      - name: 校验 head 未被偷换
-        run: |
-          GOT=$(git rev-parse HEAD)
-          if [ "$GOT" != "${{ needs.authorize.outputs.head_sha }}" ]; then
-            echo "::error::PR head 从授权时的 ${{ needs.authorize.outputs.head_sha }} 变为 $GOT，疑似触发后改包，已中止"
-            exit 1
-          fi
-
-      - name: 允许 git 访问工作区
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: AI 审查并按严重度门禁
+      - name: 审查并按严重度门禁
         env:
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR: ${{ github.event.issue.number }}
           HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          REPO: ${{ github.repository }}
         run: |
           git fetch origin main
-
-          # 跑 base 分支上的共用审查+门禁脚本（与 pr-review.yml 同一份，单一来源）。
-          # 用 git show 取 base 版本而非当前 checkout——fork PR 改不动这段逻辑；
-          # 脚本内部会清掉 fork PR 树里的不可信配置并从 base 取回可信命令文件（见脚本头部安全模型）。
-          if git show origin/main:.ci/pr-review-gate.sh | bash -s -- "$PR_NUMBER" "${{ github.repository }}"; then
-            STATE=success
-            DESC="未发现严重/重要问题"
-          else
-            STATE=failure
-            DESC="发现严重/重要问题"
-          fi
-
-          # issue_comment 触发的 run 不会自动成为 PR 的 check；把结论打到 head SHA 的 commit status，
-          # 让结果显示在 PR 上，也可在分支保护里设为 required check 来真正阻断 merge
-          gh api "repos/${{ github.repository }}/statuses/$HEAD_SHA" \
-            -f state="$STATE" -f context="pr-review" -f description="$DESC" >/dev/null
-
-          [ "$STATE" = success ]
+          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO"
