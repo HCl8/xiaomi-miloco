@@ -75,41 +75,59 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
+          SHA: ${{ steps.gate.outputs.head_sha }}
         run: |
-          # 这个 PR 上还没结束的自托管审查任务。判据是 `.status != "completed"`，
-          # **不能只列 queued / in_progress**：GitHub 还有 pending / requested / waiting
-          # 这些中间态（触发后、被 runner 领走前就是 pending），漏掉它们会让取消落空。
+          # 这个 PR 上还没结束的自托管审查任务。
+          #  · 判据是 `.status != "completed"`：GitHub 还有 pending / requested / waiting
+          #    这些中间态（触发后、被 runner 领走前就是 pending），只列 queued/in_progress 会漏。
+          #  · 认领用两个信号取并集：`pull_requests[].number` 认 pull_request 触发的，
+          #    `head_sha` 认手动 dispatch 的（dispatch 触发时 pull_requests 是空的）。
+          #  · **查失败不算"没有"**：调用方判返回值，失败就中止（下面 ids="$(...)" 那段）。
           active() {
             gh api "repos/$REPO/actions/runs?per_page=100" --paginate \
-              --jq '[.workflow_runs[]
+              --jq '.workflow_runs[]
                      | select(.path == ".github/workflows/pr-review-selfhosted.yml")
-                     | select(any(.pull_requests[]?; .number == '"$PR"'))
                      | select(.status != "completed")
-                     | .id] | .[]' 2>/dev/null
+                     | select(any(.pull_requests[]?; .number == '"$PR"') or .head_sha == "'"$SHA"'")
+                     | "\(.id)"'
           }
-          ids="$(active || true)"
+          if ! ids="$(active)"; then
+            echo "::error::查不到自托管任务的状态（API 失败）—— 无法判断有没有任务在跑，本次中止。"
+            echo "::error::把'查不到'当成'没有'，会让防双写者的守卫静默失效。稍后重发 /review。"
+            exit 1
+          fi
+          ids="$(printf '%s' "$ids" | xargs)"
           if [ -z "$ids" ]; then
             echo "没有进行中的自托管任务 → 用自托管 runner"
             echo "where=self" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "发现进行中的自托管任务，先取消："
-          printf '%s\n' "$ids" | while read -r id; do
-            [ -n "$id" ] || continue
+          for id in $ids; do
             echo "  run $id"
-            gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+            if ! gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null; then
+              echo "::error::取消 run $id 失败 —— 不带着两个写者往下走，本次中止；稍后重发 /review"
+              exit 1
+            fi
           done
           # **必须等它真的停下**：取消是异步的。不等就往下走，那一刻两个写者同时存在，
           # 共用一条 review-pr-ci 评论和同一个 pr-review status，门禁的防假绿判定会失效。
-          for _ in $(seq 1 30); do
-            [ -z "$(active)" ] && break
-            sleep 2
+          # 按**墙钟**记时限（120 秒），并且只查这几个 id —— 每轮翻全仓历史会让等待随历史线性变长。
+          deadline=$(( $(date +%s) + 120 ))
+          while :; do
+            left=""
+            for id in $ids; do
+              st="$(gh api "repos/$REPO/actions/runs/$id" --jq .status)" || {
+                echo "::error::查不到 run $id 的状态，本次中止"; exit 1; }
+              [ "$st" = completed ] || left="$left $id"
+            done
+            [ -z "$left" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::等了 120 秒仍有任务未停下（$left）—— 为免两个写者同时存在，本次中止；稍后重发 /review"
+              exit 1
+            fi
+            sleep 3
           done
-          left="$(active || true)"
-          if [ -n "$left" ]; then
-            echo "::error::取消后仍有任务未停下（$left），为免两个写者同时存在，本次中止；稍后重发 /review"
-            exit 1
-          fi
           echo "已全部停下 → 改用公共 runner"
           echo "where=cloud" >> "$GITHUB_OUTPUT"
 
