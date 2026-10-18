@@ -16,7 +16,7 @@ REPO="$3"
 # 钉死 head：维护者背书的是触发那一刻的 commit，审查也必须审它（防触发后换包）
 GOT="$(git rev-parse HEAD)"
 if [ "$GOT" != "$HEAD_SHA" ]; then
-  echo "::error::PR head 从触发时的 $HEAD_SHA 变为 $GOT，疑似触发后改包，已中止"
+  echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT}，疑似触发后改包，已中止"
   exit 1
 fi
 
