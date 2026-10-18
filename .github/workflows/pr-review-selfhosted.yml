@@ -4,11 +4,6 @@ name: PR Review (self-hosted)
 # 且不声明 container:（容器由启动器起）。用 pull_request 而非 pull_request_target：
 # PR 都来自本仓分支；改用后者前须先解决下方 concurrency 的双写者问题。
 on:
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: PR 编号（留空则用触发事件里的）
-        required: false
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -22,7 +17,7 @@ on:
 concurrency:
   # 组名必须与线上那份（pr-review-<号>）**不同** —— concurrency 组是仓库级全局的，
   # 同名时两份会互相取消。
-  group: pr-review-selfhosted-${{ github.event.pull_request.number || inputs.pr }}
+  group: pr-review-selfhosted-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -39,32 +34,12 @@ jobs:
     # draft == false 会一并挡掉）。⚠️ 不是安全边界：pull_request 取 PR 那一侧的工作流
     # 文件，fork 可以改掉它；真正的边界在容器层与仓库的 fork 审批设置。
     if: >-
-      github.event_name != 'pull_request'
-      || (github.event.pull_request.draft == false
-          && github.event.pull_request.head.repo.full_name == github.repository)
+      github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - name: 定 PR 编号
-        id: pr
-        env:
-          # 走 env 而不是把表达式直接插进 shell —— 输入值不该被当成代码执行
-          DISPATCH_PR: ${{ github.event.inputs.pr }}
-          EVENT_PR: ${{ github.event.pull_request.number }}
-        run: |
-          num="${DISPATCH_PR:-${EVENT_PR}}"
-          if [ -z "$num" ]; then
-            echo "::error::没拿到 PR 编号（手动触发时 pr 输入不能留空，否则会去 checkout refs/pull//merge）"
-            exit 1
-          fi
-          # 必须是纯数字：手动触发的 pr 是自由文本，会被拼进 API 路径与 ref，
-          # 这里挡住，下游不必各自再防一次。
-          case "$num" in
-            *[!0-9]*) echo "::error::PR 编号必须是纯数字，拿到的是：$num"; exit 1 ;;
-          esac
-          echo "num=${num}" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: refs/pull/${{ steps.pr.outputs.num }}/merge
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
 
       - name: 允许 git 访问工作区
@@ -74,7 +49,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # 同「定 PR 编号」：输入值不能当代码执行（手动触发时 pr 是自由文本）。
-          PR_NUM: ${{ steps.pr.outputs.num }}
+          PR_NUM: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           # 刻意不声明 ANTHROPIC_* / PR_AGENT_MODEL：由宿主机启动器注入容器（地址指向
           # 宿主机模型代理，容器只拿假钥匙）。声明空值会覆盖掉注入值。
