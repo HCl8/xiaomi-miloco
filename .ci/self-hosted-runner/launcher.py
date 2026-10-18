@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """一次性 runner 启动器 —— 跑在运行机上，由 launchd 托管。
 
-每一轮做同一件事：要一份一次性登记凭据 → 起一个容器把凭据交给它 → 等容器退出 → 补下一个。
-容器是本进程起的、参数是写死的，所以任务对容器形态没有话语权（挂不了宿主目录、提不了特权）。
-
-两条不能破的性质：
-  1. 凭据不进日志、不进任何进程的命令行参数（命令行参数在宿主机 ps 里人人可见）、
-     也不经环境变量（会写进容器记录 config.json）。交给容器时在 ~/prreview 下用 mkstemp
-     建一个 0600 临时文件过一手，拷完立刻 unlink —— 那是磁盘上唯一一次落地的窗口，
-     进程被 SIGKILL 才会留下残留，所以启动时顺手清扫一遍。
-  2. 容器寿命不超过凭据寿命：空等超过 idle_recycle_seconds 就主动回收重来，
-     堵上"凭据 1 小时过期"和"容器可能空等很久"之间的缝。
-
-只用标准库：这台机器上没有 Homebrew，系统 python3 是 3.9，引第三方依赖等于给自己加部署负担。
+每轮：要一份登记凭据 → 起容器交给它 → 等退出 → 补下一个。容器参数写死，任务没有话语权。
+两条不能破：凭据不进日志/命令行/环境变量，只经 0600 临时文件且拷完即删；容器寿命不超过
+凭据寿命（空等超过 idle_recycle_seconds 就回收）。只用标准库。
 """
 
 import argparse
@@ -40,7 +31,7 @@ GITHUB_API = "https://api.github.com"
 
 log = logging.getLogger("launcher")
 
-# 收到 TERM/INT 时置位，主循环据此收尾；不清空当前容器就是留一堆孤儿
+# 收到 TERM/INT 时置位，主循环据此收尾；不收容器就会留下孤儿
 _stopping = False
 
 
@@ -68,14 +59,13 @@ def load_config(path):
     cfg.setdefault("log_dir", str(Path.home() / "prreview" / "logs"))
     cfg.setdefault("runner_group_id", 1)
     # 默认值必须与 workflow 的 `runs-on` 对得上（那边是 [self-hosted, prr-test]）。
-    # 对不上时 GitHub 不报错，只是永远不派活 —— 这台机器会一直"空闲且正常"。
+    # 对不上时 GitHub 不报错，只是永远不派活。
     cfg.setdefault("runner_labels", ["self-hosted", "linux", "arm64", "prr-test"])
-    # 出口自检：起 runner 之前先实测"宿主机上那些无关服务封住了没"。默认开。
+    # 出口自检：起 runner 之前先确认宿主机上那些无关服务的端口封住了。默认开。
     cfg.setdefault("require_egress_guard", True)
     cfg.setdefault("guard_recheck_seconds", 900)
-    # 出口自检探哪几个端口：默认现探（这台机器在听什么就测什么）。给 guard_ports 是**收窄**
-    # 候选集，不是"想测哪几个就测哪几个"—— 它同样要过"绑在通配或网关地址上"那道筛，
-    # 绑在回环上的会被剔掉（那种靶子容器永远够不着，自检会变成永远绿的摆设）。
+    # 出口自检探哪几个端口：默认现探。给 guard_ports 是**收窄**候选集，它同样要过
+    # "绑在通配或网关地址上"那道筛，绑在回环上的会被剔掉（容器永远够不着）。
     # 池子：同时维持几个待命容器。每个容器只接一个任务，所以要 >1 才能扛并发。
     cfg.setdefault("replicas", 1)
     cfg.setdefault("poll_seconds", 5)
@@ -106,19 +96,8 @@ GUARD_PROBE = (
 def discover_guard_ports(cfg, restrict=None):
     """宿主机正在监听的 TCP 端口（去掉我们自己的两个网关端口）。
 
-    `restrict` 给了就只在其中挑（配置里的 guard_ports 走这条）。**配置给的靶子也要过同一道
-    筛**：写进来一个绑在回环上的端口，容器走网关地址永远够不着，那条自检就成了永远绿的摆设
-    —— 而它本该是"够不够得着"的实测。
-
-    出口自检要证明的是"容器够不着宿主机上那些与本方案无关的服务"，所以靶子应当由
-    **这台机器实际在听什么**决定，而不是写死两个端口 —— 写死既在代码里留下环境痕迹，
-    又测不到这台机器上真正暴露的东西。
-
-    返回 None 表示**探测本身失败**（跟"确实没有别的端口"是两回事）：安全检查不能因为
-    工具出错就放行，所以这两种情况必须分开，由调用方区别对待。
-
-    判据本体在 `prrlib.guard_ports` 里 —— 装机脚本 `pf-setup.sh` 要的是同一份判据，
-    以前 bash 的 awk 和这里的 Python 各写一遍、靠注释手工同步。
+    `restrict` 给了就只在其中挑，但配置给的靶子也要过「绑在通配或网关地址上」那道筛：
+    绑回环的容器够不着。返回 None 表示**探测本身失败**，与「确实没有别的端口」必须区分。
     """
     mine = {int(cfg["github_proxy_port"])}
     if cfg.get("model_proxy_port"):
@@ -128,18 +107,13 @@ def discover_guard_ports(cfg, restrict=None):
 
 
 def check_egress_guard(cfg):
-    """起一个一次性容器，实测容器还能不能碰到宿主机上那些与本方案无关的服务端口。
+    """起一个一次性容器，探测容器还能不能碰到宿主机上与本方案无关的服务端口。
 
-    这是唯一不依赖 sudo 的验证方式——不去读防火墙配置，直接问"够不够得着"。
-    够得着说明 pf 那层不在了（规则被清、开机没加载、网段变了……），
-    此时起 runner 等于把网络摊在公网 PR 面前，所以宁可不干活。
-
-    探测哪几个端口由配置给（guard_ports），函数本身不写死。
-    返回 (ok, 说明)。
+    不读防火墙配置，直接验证「够不够得着」：够得着说明 pf 那层不在了，此时起 runner 等于
+    把网络摊在公网 PR 面前，所以宁可不干活。返回 (ok, 说明)。
     """
-    # `or None`：`guard_ports: []` 与没给这个键当同一件事（写空数组多半是"没意见"）。
-    # 不归一的话，空数组会被当成"配置给了靶子"传下去 → 收窄成空集 → 判失败，
-    # 而报出来的成因还是"配置给的被筛空"，与实际发生的事对不上。
+    # `or None`：`guard_ports: []` 与没给这个键当同一件事。不归一的话空数组会被当成
+    # "配置给了靶子" → 收窄成空集 → 判失败，且报出的成因与实际发生的事对不上。
     restrict = cfg.get("guard_ports") or None
     ports = discover_guard_ports(cfg, restrict)
     if ports is None:
@@ -147,12 +121,9 @@ def check_egress_guard(cfg):
         return False, ("探不到宿主机在监听哪些端口（netstat 跑不起来），无法完成出口自检"
                        " —— 先确认 netstat 能跑（PATH/权限）")
     if not ports:
-        # 一个靶子都筛不出来 → **判失败**，与 pf-setup.sh 的 judge（要求至少一个端口靶子）
-        # 在同条件下判决一致。不能当"没有可测目标"放过：真正的"这台机器只听了网关"与
-        # "我们的解析坏了/输出格式变了"在这里长得一模一样，而后者会让这条安全检查
-        # 静默失效（一个探针容器都没跑，日志上却是"自检通过"）。
-        # 区分两种"没靶子"：配置给的被筛空了，还是现探本身没拿到东西。混成一句
-        # "netstat 没探到东西"会把人指向错误的排查方向。
+        # 一个靶子都筛不出来 → **判失败**，与 pf-setup.sh 的 judge 一致：真正的"只听了网关"
+        # 与"解析坏了/输出格式变了"长得一模一样，后者放过去会让安全检查静默失效。
+        # 两种"没靶子"要分开说，免得把人指向错误的排查方向。
         if restrict is not None:
             return False, ("配置里的 guard_ports 一个都没通过筛选（只收绑在通配或网关地址上的"
                            "监听），这条自检没靶子可测 —— 改配置里的 guard_ports，"
@@ -180,10 +151,8 @@ def check_egress_guard(cfg):
 def check_gateway(cfg):
     """我们的出网网关还在监听吗。
 
-    和出口自检是两件事，都要在起容器前确认：
-      - 出口自检 = 安全（隔离还在不在）
-      - 这一条   = 可用性（代理还活着没）
-    少确认后者的话，容器会注册成功、领到任务，然后在审查时连不上模型 —— 白白吃掉一个任务。
+    与出口自检是两件事：出口自检管安全（隔离还在不在），这里管可用性（代理还活着没）。
+    少了这一条，容器会注册成功、领到任务，审查时连不上模型，白白吃掉一个任务。
     """
     down = []
     for port in (cfg["github_proxy_port"], cfg.get("model_proxy_port")):
@@ -202,10 +171,9 @@ def check_gateway(cfg):
 # ---------------------------------------------------------------- 凭据
 
 def mint_jit(cfg, name=None):
-    """要一份一次性登记凭据。跑在宿主机上：宿主机能直连 api.github.com，容器没有路由。
+    """要一份一次性登记凭据（跑在宿主机：容器没有直连 api.github.com 的路由）。
 
-    name 用容器名，这样 GitHub 上的 runner 记录能和容器一一对上 ——
-    强杀留下的记录才清得掉（ephemeral runner 正常退出会自己注销，被杀的不会）。
+    name 用容器名，GitHub 上的 runner 记录才能和容器一一对上，强杀留下的记录才清得掉。
     凭据只作为返回值在内存里流动，不写文件也不打日志。
     """
     token = Path(cfg["github_token_file"]).read_text().strip()
@@ -241,21 +209,18 @@ def _run(args, **kw):
 
 
 def container_running_job(name):
-    """容器里的 runner 是不是正在跑任务（看它日志最后一行）。
+    """容器里的 runner 是不是正在跑任务（看日志最后一行）。
 
-    三态：True 在跑 / False 明确没在跑 / **None 问不出来**（读日志失败）。调用方必须把
-    None 当"可能正在跑"：把"没问到"当"没在跑"，下手就掐断一个在跑的作业，还会留下一条
-    GitHub 拒绝删（422）的 runner 记录，占住该 PR 的 concurrency 组直到 job 超时。
+    三态：True 在跑 / False 明确没在跑 / **None 问不出来**。调用方必须把 None 当"可能正在跑"：
+    当成"没在跑"会掐断在跑的作业，并留下一条 GitHub 拒绝删（422）的记录堵住其 concurrency 组。
     """
     proc = _run(["logs", name])
-    # **先看退出码**：这才是"这次调用成没成"的主判据。只看 stdout 空不空等于假设
-    # CLI 把报错写在别的流上 —— 那是实现细节，赌错了就在"命令失败"时返回 False
-    # （"确定没在跑"），三处调用照样下手杀容器。
+    # **先看退出码**：这才是"这次调用成没成"的主判据。只看 stdout 空不空等于赌 CLI 把报错
+    # 写在哪条流上，赌错了就在"命令失败"时返回 False（"确定没在跑"）。
     if proc.returncode != 0:
         return None
-    # **只看 stdout**：`container logs` 把容器的日志打在它自己的 stdout 上，stderr 是 CLI 的
-    # 报错。把两条流拼起来的话，"最后一行"变成 stderr 的最后一行 —— 而"跑作业期间最后一行
-    # 恰好是 Running job:"这个位置性质就没了保证（runner 期间任何一条 stderr 都会顶掉它）。
+    # **只看 stdout**：容器日志在 stdout，stderr 是 CLI 的报错。拼起来的话"最后一行"会变成
+    # stderr 的最后一行，"跑作业期间最后一行是 Running job:"这条判据就没了保证。
     lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     if not lines:
         return None                      # 还没吐出任何日志（刚起来）→ 也算问不出来，别当"没在跑"
@@ -263,14 +228,10 @@ def container_running_job(name):
 
 
 def container_state(name):
-    """容器状态：running/stopped/... ；**确实没有这个容器**返回 None ；**问不出来**返回 "unknown"。
+    """容器状态：running/stopped/...；**确实没有这个容器**返回 None；**问不出来**返回 "unknown"。
 
-    三态必须分开，两个方向都踩过/会踩：
-      - 只看 `container inspect` 的退出码不行：容器停止之后它照样返回 0，看护循环会以为它
-        还活着、一直空等到回收时限（实测踩过：跑完一个任务后启动器五十分钟才补下一个）。
-      - 把"问不出来"并进"已经没了"同样不行：调用方据此收容器，于是 inspect 偶发失败或输出
-        形状变了，就会掐掉一个正在跑任务的容器 —— 白赔一个作业，还留下一条 GitHub 拒绝删
-        （422）的 runner 记录堵住该 PR 的 concurrency 组。
+    三态必须分开：只看 inspect 退出码不行（容器停止后照样返回 0，看护循环会空等到回收时限）；
+    把"问不出来"并进"已经没了"则会掐掉正在跑任务的容器，并留下 422 删不掉的记录。
     """
     proc = _run(["inspect", name])
     if proc.returncode != 0:
@@ -291,22 +252,16 @@ def kill_and_delete(name):
 def start_container(cfg, jit, name, round_no):
     """起一个一次性容器，把凭据交给它。
 
-    凭据用 `container cp` 拷进容器文件系统，**不走命令行参数、也不走环境变量**——
-    那两条路实测都会把凭据留在宿主上：命令行参数进 `ps`（人人可见），
-    环境变量进容器记录 `config.json`（644 权限，而且删容器不清记录）。
-    拷文件这条走完，宿主机磁盘上搜不到凭据，容器记录里也没有；容器侧读完即删。
-
-    容器形态全部写死在这里：不挂宿主目录、不开容器 socket、非 root（镜像里定的）、
-    加 CPU/内存限额。任务对这些没有话语权。
+    凭据用 `container cp` 拷进去，不走命令行参数（会进 `ps`）也不走环境变量（会进容器记录的
+    `config.json`，删容器不清记录）。容器形态全部写死：不挂宿主目录、不开容器 socket、加限额。
     """
     env = dict(os.environ)
     env["HTTP_PROXY"] = "http://%s:%s" % (cfg["host_gateway"], cfg["github_proxy_port"])
     env["HTTPS_PROXY"] = env["HTTP_PROXY"]
     env["NO_PROXY"] = "%s,localhost,127.0.0.1" % cfg["host_gateway"]
 
-    # 模型环境：容器只拿到"代理地址 + 一把假钥匙 + 模型名"，真 key 在宿主机代理里，永不进容器。
-    # 这几项走环境变量、因而会进容器记录——可以接受：假钥匙是我们自己造的，
-    # 只在本地代理上有效，而代理本身还限了来源网段。真凭据一个都不走这条路。
+    # 模型环境：容器只拿到"代理地址 + 假钥匙 + 模型名"，真 key 在宿主机代理里，永不进容器。
+    # 这几项走环境变量会进容器记录，可以接受：假钥匙只在本地代理上有效，且代理限了来源网段。
     token_file = cfg.get("container_token_file")
     if cfg.get("model_proxy_port") and token_file and Path(token_file).is_file():
         env["ANTHROPIC_API_KEY"] = Path(token_file).read_text().strip()
@@ -346,9 +301,8 @@ def start_container(cfg, jit, name, round_no):
 def image_info(ref):
     """镜像引用解析出的 (digest, 构建它的 commit)；取不到的项为 None。
 
-    日志里只打配置里的字面值不够用：配置写 `latest` 时，两次构建之后同一条日志一模一样。
-    digest 能区分"换没换"，但要对回"换成了哪个 commit"还得翻 registry —— 而镜像自己就带着
-    这个信息（build-runner-image.yml 打的 OCI label），直接读出来。
+    配置写 `latest` 时，两次构建后同一条日志一模一样。镜像自带 build-runner-image.yml 打的
+    OCI label，直接读出来才能对上"换成了哪个 commit"。
     """
     proc = _run(["image", "inspect", ref])
     if proc.returncode != 0:
@@ -371,10 +325,10 @@ def image_info(ref):
 
 
 def sweep_stale_jit_files(cfg):
-    """清掉上次被强杀时留下的临时凭据文件。
+    """清掉进程被强杀时留下的临时凭据文件。
 
-    正常路径上那个 mkstemp 文件在 finally 里必然被 unlink，只有 SIGKILL / 断电才会留残。
-    入口包装读不到凭据会一直等到超时，所以残留不影响功能，但它是一份躺在盘上的凭据。
+    正常路径上 mkstemp 文件在 finally 里必然被 unlink，只有 SIGKILL/断电才留残。
+    残留不影响功能，但它是一份躺在盘上的凭据。
     """
     for p in Path(cfg["log_dir"]).parent.glob(".prr-jit-*"):
         try:
@@ -386,9 +340,8 @@ def sweep_stale_jit_files(cfg):
 
 def _hand_over_jit(cfg, jit, name):
     """把凭据拷进容器。临时文件用 mkstemp 建（天生 0600），拷完立刻 unlink。"""
-    # 路径写死，不做成配置项：容器侧入口包装读的也是这个常量（`PRR_JIT_FILE` 只是给镜像
-    # 自己留的兜底），启动器又不会把那个环境变量传进去 —— 做成配置项只会让人以为能改，
-    # 改了却是"拷到新路径、入口包装还在老的路上等"，表现成 90 秒超时。
+    # 路径写死不做成配置项：容器侧入口包装读的也是这个常量，改了就是"拷到新路径、入口包装
+    # 还在老路上等"，表现成 90 秒超时。
     target = "%s:%s" % (name, JIT_PATH)
     fd, tmp = tempfile.mkstemp(prefix=".prr-jit-", dir=str(Path(cfg["log_dir"]).parent))
     try:
@@ -417,9 +370,8 @@ def tail_container_log(name, lines=12):
 def host_reclaimable_gb():
     """宿主机可回收内存（GB）。取不到返回 None。
 
-    macOS 上约等于 free + inactive + speculative + purgeable —— 这部分内存系统能拿回来用，
-    所以它比"已用多少"更能反映"还能不能再起容器"。要留意压缩内存：它开始涨就说明压力上来了
-    （系统先压缩、后换页），代价是 CPU 和延迟 —— 而审查本来就是延迟敏感的。
+    可回收 ≈ free + inactive + speculative + purgeable —— 比"已用多少"更能反映还能不能再起
+    容器；压缩内存开始涨说明压力上来了（系统先压缩、后换页）。
     """
     try:
         ps = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"]).strip())
@@ -439,8 +391,8 @@ def host_reclaimable_gb():
 def _list_runners(base, headers, timeout=30):
     """列出**全部** runner 记录（跟着 Link 头翻页）。
 
-    这个列表是仓库级的、记录会随容器 churn 堆积，一页装不下很正常。不带 per_page 只看得到
-    30 条，带了但只取一页则只看到 100 条 —— 两种都会漏，表现成"这几条记录怎么也清不掉"。
+    记录是仓库级的、随容器 churn 堆积，一页装不下很正常；只取一页会漏，表现成
+    "这几条记录怎么也清不掉"。
     """
     out = []
     url = base + "?per_page=100"
@@ -468,11 +420,8 @@ def _runners_api(cfg):
 def forget_runners(cfg, names):
     """把一批容器对应的 runner 记录删掉（best-effort）。
 
-    一次性 runner 正常退出时会自己注销，但**被我们杀掉的不会** —— 每轮空闲回收、每次重启
-    都会留下记录。容器名就是 runner 名（铸凭据时用的同一个名字），所以这里能精确删掉那几条，
-    不必等定期清理去扫。
-
-    删不到不算错：正常退出的那些记录本来就已经没了。一次列全、再逐个删，避免每个名字都列一遍。
+    一次性 runner 正常退出会自己注销，被我们杀掉的不会。容器名 == runner 名，所以能精确删掉
+    那几条；删不到不算错。一次列全、再逐个删。
     """
     names = set(names)
     if not names:
@@ -514,11 +463,8 @@ def live_container_names():
 def cleanup_runner_records(cfg):
     """删掉"离线、且对应容器已经不存在"的 runner 记录。
 
-    容器被销毁、启动器被强杀，GitHub 上都会留下记录 —— 正常退出的 ephemeral runner
-    会自己注销，被杀的不会 —— 重启几次就会堆起来。
-
-    判据刻意保守：只删**离线**的、且容器确实不在的。刚铸完凭据还没注册的 runner
-    也是"离线"状态，但那一刻容器已经存在，所以不会被误删。
+    容器被销毁、启动器被强杀都会留下记录。判据刻意保守：刚铸完凭据还没注册的 runner 也是
+    离线状态，但那一刻容器已经存在，所以不会被误删。
     """
     live = live_container_names()
     if live is None:
@@ -532,7 +478,7 @@ def cleanup_runner_records(cfg):
         return
 
     # 只认本实例铸出来的记录（名字前缀）。runner 列表是**仓库级**的：别的机器、别人手工注册的
-    # runner 也在里面，名字同样可能不在本机容器清单里 —— 不按前缀认领就会把别人的删掉。
+    # 也在里面，不按前缀认领会把别人的删掉。
     prefix = cfg["name_prefix"] + "-"
     gone = [r for r in runners
             if r.get("status") != "online"
@@ -551,11 +497,8 @@ def cleanup_runner_records(cfg):
 def maintain(cfg, have_slots):
     """定期清理。
 
-    容器是高频 churn 的（每个任务一个新容器，池子里还会每 50 分钟整体轮换一轮），
-    不清理快照会一直堆。
-
-    镜像那一步有前提：**只在至少有一个容器在跑的时候清**。否则我们自己的镜像会变成
-    "无引用"被一起删掉，而重新取镜像要走 ghcr（pull_image.py），不是随手能补的。
+    容器高频 churn，不清快照会一直堆。镜像那一步只在至少有一个容器在跑时做：否则我们自己的
+    镜像会变成"无引用"被一起删掉，重新取镜像不是随手能补的。
     """
     log.info("定期清理：删掉已停止的容器")
     proc = _run(["prune"])
@@ -578,17 +521,15 @@ def maintain(cfg, have_slots):
 def start_slot(cfg, slot, seq):
     """铸凭据 → 起一个容器 → 把凭据交给它。返回容器名。
 
-    每个容器只登记成一个"只接一个任务"的 runner，跑完自己注销退出。
-    容器名先生成再拿去铸凭据 —— 让 GitHub 上的 runner 记录名 == 容器名，记录才清得掉。
+    容器名先生成再拿去铸凭据，让 GitHub 上的 runner 记录名 == 容器名，记录才清得掉。
     """
     name = "%s-%d-%d" % (cfg["name_prefix"], slot, int(time.time()))
     jit = mint_jit(cfg, name)
     try:
         start_container(cfg, jit, name, seq)
     except Exception:
-        # 起容器是两步（先 run，再 cp 凭据进去），第二步失败时容器已经创建好了。调用方只会
-        # 记一条 warning 就去补下一个槽，这个容器不在池子里、此后没人认识它 —— 不就地收掉，
-        # 就得等定期清理（最长一小时）才轮到它。
+        # 起容器是两步（先 run，再 cp 凭据），第二步失败时容器已创建好。不就地收掉，就得等
+        # 定期清理（最长一小时）才轮到它。
         kill_and_delete(name)
         forget_runners(cfg, [name])
         raise
@@ -600,11 +541,8 @@ def start_slot(cfg, slot, seq):
 def manage_pool(cfg):
     """把「同时有 replicas 个待命容器」这件事维护住。
 
-    池子里放多个的理由：每个一次性 runner 只接一个任务，而同时可能有多个任务在排队
-    （审查、探针、别的 workflow）。只有一个待命容器时，谁先入队谁后入队不由我们控制 ——
-    更晚入队的任务可能先被领走。所以按并发数维护一个池子。
-
-    池子里的每个槽独立：容器结束就补，空等超时也补（避免凭据过期后还挂着）。
+    每个一次性 runner 只接一个任务，而同时可能有多个任务排队，所以要按并发数维护池子。
+    每个槽独立：容器结束就补，空等超时也补（避免凭据过期后还挂着）。
     """
     slots = {}                       # slot -> (容器名, 空等截止时刻)
     seq = 0
@@ -612,7 +550,7 @@ def manage_pool(cfg):
     guard_checked_at = 0.0
     maintained_at = time.time()
 
-    # 启动时先扫一遍：上一次进程被强杀时留下的 runner 记录，别等到一小时后那轮定期清理
+    # 启动时先扫一遍：进程被强杀会留下 runner 记录，别等到一小时后的定期清理
     try:
         cleanup_runner_records(cfg)
     except Exception:                              # noqa: BLE001
@@ -631,7 +569,7 @@ def manage_pool(cfg):
                 maintained_at = time.time()
 
             # 起容器前先确认两件事：隔离还在（安全）、网关还活着（可用性）。
-            # 任一条不过就停掉待命容器且不再起新的 —— 这台机器要接公网 PR 的任务。
+            # 任一条不过就停掉待命容器且不再起新的 —— 要接公网 PR 的任务。
             if cfg["require_egress_guard"] and now - guard_checked_at > cfg["guard_recheck_seconds"]:
                 # 两条都跑、两条都记：失败时能一眼看出是"隔离破了"还是"网关挂了"
                 egress_ok, egress_detail = check_egress_guard(cfg)
@@ -639,22 +577,18 @@ def manage_pool(cfg):
                 detail = "出口[%s] 网关[%s]" % (egress_detail, gateway_detail)
                 if not (egress_ok and gateway_ok):
                     log.error("启动前自检没过：%s", detail)
-                    # 修法要按**具体哪一条**给。以前不管哪种失败都写"隔离修法：pf-setup.sh"，
-                    # 而"筛不出可测的宿主端口"根本不是 pf 的问题（是端口探测没拿到东西），
-                    # 照着去重跑 pf-setup 只会白跑一趟，还错过真正的线索。
+                    # 修法按**具体哪一条**给：「筛不出可测的宿主端口」不是 pf 的问题（是端口
+                    # 探测没拿到东西），照着重跑 pf-setup 只会白跑一趟，还错过真正的线索。
                     log.error("停掉待命容器且不再起新的，按下面具体那条修：")
                     if not egress_ok:
-                        # 这里**只原样打出来**，不再按文案分流 —— 分流要匹配消息里的字面量，
-                        # 而消息一改分流就静默失效（上一版就是这么坏的：它引用的那句
-                        # "筛不出可测的宿主端口"当轮就被改掉了）。修法由 check_egress_guard
-                        # 写在 detail 里，谁产生的消息谁负责说清怎么办。
+                        # 只原样打出，不按文案分流：分流要匹配消息里的字面量，消息一改就静默
+                        # 失效。修法由 check_egress_guard 写在 detail 里。
                         log.error("  出口自检不过 —— %s", egress_detail)
                     if not gateway_ok:
                         log.error("  网关自检不过（%s）。修法：launchctl kickstart -k gui/%s/com.prreview.gateway",
                                   gateway_detail, os.getuid())
-                    # 同一条判据：只收空闲的。自检没过不该牵连正在跑任务的容器 —— 杀它 = 掐断那个
-                    # 任务，且 GitHub 拒绝删"正在跑任务的 runner"记录（422），那条会占住该 PR 的
-                    # concurrency 组直到 job 自己超时（与退出收尾处同理）。
+                    # 同一条判据：只收空闲的。杀正在跑任务的容器 = 掐断那个任务，且 GitHub
+                    # 拒绝删"正在跑任务的 runner"记录（422），会占住该 PR 的 concurrency 组。
                     names = [n for n, _ in slots.values()]
                     # `is not False`：查不出来的一律当"可能正在跑"，不动它
                     busy = [n for n in names if container_running_job(n) is not False]
@@ -672,13 +606,13 @@ def manage_pool(cfg):
                 guard_checked_at = time.time()
                 log.info("启动前自检通过：%s", detail)
 
-            # 回收：容器已经结束的、或空等超时的。收掉容器时顺手把它的 runner 记录也删了 ——
+            # 回收：容器已结束的、或空等超时的。收掉容器时顺手删它的 runner 记录 ——
             # 被我们杀掉的容器不会自己注销，不删就堆着。
             for slot, (name, deadline) in list(slots.items()):
                 state = container_state(name)
                 if state == "unknown":
-                    # "问不出来"不是"已经没了"。这一支里动手就是拿没问到当没有，可能掐掉一个
-                    # 正在跑任务的容器。留着，下一轮再问。
+                    # "问不出来"不是"已经没了"：这一支动手就可能掐掉正在跑任务的容器。
+                    # 留着，下一轮再问。
                     log.warning("槽 %d：容器 %s 状态查不出来，本轮不动它", slot, name)
                     continue
                 if state != "running":
@@ -688,9 +622,8 @@ def manage_pool(cfg):
                     del slots[slot]
                     forget_runners(cfg, [name])
                 elif time.time() >= deadline:
-                    # 空等超时的回收**只看时钟是不够的**：作业可能正好落在容器生命的最后一段，
-                    # 这时容器还在跑任务，按时钟收掉就是把它掐断。判据与另外两处（自检不过、
-                    # 进程退出收尾）一致：正在跑任务的不收。
+                    # 空等超时只看时钟不够：作业可能正好落在容器生命的最后一段。判据与另外
+                    # 两处（自检不过、进程退出收尾）一致：正在跑任务的不收。
                     if container_running_job(name) is not False:
                         # 截止时刻往后推，免得每轮轮询都去读一次容器日志。任务跑完 runner 会自己
                         # 退出，那时由上面「已结束」那条分支收，推后的截止时刻不会真的用到。
@@ -730,14 +663,9 @@ def manage_pool(cfg):
                     break
                 time.sleep(0.5)
     finally:
-        # 收尾：**空闲的容器收掉，正在跑任务的放它跑完**（收到 TERM 时 launchd 会等着我们做完）。
-        #
-        # 不杀正在跑任务的容器的理由：杀了 = 掐断那个任务，而且后果远不止于此 ——
-        # GitHub 会**拒绝删除"正在跑任务的 runner"记录**（422），那条记录会一直占着它所在的
-        # concurrency 组，把同一 PR 的后续 run 全堵在 pending，直到那个 job 自己超时。
-        #
-        # 一次性 runner 跑完一个任务就自己退出并注销，所以"放它跑完"是有界的（上界就是 job
-        # 本身的超时）。停下来的容器由定期清理的 `container prune` 收走。
+        # 收尾：**空闲的容器收掉，正在跑任务的放它跑完**（launchd 会等我们收完）。杀正在
+        # 跑任务的 = 掐断作业，且 GitHub 拒绝删这类记录（422），会堵住 concurrency 组直到
+        # job 自己超时。一次性 runner 跑完就退出，所以"放它跑完"有界。
         names = [n for n, _ in slots.values()]
         busy = [n for n in names if container_running_job(n) is not False]   # 查不出来的一律不动
         idle = [n for n in names if n not in busy]
@@ -753,9 +681,9 @@ def manage_pool(cfg):
 
 
 def main():
-    # 必须能接受 --config：launchd 的 LaunchAgent **不继承调用方 shell 的环境变量**，
-    # 只靠 PRR_CONF 的话，装机时用了非默认路径就会变成「网关读你指定的那份、启动器读默认
-    # 路径」，读不到就退出，KeepAlive 每 30 秒再拉起来挂一次。
+    # 必须能接受 --config：launchd 的 LaunchAgent 不继承调用方 shell 的环境变量，只靠 PRR_CONF
+    # 的话，装机用了非默认路径就会变成网关读指定的那份、启动器读默认路径，读不到就退出，
+    # KeepAlive 反复拉起。
     ap = argparse.ArgumentParser(description="一次性 runner 启动器")
     ap.add_argument("--config", default=os.environ.get("PRR_CONF", str(DEFAULT_CONFIG)))
     cfg_path = Path(ap.parse_args().config)
@@ -786,11 +714,10 @@ def main():
              revision[:12] if revision else "未标注（镜像没带 revision label）",
              cfg["network"], cfg["github_repo"], ",".join(cfg["runner_labels"]),
              cfg["replicas"], cfg["idle_recycle_seconds"])
-    # 标签是唯一让 GitHub 把作业派到这台机器上的东西：runner 报的标签与 workflow 的 runs-on
-    # 对不上时**不报错**，表现是作业一直排队、这台机器一直空闲。所以把它打出来，对得上眼见为实。
+    # 标签对不上时 GitHub **不报错**，只是作业永远排队、这里看着一切正常，所以打出来供核对。
     log.info("（workflow 的 runs-on 必须包含上面这些标签，否则作业永远排队、这里看着一切正常）")
 
-    # 池子循环万一因为意外异常退出，重建它 —— 但不能空转刷日志，所以加个间隔
+    # 池子循环意外退出就重建 —— 加个间隔，别空转刷日志
     while not _stopping:
         try:
             manage_pool(cfg)

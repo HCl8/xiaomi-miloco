@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""把审查镜像取到本机 —— 从 registry 拉。
+"""从 registry 拉审查镜像。
 
-只有一条路：构建在 CI 完成、推到 registry，运行机拉下来。
-比"用 artifact 传一份几百 MB 的 tar 再 load"少一大截动作，而且拉下来的镜像有 digest，
-可以写进配置钉死（`<镜像>@sha256:...`）。
-
-包是 public 时**不需要任何凭据**；只有私有包才要一个带 read:packages 的凭据文件
-（配置里 `registry_token_file`，给了就登录，不给就按匿名拉）。
-公开仓出来的镜像里没有秘密，所以正常情况就是匿名那条。
+public 包不需要任何凭据；私有包才要带 read:packages 的凭据文件（配置里 registry_token_file，
+配合 --login-user）。拉下来的镜像有 digest，可以写进配置钉死（`<镜像>@sha256:...`）。
 
 用法:
     python3 pull_image.py [--config ~/prreview/prreview.json] [--reference <镜像引用>]

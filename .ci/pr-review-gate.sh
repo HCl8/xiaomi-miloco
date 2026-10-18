@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# PR 审查 + 严重度门禁的单一实现，供 pr-review.yml / pr-review-command.yml 共用。
-# 两个 workflow 都以 `git show origin/main:.ci/pr-review-gate.sh | bash -s -- <pr> <repo>` 方式调用，
-# 即始终跑 base 分支(main)上的本脚本——fork PR 改不动它，也保证严重度正则等只有一处。
+# PR 审查 + 严重度门禁的单一实现，pr-review.yml / pr-review-command.yml 共用。
+# 两条 workflow 都以 `git show origin/main:.ci/pr-review-gate.sh | bash -s -- <pr> <repo>`
+# 调用，始终跑 base 上的本脚本：fork PR 改不动它，严重度正则也只有一处。
 #
-# 安全模型：调用方 checkout 的代码树可能是不可信的 fork PR。审查 CLI 启动时会自动加载工作目录的
-# CLAUDE.md（项目指令）、.claude/settings.json（hooks=RCE）、.mcp.json（MCP server=RCE），拷进
-# .claude/commands/ 的 review-pr.md 又会被当命令直接执行。故启动前先清掉这些会被自动加载/执行的文件，
-# 再只从 base 分支(fork 改不到)取回可信版本。调用前需保证 origin/main 已 fetch。
+# 安全模型：调用方 checkout 的树可能是不可信 fork PR，审查 CLI 会自动加载 CLAUDE.md、
+# .claude/settings.json（hooks=RCE）、.mcp.json（MCP server=RCE），.claude/commands/ 下的
+# 文件会被当命令执行。故启动前清掉这些文件，只从 base 取回可信版本；调用前须已 fetch origin/main。
 #
 # 用法: pr-review-gate.sh <pr-number> <repo-slug>
 # 退出码: 0=放行（无严重/重要问题，或 infra 故障放行不阻塞）, 1=发现严重或重要问题
@@ -15,11 +14,10 @@ set -uo pipefail
 PR_NUMBER="$1"
 REPO="$2"
 
-# 下面取可信文件依赖 origin/main。经 `git show origin/main:gate.sh | bash` 调用时调用方必然已 fetch
-# （否则连本脚本都取不出来），这里再保底一次，使脚本也能独立运行（如本地 `bash pr-review-gate.sh` 测试）
+# 取可信文件依赖 origin/main；调用方通常已 fetch，这里保底一次以支持脚本独立运行。
 git fetch --no-tags origin main 2>/dev/null || true
 
-# ANTHROPIC_BASE_URL 未配置时 CI 注入成空串，会被 SDK 当成无效 base URL；清掉空值回退默认端点
+# 未配置时 CI 会注入空串，空 base URL 会被 SDK 当成无效值；清掉以回退默认端点。
 if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then unset ANTHROPIC_BASE_URL; fi
 
 # 清不可信配置，从 base 取回可信版本（见顶部安全模型）
@@ -31,32 +29,19 @@ git show "origin/main:.agents/commands/review-pr.md" \
   | sed "s#XiaoMi/xiaomi-miloco#${REPO}#g" \
   > .claude/commands/review-pr.md
 
-# 写死 Bash 子命令白名单到 .claude/settings.json。
-# dontAsk 模式下只有 permissions.allow 名单内的命令能执行，其余自拒。
-#
-# ⚠️ 这份文件**不会被自动加载**：非交互（-p）模式下项目级 settings 不参与判定，实测
-# `.claude/settings.json` 里的规则一条都不生效，真正生效的只有 skill 自己的 allowed-tools
-# （`.agents/commands/review-pr.md` 的 front-matter，同样取自 origin/main，所以"PR 改不动
-# 白名单"这条性质仍然成立，只是承担它的文件不是这一份）。
-# 所以 .ci/pr-agent.sh 用 `--settings` 把这份文件显式喂给 CLI —— CLI 参数这条通道确定生效。
-# Edit(//tmp/**) 放行的是**所有写文件工具**在 /tmp 下的写入（路径规则只认 Edit(...)；
-# 写成 Write(//tmp/**) 会被接受但永不匹配，等于没写）。注释正文动辄几 KB、又超过单条命令
-# 长度上限，只能落到文件里再 `gh api -F body=@文件`。dontAsk 模式下不在名单里的写入一律自拒，
-# 所以这等于"只许写 /tmp"。
+# 写死 Bash 子命令白名单：dontAsk 下只有 permissions.allow 内的命令能执行，其余自拒。
+# 这份 settings 不会被自动加载，必须由 .ci/pr-agent.sh 用 --settings 显式喂给 CLI。
+# Edit(//tmp/**) 放行所有写文件工具在 /tmp 的写入（路径规则只认 Edit(...)，Write(...) 永不匹配）；
+# 长正文超过单条命令上限，只能落文件再 gh api -F body=@文件，故等于"只许写 /tmp"。
 cat > .claude/settings.json <<'SETEOF'
 {"permissions": {"allow": ["Bash(jq *)", "Bash(gh *)", "Bash(git *)", "Bash(md5sum *)", "Bash(diff *)", "Edit(//tmp/**)"]}}
 SETEOF
 
-# 跑审查：主模型失败时降级到备用模型/endpoint 重试一次。
-# 主备均失败或审查结果未产出时直接阻断 merge，确保无审查覆盖的 PR 不能合入。
-# < /dev/null 必须：本脚本以 `git show ...:pr-review-gate.sh | bash` 方式（脚本走 bash stdin）调用，
-# 而审查 CLI 的 -p 模式在非 TTY 下会读 stdin 当输入，会把 bash 尚未读完的后续脚本（含下面的门禁逻辑）吞掉，
-# 导致 pr-agent 后整段门禁被静默跳过、门禁恒放行。隔到 /dev/null 杜绝它消费脚本流。
-# 跑审查之前，先把"现有那条 review-pr-ci 评论"的更新时间记下来 —— 末尾判定要拿它比对。
-# 必须比对的原因：这条评论是**可复用的**（每次审查都改同一条，不新增）。所以"本次审查
-# 什么都没产出"和"本次审查产出了结论"在只看 body 时长得一模一样：
-# 上次结论是红的就**假红**，上次结论是绿的则**假绿** —— 没被审过的 commit 拿到绿灯，
-# 直接能合进去。判定必须能区分"这是本次的结论"和"这是上次留下的"。
+# 跑审查：主模型失败时降级到备用模型/endpoint 重试一次；主备均失败则阻断 merge。
+# < /dev/null 必须：脚本经 bash stdin 执行，-p 模式会读 stdin 当输入并吞掉后续门禁脚本，
+# 导致整段门禁被静默跳过、恒放行。
+# 跑审查前先记下现有 review-pr-ci 评论的更新时间：这条评论是复用的，"本次没产出"和
+# "产出了结论"只看 body 无法区分，不比对就会把旧结论当本次结果（假绿/假红）。
 comment_stamp() {
   gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate 2>/dev/null \
     | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->"))] | last | (.updated_at // "")' 2>/dev/null \
@@ -77,15 +62,14 @@ elif [ -n "${ANTHROPIC_FALLBACK_API_KEY:-}" ] && [ -n "${PR_AGENT_FALLBACK_MODEL
     REVIEW_OK=1
   fi
 fi
-# 运维须知：主备模型同时不可用（或未配 ANTHROPIC_FALLBACK_* secrets）时，下面 exit 1 会让 pr-review
-# 这条 required check 变红、阻断全仓 merge。Anthropic 长时间 outage 期间若需放行，可临时在分支保护里
-# 摘掉 pr-review required check 解封，恢复后再加回。
+# 主备模型同时不可用（或未配 ANTHROPIC_FALLBACK_* secrets）时，下面的 exit 1 会让
+# pr-review 这条 required check 变红、阻断全仓 merge。
 if [ "$REVIEW_OK" -ne 1 ]; then
   echo "[FAIL] 审查执行失败（主备均不可用），阻断 merge"
   exit 1
 fi
 
-# 拉 review-pr-ci 评论；gh api 瞬断时 || 回退空串，交给下面判空分支阻断
+# gh api 瞬断时回退空串，交给下面的判空分支阻断。
 NOTE_BODY=$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
   | jq -rs 'add | .[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .body') || NOTE_BODY=""
 if [ -z "$NOTE_BODY" ]; then
@@ -93,15 +77,14 @@ if [ -z "$NOTE_BODY" ]; then
   exit 1
 fi
 
-# 这条评论必须**被本次审查更新过**。没更新说明本次审查没产出结果，
-# 那它承载的就是上一次的结论 —— 不能当本次结论用（假绿会放过没审过的 commit）。
+# 评论必须被本次审查更新过；没更新说明读到的就是旧结论，不能当本次结果用。
 STAMP_AFTER="$(comment_stamp)"
 if [ -z "$STAMP_AFTER" ] || [ "$STAMP_AFTER" = "$STAMP_BEFORE" ]; then
   echo "[FAIL] review-pr-ci 评论未被本次审查更新（本次结果未产出，读到的会是旧结论），阻断 merge"
   exit 1
 fi
 
-# 锚定到 Markdown 小节标题（review-pr 约定 #### 开头，留 1~4 个 # 余量），避免概述里的提法被误判
+# 锚定小节标题，避免概述里的提法被误判（review-pr 约定 #### 开头，留 1~4 个 # 余量）。
 if echo "$NOTE_BODY" | grep -qE '^#{1,4} .*(🔴 严重|🟡 重要)'; then
   echo "[FAIL] Review 发现严重或重要问题"
   exit 1

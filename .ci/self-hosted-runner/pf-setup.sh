@@ -1,32 +1,19 @@
 #!/bin/bash
-# 给这套 runner 的专属网段加一层宿主机侧出口过滤（pf）。
-#
-# 这一层解决的是：在 host-only 网络里，容器能碰到宿主机上**所有**监听端口的服务。
-# hostOnly 的定义本身就是"同一子网内互通"，宿主就在那个子网里、是网关 ——
-# 所以从 container 的设置里关不掉，唯一能收口的位置是宿主机。
-#
-# 规则只匹配「源 = prr-int 的网段」，机器上其它容器在别的网段，一条都不匹配。
-#
-# 用法（以普通用户跑，脚本内部按需 sudo）：
-#     bash pf-setup.sh              # 安装 + 自动实测
-#     bash pf-setup.sh --rollback   # 撤掉
-#     bash pf-setup.sh --persist    # 装 LaunchDaemon 让它开机生效（验证通过后再跑）
-#
-# 全过程写到 ~/prreview/logs/pf-setup.log，出问题直接看那个文件。
+# 给这套 runner 的专属网段加宿主机侧出口过滤（pf）。
+# hostOnly 网络里容器能碰到宿主机所有监听端口，container 侧关不掉，只能在宿主机收口。
+# 用法: bash pf-setup.sh [--rollback|--persist]；日志在 ~/prreview/logs/pf-setup.log
 
 set -uo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 SUBNET="${PRR_SUBNET:-192.168.100.0/24}"
 # 容器侧看到的宿主机地址，就是这个网段的网关地址。改 SUBNET 时必须一起改，否则下面
-# 「必须连不上」的靶子会指向一个不存在的地址 —— 永远「不通」，block 侧恒判通过。
+# 「必须连不上」的靶子会指向不存在的地址 —— 永远「不通」，block 侧恒判通过。
 HOST_GW="${PRR_HOST_GATEWAY:-192.168.100.1}"
-# 放行哪两个端口**必须与网关实际监听的一致**，所以留空、等一下从配置文件取（与 launcher
-# 同一个键）。写死默认值的后果：配置改了端口，代理听着新端口、pf 只放行旧端口，容器发往
-# GitHub 的连接在 pf 层被丢掉，表现成 gh api 全部超时，而日志里没有一处提示是端口不一致。
+# 放行的两个端口必须与网关实际监听一致，所以从配置文件取（与 launcher 同一键）。
+# 写死默认值的话，配置改了端口而 pf 只放行旧端口，容器出网会被静默丢掉。
 PORTS="${PRR_PORTS:-}"
-# 镜像引用不在这里写死默认值：没人记得住它到底是什么，而写错的表现是探针起不来容器、
-# 被判成"规则过宽"。留空，等一下从配置文件里取（与 launcher 读同一份，单一来源）。
+# 镜像引用也留空、从配置文件取（与 launcher 同一份，单一来源）；写错会让探针起不来容器。
 IMAGE="${PRR_IMAGE:-}"
 NETWORK="${PRR_NETWORK:-prr-int}"
 CONF="${PRR_CONF:-$HOME/prreview/prreview.json}"
@@ -46,9 +33,7 @@ die()   { printf '\n!! 错误: %s\n' "$*"; printf '!! 已中止。回滚：bash 
 mkdir -p "$LOG_DIR"
 exec > >(tee "$LOG") 2>&1
 
-# 镜像引用与两个代理端口都从配置文件读（与 launcher 同一份，单一来源）。环境变量仍可覆盖。
-# 这两个值必须取对：镜像写错 → 探针起不来容器、被判成"规则过宽"；端口写错 → 代理听着新端口、
-# pf 只放行旧端口，容器发往 GitHub 的连接在 pf 层被丢掉，表现成 gh api 全部超时。
+# 镜像引用与两个代理端口都从配置文件读（与 launcher 同一份，单一来源），环境变量仍可覆盖。
 cfg_get() {     # cfg_get <键> → 值（读不到打空串）
     CONF="$CONF" KEY="$1" python3 -c '
 import json, os
@@ -65,14 +50,12 @@ printf '%s' "$PORTS" | grep -qE '^[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*[0-
     || die "没拿到有效的代理端口（形如 \"18080, 18081\"）：给 PRR_PORTS，或在 $CONF 里写 github_proxy_port / model_proxy_port"
 ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与判定用的空格分隔形式
 
-# "必须连不上"的靶子：宿主机上与本方案无关的服务端口、宿主机的对外地址、以及公网。
-# 端口和地址都**现探**，正文里不写死任何具体值 —— 测的本来就该是"这台机器实际暴露了什么"。
+# "必须连不上"的靶子：宿主机上与本方案无关的服务端口、宿主机对外地址、公网。
+# 端口和地址都现探，不写死具体值 —— 测的本来就是机器实际暴露了什么。
 HOST_OWN_ADDR="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^127\.' | head -1)"
 BLOCK_TARGETS=("1.1.1.1:443")
-# 只取「通配」或「就绑在网关地址上」的监听当靶子：绑在回环或别的地址上的端口，容器走网关
-# 地址本就碰不到，拿它当靶子永远是"不通"，那条断言等于没做（判定恒通过）。
-# 判据本体在 prrlib.guard_ports 里 —— 与 launcher.py 的出口自检**共用同一份实现**
-# （以前这里是一段 awk、那边是一段 Python，靠注释手工同步，迟早漂移）。
+# 只取「通配」或「就绑在网关地址上」的监听当靶子：绑在回环或别的地址上的端口容器本就碰不到，
+# 拿它当靶子永远不通，那条断言等于没做。判据在 prrlib.guard_ports，与 launcher.py 的出口自检共用。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 for _p in $(python3 "$SCRIPT_DIR/prrlib.py" --guard-ports "$HOST_GW" --exclude "$PORTS" 2>/dev/null); do
     BLOCK_TARGETS+=("${HOST_GW}:${_p}")
@@ -159,9 +142,8 @@ detect_gw_iface() {
 write_rules_subnet() {
     if ! sudo tee "$ANCHOR_FILE" >/dev/null <<EOF
 # 这套 runner 的专属网段（${NETWORK}）在宿主侧的出口规则。
-# 全部以「源 = 容器网段」为条件，机器上其它容器在别的网段，一条都不匹配。
-# 放行到两个代理端口的 TCP；放行 DHCP（免得容器续约失败）；其余一律丢 ——
-# 包括宿主机自己的其它端口、内网其它主机、以及公网。
+# 放行两个代理端口的 TCP 和 DHCP（免得容器续约失败），其余一律丢。
+# 全部以「源 = 容器网段」为条件，其它网段的容器一条都不匹配。
 pass  quick proto udp from $SUBNET port 68 to any port 67
 pass  quick proto tcp from $SUBNET to any port { $PORTS } flags S/SA keep state
 block drop quick from $SUBNET to any
@@ -169,7 +151,6 @@ EOF
     then
         return 1
     fi
-    [ -s "$ANCHOR_FILE" ] || return 1
     return 0
 }
 
@@ -236,11 +217,9 @@ judge() {
             [ "$result" = "不通" ] || block_ok=0
         fi
     done
-    # 下限 = 两个允许靶子 + 1.1.1.1 + **至少一个端口靶子**。
-    # 1.1.1.1 证明的是"容器出不了公网"（容器有默认路由，实测 `0.0.0.0/0 via 192.168.100.1`，
-    # 所以它不通正是这层规则在起作用），但它**不能代替**"宿主端口挡没挡住"那一条；
-    # 端口靶子一个都没有时说明上面按绑定地址筛完没剩下可测的东西，这条兜底就没成立，
-    # 应当判失败（宁可让人去看一眼，也不要给出一个没验证过的 ✅）。
+    # 下限 = 两个放行靶子 + 1.1.1.1 + 至少一个端口靶子。
+    # 1.1.1.1 只证明容器出不了公网，不能代替「宿主端口挡没挡住」那一条；
+    # 端口靶子为空说明兜底没成立，应判失败，不要给出未经确认的通过。
     [ "$n" -ge 4 ] || return 1
     [ "$allow_ok" = 1 ] && [ "$block_ok" = 1 ]
 }

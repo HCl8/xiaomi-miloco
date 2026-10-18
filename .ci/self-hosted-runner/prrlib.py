@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""网关和启动器共用的那点东西。
+"""网关和启动器共用的少量工具：日志配置、来源网段判断、读凭据。
 
-刻意保持薄 —— 只有"两边逐字重复过"的东西才放进来：日志配置、来源网段判断、读凭据。
-放这里的目的是消掉重复，不是造框架。
+只放两边逐字重复过的东西 —— 消重复，不造框架。
 """
 
 import argparse
@@ -19,8 +18,8 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 def setup_logging(log_path=None):
     """统一的日志配置。
 
-    注意不能把 stream 和 filename 一起传给 basicConfig：Python 3.9 检查的是"键是否存在"，
-    不是值是否为真，所以连 stream=None 都会抛 ValueError（踩过这个坑）。
+    不能把 stream 和 filename 一起传给 basicConfig：Python 3.9 检查键是否存在而不是值，
+    连 stream=None 都会抛 ValueError。
     """
     common = {"level": logging.INFO, "format": LOG_FORMAT}
     if log_path:
@@ -55,14 +54,10 @@ def parse_cidrs(specs):
 
 
 def guard_ports(gateway, exclude=(), only=None, netstat_text=None, limit=3):
-    """宿主机上**从容器够得着**的监听端口，当出口自检的靶子。
+    """宿主机上从容器够得着的监听端口，当出口自检的靶子（pf-setup.sh 与 launcher.py 共用）。
 
-    判据（`pf-setup.sh` 与 `launcher.py` 共用这一份，别在别处再写一遍）：只取绑在
-    通配地址或网关地址上的监听。绑在回环或别的地址上的端口，容器走网关地址本就碰不到，
-    拿它当靶子永远是"没连上" —— 那条断言等于没做（假绿）。
-
-    返回 `(ports, ok)`：`ok=False` 表示**这次探测本身没成立**（netstat 跑不起来），
-    与"确实筛不出靶子"（ok=True, ports=[]）是两回事，调用方要区别对待。
+    只取绑在通配地址或网关地址上的监听：绑在回环或别的地址上的，容器走网关地址本就碰不到。
+    返回 `(ports, ok)`，`ok=False` 表示探测本身没成立（netstat 跑不起来），要与"筛不出靶子"区分。
     """
     if netstat_text is None:
         import subprocess
@@ -75,8 +70,7 @@ def guard_ports(gateway, exclude=(), only=None, netstat_text=None, limit=3):
             return [], False
         netstat_text = proc.stdout
     skip = {int(p) for p in exclude}
-    # `only` 在**取前 limit 个之前**收窄候选集。顺序反过来（先截断再收窄）会让"配置里给的
-    # 靶子恰好不在前几个里"变成空集 —— 那不是配置错，是我们自己截断早了。
+    # `only` 必须在取前 limit 个之前收窄候选集；顺序反过来会让配置给的靶子变成空集。
     keep = None if only is None else {int(p) for p in only}
     found = set()
     for line in netstat_text.splitlines():
@@ -99,8 +93,8 @@ def guard_ports(gateway, exclude=(), only=None, netstat_text=None, limit=3):
 def client_allowed(addr, nets):
     """来源地址是否落在允许网段里。nets 为空表示不限制。
 
-    宿主机看到的容器地址带 IPv6 映射前缀（`::ffff:192.168.100.3`），要先剥掉再比 ——
-    某些平台下容器地址就是这个形式，不剥的话一条规则都匹配不上。
+    宿主看到的容器地址可能带 IPv6 映射前缀（`::ffff:192.168.100.3`），要先剥掉再比，
+    否则一条规则都匹配不上。
     """
     if not nets:
         return True
@@ -115,8 +109,7 @@ def client_allowed(addr, nets):
 
 
 if __name__ == "__main__":
-    # 给 pf-setup.sh 用：bash 里 import 不了，所以留一个最小 CLI，让"哪个宿主端口能当靶子"
-    # 这道判据两边共用同一份实现（以前是 bash 的 awk 和 Python 各写一遍，靠注释手工同步）。
+    # 给 pf-setup.sh 用的最小 CLI：bash 里 import 不了，让"哪个宿主端口能当靶子"两边共用同一份实现。
     ap = argparse.ArgumentParser(description="从 netstat 里挑出容器够得着的宿主端口")
     ap.add_argument("--guard-ports", metavar="GATEWAY", required=True,
                     help="容器侧看到的宿主机地址（网关地址）")

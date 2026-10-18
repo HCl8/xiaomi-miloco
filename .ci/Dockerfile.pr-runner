@@ -1,15 +1,9 @@
-# 一次性审查容器的镜像：审查环境 + GitHub 官方 runner 程序。
+# 一次性审查容器的镜像：审查环境 + GitHub 官方 runner 程序。容器本身就是那台 runner，
+# 起来后注册、领一个任务、跑完退出并销毁。分两阶段：底座只放让 runner 活起来的东西，
+# 审查工具单独一层，改工具不用重建底座。
 #
-# runner 程序放在容器里的理由：容器不是"装任务的容器"，容器本身就是那台 runner。
-# 启动器起一个容器 → 容器里的 runner 注册、领一个任务、跑完退出 → 容器销毁。
-#
-# 分两个阶段：底座只放"让 runner 活起来"的东西，审查工具单独一层——
-# 改审查工具不用重建装 runner 的那层，也便于分别审计。
-#
-# 这个镜像由 .github/workflows/build-runner-image.yml 在 CI 上按多架构构建并推 ghcr，
-# 运行机只负责取用。**不在运行机上本地构建**：运行机到上游安装源的 TLS 链在容器里
-# 验不过（实测报 `unable to get local issuer certificate`），取不到审查 CLI。
-# 构建放在能正常访问上游的环境做，运行机就只剩"取镜像"这一件事。
+# 镜像由 .github/workflows/build-runner-image.yml 在 CI 上多架构构建并推 ghcr。不在运行机上
+# 本地构建：运行机到上游源的 TLS 链在容器里验不过，取不到审查 CLI；运行机只负责取镜像。
 
 ARG BASE_IMAGE=debian:trixie
 
@@ -25,8 +19,7 @@ RUN apt-get update \
         ca-certificates curl bash git gh jq tar gzip tini \
     && rm -rf /var/lib/apt/lists/*
 
-# GitHub 官方 runner 程序，按版本下载 + 按官方发布的 SHA256 校验。
-# 校验值取自 actions/runner 对应 release 的 "SHA-256 Checksums" 段。
+# 官方 runner 程序：按版本下载并按官方 release 的 SHA256 校验。
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
       arm64) asset="actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz"; \
@@ -46,14 +39,13 @@ RUN set -eux; \
 # runner 的 .NET 运行时依赖，官方脚本按发行版装齐
 RUN cd /opt/runner && ./bin/installdependencies.sh
 
-# UID 对齐 GitHub 托管 runner 的口径（1001），且必须非 root——
-# GitHub Actions 以 runner 用户创建 /__w 与 runner_file_commands，UID 不一致会 EACCES。
+# UID 对齐 GitHub 托管 runner（1001）且必须非 root，否则 Actions 创建 /__w 与
+# runner_file_commands 时会 EACCES。
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && chown -R agent:agent /opt/runner
 
-# 入口包装：等启动器把一次性登记凭据**拷成文件**进来，再以 --jitconfig 交给 runner。
-# 凭据不走命令行参数（会进宿主 ps），也不走环境变量（会进容器记录 config.json），
-# 容器侧读完立刻删。完整取舍见 README「登记凭据进容器的方式」。
+# 入口包装：等启动器把登记凭据拷成文件，再以 --jitconfig 交给 runner；
+# 凭据不走命令行参数或环境变量，容器侧读完立刻删。
 COPY .ci/runner-entrypoint.sh /opt/runner/entrypoint.sh
 RUN chmod 0755 /opt/runner/entrypoint.sh
 
@@ -68,14 +60,11 @@ RUN chmod 0755 /usr/local/bin/pr-agent
 
 USER agent
 
-# 必须在切到 agent 之后设 —— 否则写的是 /root/.gitconfig，而 agent 读的是 /home/agent/.gitconfig，
-# 等于没设（实测踩过：容器里 agent 的全局配置里根本没有这一条）。
+# 必须在切到 agent 之后设，否则写的是 /root/.gitconfig，等于没设。
 # 作用是关掉 dubious ownership 检查，不然 gh pr diff / git diff / git log 会全部报错。
 RUN git config --global --add safe.directory '*'
 
-# 审查 CLI 装到 agent 用户下。
-# NOTE(intentional): 刻意不 pin 版本——镜像按周期重建，借此跟进上游；每次重建前本地验证一遍。
-# 这条已在安全评审文档里作为供应链风险披露。
+# 审查 CLI 装到 agent 用户下。刻意不 pin 版本：镜像按周期重建以跟进上游。
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 ENV PATH="/home/agent/.local/bin:${PATH}"

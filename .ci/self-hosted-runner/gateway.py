@@ -1,22 +1,7 @@
 #!/usr/bin/env python3
-"""宿主机上的出网网关 —— 一个进程，两个端口。
+"""宿主机上的出网网关：一个进程，两个端口（18080 GitHub 转发，18081 模型代理）。
 
-合成一个进程的理由：这两个代理形状完全一样（长驻、被动、无状态），而且是"要么都在、要么都不在"
-——GitHub 那侧挂了接不到任务，模型那侧挂了审查跑不完，没有"只需要其中一个"的场景。
-合成一个进程少一个活动部件，也少一处重复。
-
-但它和**启动器刻意分开**：启动器会频繁重启（部署、改代码），而每次重启都会掐断正在飞的请求。
-两者寿命不同，不该互相承担 —— 今天为了改启动器重启了四五次，每次都刻意等到审查跑完。
-
-两个端口的分工：
-
-  18080  GitHub 转发代理
-         容器在 host-only 网络里没有到公网的路由，GitHub 流量只能从宿主机出去。
-         按域名白名单放行（runner 要能到的那几个端点），其余 403。
-
-  18081  模型代理
-         拿容器递来的**假钥匙**换**真 key** 再发给上游。真 key 只在宿主机、永不进容器；
-         容器拿到的一把假钥匙只在这层认。
+与启动器刻意分开：启动器会频繁重启，每次重启都会掐断正在飞的请求，两者寿命不同。
 """
 
 import argparse
@@ -35,8 +20,7 @@ import prrlib
 
 LOG = logging.getLogger("gateway")
 
-# 隧道里单方向允许积压的未发字节上限。对端不收时断开，别把这层（跑在宿主机上、
-# 和整台机器共用内存）拖垮。
+# 隧道里单方向允许积压的未发字节上限。对端不收时断开，别把这层（和整台机器共用内存）拖垮。
 MAX_PENDING = 8 * 1024 * 1024
 
 # ---- 运行时配置（main 里填）----
@@ -47,11 +31,8 @@ MODEL_EXPECT_TOKEN = None
 
 _stopping = False
 
-# GitHub 要求自托管 runner 能到的端点。取自官方 "self-hosted runners reference" 那张按用途分组的表。
-#
-# ⚠️ 少一项是**静默**坏功能，不是报错：我们最初漏了 `*.blob.core.windows.net`，
-# 表现是任务正常跑完、结论正常发出，但 job 日志一条都取不到（网关日志里能看到它被 403 拒了）。
-# 所以这里按官方清单逐组对齐，每组注明用途 —— 将来出错时能从注释直接对上"哪一组没放行"。
+# GitHub 要求自托管 runner 能到的端点，按官方 "self-hosted runners reference" 的用途分组。
+# 少一项是静默坏功能而不是报错，所以每组注明用途，出错时能直接对上"哪一组没放行"。
 GH_HOSTS_EXACT = (
     # 基本运转
     "api.github.com",
@@ -72,9 +53,8 @@ GH_HOSTS_SUFFIXES = (
     "pkg.github.com",                    # GitHub Packages
     "github-cloud.s3.amazonaws.com",     # Git LFS
 )
-# 刻意没放：*.core.windows.net（官方标为 VNet 场景）、githubapp.com（Dependabot）—— 我们不用。
-# 另外注意 blob.core.windows.net 是 Azure：放行它意味着容器能往那儿写数据。
-# 这是 GitHub Actions 存日志/产物的固有形态，不是我们选的路；审计时要知道这一条在。
+# 刻意没放：*.core.windows.net（VNet 场景）、githubapp.com（Dependabot）。
+# 注意 blob.core.windows.net 属 Azure，放行意味着容器能往那儿写数据 —— 这是 GitHub 存日志/产物的固有形态。
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -131,12 +111,8 @@ class GitHubProxy(BaseHTTPRequestHandler):
     def _tunnel(self, upstream):
         """两个 socket 之间双向搬字节。
 
-        写这一侧**不能用 `sendall`**：两个 socket 都是非阻塞的，sendall 发不完会抛
-        BlockingIOError，而那时前半截已经发出去了 —— 重试会重复发前缀，被外层 except 吞掉
-        则表现为"对端一慢就静默拆掉整条连接"。所以自己记一份没发完的尾巴，等 socket 可写
-        再接着发。
-
-        `pending[x]` = 还要**写给** x 的字节。
+        非阻塞 socket 不能用 `sendall`：发不完会丢前缀（前半截已发出，重试会重复发），
+        所以自记没发完的尾巴，等可写再接着发。`pending[x]` = 还要写给 x 的字节。
         """
         downstream = self.connection
         downstream.setblocking(False)
@@ -183,8 +159,7 @@ class GitHubProxy(BaseHTTPRequestHandler):
                         return
                     pending[dst] = buf[sent:]
                     if len(pending[dst]) > MAX_PENDING:
-                        # 对端一直不收（对端 socket 可读事件照常注册着，字节只进不出）。
-                        # 断开比把宿主机内存吃光强 —— 这层在宿主上，和整台机器共用内存。
+                        # 对端一直不收；断开比把宿主机内存吃光强（这层和整台机器共用内存）。
                         LOG.warning("对端长时间不收，待写缓冲超过 %d 字节，断开这条隧道",
                                     MAX_PENDING)
                         return
@@ -317,15 +292,13 @@ class ModelProxy(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                # 必须用 read1：read(n) 会**阻塞到攒够 n 字节或流结束**（chunked 时逐块拼、
-                # 非 chunked 时走 BufferedReader.read），于是模型的 SSE 变成一坨一坨地到，
-                # 中间整段整段地停。read1 是"有多少给多少"。
+                # 必须用 read1：read(n) 会阻塞到攒够 n 字节，SSE 就会一坨一坨地到。
                 chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (OSError, BrokenPipeError):
+        except OSError:
             pass
         finally:
             conn.close()
@@ -354,8 +327,7 @@ def main():
     cfg = prrlib.load_json_config(args.config, required=(
         "github_proxy_port", "model_proxy_port", "model_upstream",
         "model_key_file", "container_token_file",
-        # allow_cidrs 必须必填：漏了它 parse_cidrs 得到空列表，而空列表的含义是"来源不限"
-        # —— 等于把这层唯一的准入关掉（谁能连到 18080 就能借这台机器出网到 GitHub）。
+        # allow_cidrs 必须必填：空列表的含义是"来源不限"，等于关掉这层唯一的准入关。
         "allow_cidrs",
     ))
     log_path = args.log or (prrlib.expand(cfg["log_dir"]) + "/gateway.log"

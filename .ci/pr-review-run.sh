@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 审查 + 门禁 + 打状态的共用实现，供 /review 的两条执行路径（自托管 / 云端）共用。
+# 审查 + 门禁 + 打状态的共用实现，供 /review 的自托管与云端两条路径共用。
 #
-# 为什么不做成本地 composite action：`issue_comment` 的 job checkout 的是 refs/pull/<n>/head，
-# 也就是 **PR 那一侧的代码** —— 本地 action 会从那里加载，等于让 PR 决定我们要执行什么。
-# 所以和门禁脚本一样，从 origin/main 取（调用方已 checkout 并 fetch）。
+# 不做成本地 composite action：issue_comment 的 job checkout 的是 refs/pull/<n>/head，
+# 即 PR 那一侧的代码，本地 action 会从那里加载，等于让 PR 决定执行什么。故与门禁脚本
+# 一样从 origin/main 取（调用方已 checkout 并 fetch）。
 #
 # 用法: git show origin/main:.ci/pr-review-run.sh | bash -s -- <pr> <head-sha> <repo>
 # 退出码: 0 = 放行 / 1 = 有问题或执行失败（与门禁一致）

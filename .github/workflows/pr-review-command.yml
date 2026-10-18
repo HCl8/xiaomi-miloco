@@ -5,8 +5,8 @@
 # 用哪条 runner 由**触发那一刻有没有正在跑的自托管任务**决定：
 #   有（排队中 / 在跑）→ 取消它，等它真的停下，然后改用公共 runner
 #   没有              → 用自托管 runner
-# 这样"机器挂了、作业卡在队列里"时，维护者发一句 /review 就能切到公共 runner，
-# 而不需要去仓库设置里手动开关 workflow（那种开关一开就是全仓生效，还会留下两个写者）。
+# 这样自托管机器不可用、作业卡在队列里时，发一句 /review 就能切到公共 runner，
+# 而不必去仓库设置里开关 workflow（那种开关全仓生效，还会留下两个写者）。
 name: PR Review (command)
 
 on:
@@ -25,11 +25,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 轻量授权门：用评论自带的 author_association 判定（OWNER/MEMBER/COLLABORATOR=可信内部人），
-  # 挡住外部贡献者在自己 fork PR 下自助触发带 key 的流程。
-  # 用 author_association 而非 `gh api collaborators/<user>/permission`：后者权限要求在 org 仓不确定，
-  # token 不足时会对所有人 403→静默拒绝；author_association 是 webhook 自带字段，无 API、无 token 依赖。
-  # 注：MEMBER 含只读 org 成员（比"对本仓有 write"略宽），对"挡外部人"这个目标足够。
+  # 轻量授权门：按评论自带的 author_association 判定，挡外部贡献者在 fork PR 下自助
+  # 触发带 key 的流程。不用 `gh api collaborators/.../permission`：token 不足会对所有人
+  # 403 静默拒绝。注：MEMBER 含只读 org 成员，比「有 write」略宽，挡外部人够用。
   authorize:
     if: >-
       github.event.issue.pull_request != null
@@ -63,7 +61,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
         run: |
-          # 钉死触发此刻的 head SHA：维护者背书的是这个 commit，审查也必须审它（防触发后被换包）
+          # 钉死触发此刻的 head SHA：维护者背书的是这个 commit，防触发后被换包
           HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
 
@@ -77,12 +75,9 @@ jobs:
           PR: ${{ github.event.issue.number }}
           SHA: ${{ steps.gate.outputs.head_sha }}
         run: |
-          # 这个 PR 上还没结束的自托管审查任务。
-          #  · 判据是 `.status != "completed"`：GitHub 还有 pending / requested / waiting
-          #    这些中间态（触发后、被 runner 领走前就是 pending），只列 queued/in_progress 会漏。
-          #  · 认领用两个信号取并集：`pull_requests[].number` 认 pull_request 触发的，
-          #    `head_sha` 认手动 dispatch 的（dispatch 触发时 pull_requests 是空的）。
-          #  · **查失败不算"没有"**：调用方判返回值，失败就中止（下面 ids="$(...)" 那段）。
+          # 这个 PR 上还没结束的自托管审查任务。判据 status != "completed"：pending /
+          # requested / waiting 也是未结束，只列 queued/in_progress 会漏。认领取
+          # pull_requests[].number 与 head_sha 的并集（手动 dispatch 时前者为空）。
           active() {
             gh api "repos/$REPO/actions/runs?per_page=100" --paginate \
               --jq '.workflow_runs[]
@@ -110,9 +105,9 @@ jobs:
               exit 1
             fi
           done
-          # **必须等它真的停下**：取消是异步的。不等就往下走，那一刻两个写者同时存在，
-          # 共用一条 review-pr-ci 评论和同一个 pr-review status，门禁的防假绿判定会失效。
-          # 按**墙钟**记时限（120 秒），并且只查这几个 id —— 每轮翻全仓历史会让等待随历史线性变长。
+          # 必须等它真的停下：取消是异步的，不等就往下走会同时存在两个写者，
+          # 共用 review-pr-ci 评论与 pr-review status，门禁的防假绿判定会失效。
+          # 按墙钟记 120 秒，且只查这几个 id（翻全仓历史会让等待线性变长）。
           deadline=$(( $(date +%s) + 120 ))
           while :; do
             left=""
@@ -139,8 +134,8 @@ jobs:
           gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content=eyes >/dev/null 2>&1 || true
 
-  # 自托管：容器由启动器提供，模型地址与假钥匙也由它注入 —— 这里**刻意不声明** ANTHROPIC_*，
-  # 声明空值会把注入的值覆盖掉。
+  # 自托管：容器由启动器提供，模型地址与假钥匙也由它注入 —— 刻意不声明 ANTHROPIC_*，
+  # 声明空值会把注入值覆盖掉。
   review_self:
     needs: authorize
     if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'self'

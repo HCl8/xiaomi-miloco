@@ -1,11 +1,6 @@
 #!/bin/bash
-# 装两个 LaunchAgent（原来是三个，两个代理已合成一个网关进程）：
-#   1. com.prreview.gateway   宿主机出网网关（一个进程两个端口：GitHub 转发 + 模型代理）
-#   2. com.prreview.launcher  一次性 runner 启动器
-#
-# 网关和启动器分成两个进程的理由：寿命不同。启动器会频繁重启（部署、改代码），
-# 每次重启都会掐断正在飞的请求；网关重启的代价只是几十毫秒的 502。两者不该互相承担。
-#
+# 装两个 LaunchAgent：com.prreview.gateway（一个进程两个端口）和 com.prreview.launcher。
+# 分成两个进程是因为寿命不同：启动器频繁重启会掐断在飞请求，网关不该陪它一起重启。
 # 幂等：重复跑等于重装。凭据文件不在这里创建，见 README。
 set -euo pipefail
 
@@ -19,8 +14,7 @@ CONTAINER_BIN=/usr/local/bin/container
 
 say() { printf '  %s\n' "$*"; }
 
-# 端口从配置读，别在这里再写一份 —— 写死的话改了配置这里的自检会去敲一个没人听的端口，
-# 自检红了却与真实故障无关（或者反过来，端口写错了自检照样绿）。
+# 端口从配置读：写死的话改了配置自检会敲没人听的端口，红/绿都与真实故障无关。
 cfg_get() {     # cfg_get <键> <默认值>
     CONF="$CONF" KEY="$1" DEF="${2:-}" python3 -c '
 import json, os
@@ -56,8 +50,7 @@ write_agent() {  # write_agent <label> <plist路径> <可执行> <参数...>
         echo '  <key>RunAtLoad</key><true/>'
         echo '  <key>KeepAlive</key><true/>'
         echo '  <key>ThrottleInterval</key><integer>30</integer>'
-        # 收到 TERM 之后要给足时间收尾：启动器要杀掉并删掉它管的每一个容器，
-        # 默认宽限期不够，会被强杀 → 留下一批孤儿容器
+        # TERM 之后要给足收尾时间：启动器每次都要杀掉并删掉它管的容器，默认宽限期会强杀并留下孤儿
         echo '  <key>ExitTimeOut</key><integer>60</integer>'
         echo "  <key>StandardOutPath</key><string>$PRR_DIR/logs/$label.out</string>"
         echo "  <key>StandardErrorPath</key><string>$PRR_DIR/logs/$label.err</string>"
@@ -69,9 +62,8 @@ bootstrap() {
     local label="$1" plist="$2"
     cp "$plist" "$AGENTS/$label.plist"
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
-    # 必须等它真的从域里消失再 bootstrap —— 只 sleep 一秒会撞上 "Bootstrap failed: 5:
-    # Input/output error"，服务起不来还不容易看出来。
-    # 启动器要收干净它管的容器，可能花十几秒。
+    # 必须等它真从域里消失再 bootstrap，否则会撞 "Bootstrap failed: 5" 且不易发现。
+    # 启动器收干净它管的容器可能要十几秒。
     for _ in $(seq 1 40); do
         launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || break
         sleep 1
@@ -80,7 +72,7 @@ bootstrap() {
     say "已装 $label"
 }
 
-# 旧的两个代理 agent（已被 gateway 取代）：停掉并删干净，免得它们和新网关抢同一个端口
+# 旧的两个代理 agent 会和新网关抢同一端口：停掉并删干净
 for old in com.prreview.github-proxy com.prreview.model-proxy; do
     if [ -e "$AGENTS/$old.plist" ]; then
         launchctl bootout "$DOMAIN/$old" 2>/dev/null || true
