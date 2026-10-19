@@ -7,6 +7,7 @@
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -64,8 +66,6 @@ def load_config(path):
     # 出口自检：起 runner 之前先确认宿主机上那些无关服务的端口封住了。默认开。
     cfg.setdefault("require_egress_guard", True)
     cfg.setdefault("guard_recheck_seconds", 900)
-    # 出口自检探哪几个端口：默认现探。给 guard_ports 是**收窄**候选集，它同样要过
-    # "绑在通配或网关地址上"那道筛，绑在回环上的会被剔掉（容器永远够不着）。
     # 池子：同时维持几个待命容器。每个容器只接一个任务，所以要 >1 才能扛并发。
     cfg.setdefault("replicas", 1)
     cfg.setdefault("poll_seconds", 5)
@@ -83,69 +83,70 @@ def load_config(path):
 # ---------------------------------------------------------------- 出口自检
 
 # 容器里跑这几条：能连上任一个，就说明 pf 那层不在了
+# 自检用的探针：去连启动器自己刚开的那条临时监听
 GUARD_PROBE = (
-    'rc=0; '
-    'for p in {ports}; do '
-    'if timeout 4 bash -c "exec 3<>/dev/tcp/{gw}/$p" 2>/dev/null; then '
-    'echo "reachable:$p"; rc=1; fi; '
-    'done; '
-    'exit $rc'
+    'if timeout 4 bash -c "exec 3<>/dev/tcp/{gw}/{port}" 2>/dev/null; '
+    'then echo reachable; else echo blocked; fi'
 )
 
 
-def discover_guard_ports(cfg, restrict=None):
-    """宿主机正在监听的 TCP 端口（去掉我们自己的两个网关端口）。
+@contextlib.contextmanager
+def _canary_listener():
+    """在宿主机上临时开一个监听，用来验证 pf 有没有挡住容器。
 
-    `restrict` 给了就只在其中挑，但配置给的靶子也要过「绑在通配或网关地址上」那道筛：
-    绑回环的容器够不着。返回 None 表示**探测本身失败**，与「确实没有别的端口」必须区分。
+    靶子由我们自己造，不依赖机器上碰巧有什么服务在听：pf 在位时容器连不上，不在时连得上。
+    绑 0.0.0.0 —— 容器网段的 bridge 只在有容器挂着时才存在，绑具体地址会在冷启动时失败。
     """
-    mine = {int(cfg["github_proxy_port"])}
-    if cfg.get("model_proxy_port"):
-        mine.add(int(cfg["model_proxy_port"]))
-    ports, ok = prrlib.guard_ports(cfg["host_gateway"], exclude=mine, only=restrict)
-    return ports if ok else None
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", 0))
+    srv.listen(8)
+    srv.settimeout(0.5)
+    stop = threading.Event()
+
+    def accept_loop():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            conn.close()
+
+    worker = threading.Thread(target=accept_loop, daemon=True)
+    worker.start()
+    try:
+        yield srv.getsockname()[1]
+    finally:
+        stop.set()
+        srv.close()
+        worker.join(timeout=2)   # 等 accept 从阻塞里退出，端口才真的释放
 
 
 def check_egress_guard(cfg):
-    """起一个一次性容器，探测容器还能不能碰到宿主机上与本方案无关的服务端口。
+    """起一个一次性容器，看它能不能连上宿主上刚开的临时端口。
 
-    不读防火墙配置，直接验证「够不够得着」：够得着说明 pf 那层不在了，此时起 runner 等于
-    把网络摊在公网 PR 面前，所以宁可不干活。返回 (ok, 说明)。
+    连得上说明 pf 那层不在了 —— 此时起 runner 等于把网络摊在公网 PR 面前，宁可不干活。
+    返回 (ok, 说明)。
     """
-    # `or None`：`guard_ports: []` 与没给这个键当同一件事。不归一的话空数组会被当成
-    # "配置给了靶子" → 收窄成空集 → 判失败，且报出的成因与实际发生的事对不上。
-    restrict = cfg.get("guard_ports") or None
-    ports = discover_guard_ports(cfg, restrict)
-    if ports is None:
-        # 探测失败 ≠ 没有目标。宁可挡住，也不假装检查过了
-        return False, ("探不到宿主机在监听哪些端口（netstat 跑不起来），无法完成出口自检"
-                       " —— 先确认 netstat 能跑（PATH/权限）")
-    if not ports:
-        # 一个靶子都筛不出来 → **判失败**，与 pf-setup.sh 的 judge 一致：真正的"只听了网关"
-        # 与"解析坏了/输出格式变了"长得一模一样，后者放过去会让安全检查静默失效。
-        # 两种"没靶子"要分开说，免得把人指向错误的排查方向。
-        if restrict is not None:
-            return False, ("配置里的 guard_ports 一个都没通过筛选（只收绑在通配或网关地址上的"
-                           "监听），这条自检没靶子可测 —— 改配置里的 guard_ports，"
-                           "或把它设成 null 走现探；重跑 pf-setup.sh 不解决这个")
-        return False, ("现探不出可测的宿主端口（netstat 输出里没有通配/网关地址上的监听？），"
-                       "无法完成出口自检 —— 先看 netstat -an -f inet 的输出，"
-                       "重跑 pf-setup.sh 不解决这个")
-    probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
-                               ports=" ".join(str(p) for p in ports))
-    args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
-            "--entrypoint", "/bin/bash", cfg["image"], "-c", probe]
     try:
-        proc = subprocess.run([CONTAINER] + args, capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with _canary_listener() as port:
+            probe = GUARD_PROBE.format(gw=cfg["host_gateway"], port=port)
+            args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
+                    "--entrypoint", "/bin/bash", cfg["image"], "-c", probe]
+            proc = subprocess.run([CONTAINER] + args, capture_output=True,
+                                  text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError) as exc:
         return False, "自检没跑起来: %s" % exc
-    if proc.returncode == 0:
-        return True, "宿主端口已封住"
-    hit = [ln for ln in (proc.stdout or "").splitlines() if ln.startswith("reachable:")]
-    if hit:
-        return False, ("从容器里能连到宿主机端口 %s —— pf 那层不在了。"
-                       "修法：bash ~/prreview/pf-setup.sh") % ", ".join(hit)
-    return False, "自检异常退出(%d): %s" % (proc.returncode, (proc.stderr or proc.stdout).strip()[:200])
+    out = proc.stdout or ""
+    if "reachable" in out:
+        return False, ("容器连上了宿主机上的临时端口 %d —— pf 那层不在了。"
+                       "修法：bash ~/prreview/pf-setup.sh") % port
+    if "blocked" not in out:
+        # 探针一个字都没回：容器没起来 / 镜像不在 / 超时。没验过就不能算通过
+        return False, "自检异常退出(%d): %s" % (proc.returncode, (proc.stderr or out).strip()[:200])
+    return True, "宿主端口已封住"
 
 
 def check_gateway(cfg):
