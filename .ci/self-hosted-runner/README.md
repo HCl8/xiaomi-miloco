@@ -89,12 +89,12 @@ hostOnly 网络里出站 TCP 是否被转发，取决于宿主机的 `net.inet.i
 
 ```
 pass  quick proto udp from 192.168.100.0/24 port 68 to any port 67
-pass  quick proto tcp from 192.168.100.0/24 to any port { 18080, 18081 } flags S/SA keep state
+pass  quick proto tcp from 192.168.100.0/24 to 192.168.100.1 port { 18080, 18081 } flags S/SA keep state
 block drop quick from 192.168.100.0/24 to any
 ```
 
 规则以「源 = 该网段」为条件，机器上其它容器在别的网段，**一条都不匹配**。
-`launcher.py` 起 runner 之前会检查一次（能不能碰到宿主机上与本方案无关的服务端口），封不住就拒绝干活。
+`launcher.py` 起 runner 之前会检查一次：自己在宿主上临时开一个端口，看容器能不能连上。连得上就拒绝干活。
 
 ## 已知缺口（别当已经解决）
 

@@ -5,7 +5,7 @@
 # 那里加载，等于让 PR 决定执行什么。故与门禁脚本一样从 origin/main 取。
 #
 # 用法: git show origin/main:.ci/pr-review-run.sh | bash -s -- <pr> <head-sha> <repo>
-# 退出码: 0 = 放行 / 1 = 有问题或执行失败（与门禁一致）
+# 退出码: 0 = 放行 / 1 = 没放行（具体是「有问题」还是「链路故障」看 status 的 description）
 set -uo pipefail
 
 PR_NUMBER="$1"

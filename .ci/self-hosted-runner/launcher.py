@@ -63,7 +63,7 @@ def load_config(path):
     # 默认值必须与 workflow 的 `runs-on` 对得上（那边是 [self-hosted, prr-test]）。
     # 对不上时 GitHub 不报错，只是永远不派活。
     cfg.setdefault("runner_labels", ["self-hosted", "linux", "arm64", "prr-test"])
-    # 出口自检：起 runner 之前先确认宿主机上那些无关服务的端口封住了。默认开。
+    # 出口自检：起 runner 之前先确认容器连不上宿主上临时开的端口。默认开。
     cfg.setdefault("require_egress_guard", True)
     cfg.setdefault("guard_recheck_seconds", 900)
     # 池子：同时维持几个待命容器。每个容器只接一个任务，所以要 >1 才能扛并发。
@@ -83,10 +83,15 @@ def load_config(path):
 # ---------------------------------------------------------------- 出口自检
 
 # 容器里跑这几条：能连上任一个，就说明 pf 那层不在了
-# 自检用的探针：去连启动器自己刚开的那条临时监听
+# 自检用的探针。两条连接，缺一不可：
+#   control —— 连网关那个**必须通**的端口，证明探针自己能跑（bash 有 /dev/tcp、timeout 在）。
+#              没有它，"连不上" 就同时代表"被挡住"和"探针坏了"，前者才能判通过。
+#   canary  —— 连启动器刚开的临时端口，**必须不通**。
 GUARD_PROBE = (
-    'if timeout 4 bash -c "exec 3<>/dev/tcp/{gw}/{port}" 2>/dev/null; '
-    'then echo reachable; else echo blocked; fi'
+    'c=0; k=0; '
+    'timeout 4 bash -c "exec 3<>/dev/tcp/{gw}/{control}" 2>/dev/null && c=1; '
+    'timeout 4 bash -c "exec 3<>/dev/tcp/{gw}/{canary}" 2>/dev/null && k=1; '
+    'echo "control=$c canary=$k"'
 )
 
 
@@ -132,7 +137,8 @@ def check_egress_guard(cfg):
     """
     try:
         with _canary_listener() as port:
-            probe = GUARD_PROBE.format(gw=cfg["host_gateway"], port=port)
+            probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
+                                       control=cfg["github_proxy_port"], canary=port)
             args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
                     "--entrypoint", "/bin/bash", cfg["image"], "-c", probe]
             proc = subprocess.run([CONTAINER] + args, capture_output=True,
@@ -140,12 +146,13 @@ def check_egress_guard(cfg):
     except (OSError, subprocess.SubprocessError) as exc:
         return False, "自检没跑起来: %s" % exc
     out = proc.stdout or ""
-    if "reachable" in out:
+    if "control=1" not in out:
+        # 正向对照没通：探针跑不起来（缺 timeout / 无 /dev/tcp）或网关端口不通。
+        # 此时"连不上临时端口"证明不了任何事，不能判通过。
+        return False, "自检没得出有效结果(%d): %s" % (proc.returncode, (proc.stderr or out).strip()[:200])
+    if "canary=1" in out:
         return False, ("容器连上了宿主机上的临时端口 %d —— pf 那层不在了。"
                        "修法：bash ~/prreview/pf-setup.sh") % port
-    if "blocked" not in out:
-        # 探针一个字都没回：容器没起来 / 镜像不在 / 超时。没验过就不能算通过
-        return False, "自检异常退出(%d): %s" % (proc.returncode, (proc.stderr or out).strip()[:200])
     return True, "宿主端口已封住"
 
 
