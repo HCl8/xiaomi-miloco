@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# 审查 + 门禁 + 打状态的共用实现，供 /review 的自托管与云端两条路径共用。
+# 审查 + 门禁 + 打状态的共用实现，自动审查与 /review 两条路径共用。
 #
-# 不做成本地 composite action：issue_comment 的 job checkout 的是 PR 那一侧的代码，
-# 即 PR 那一侧的代码，本地 action 会从那里加载，等于让 PR 决定执行什么。故与门禁脚本
-# 一样从 origin/main 取（调用方已 checkout 并 fetch）。
+# 不做成本地 composite action：job checkout 的是 PR 那一侧的代码，本地 action 会从
+# 那里加载，等于让 PR 决定执行什么。故与门禁脚本一样从 origin/main 取。
 #
 # 用法: git show origin/main:.ci/pr-review-run.sh | bash -s -- <pr> <head-sha> <repo>
 # 退出码: 0 = 放行 / 1 = 有问题或执行失败（与门禁一致）
@@ -13,16 +12,23 @@ PR_NUMBER="$1"
 HEAD_SHA="$2"
 REPO="$3"
 
-# 钉死 head：检出的是 refs/pull/<n>/merge（base 与 PR head 的合并提交），
-# 它的第二个父就是 PR head —— 对不上说明触发之后被换过包
-GOT="$(git rev-parse --verify -q HEAD^2 || true)"   # --verify -q：解析失败时回空串，不回显参数
+# 容器 / 不同 runner 的用户不同，工作区所有权会对不上
+git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
+
+# 优先审**合并结果**（base 与 PR head 合出来的提交）：base 前进带出的冲突也会落进审查。
+# PR 有冲突时这个 ref 不存在，退回审 head —— 那种情况下根本没有合并结果可看。
+if git fetch --no-tags origin "refs/pull/$PR_NUMBER/merge" 2>/dev/null; then
+  git checkout --detach FETCH_HEAD >/dev/null 2>&1
+  GOT="$(git rev-parse --verify -q HEAD^2 || true)"   # 合并提交的第二个父就是 PR head
+else
+  echo "::warning::PR 有冲突，取不到合并结果，本次审的是 head"
+  GOT="$(git rev-parse HEAD)"
+fi
 if [ "$GOT" != "$HEAD_SHA" ]; then
-  echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT:-（取不到合并提交的第二个父）}，疑似触发后改包，已中止"
+  echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT:-（取不到）}，疑似触发后改包，已中止"
   exit 1
 fi
 
-# 容器 / 不同 runner 的用户不同，工作区所有权会对不上
-git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
 git fetch --no-tags origin main 2>/dev/null || true
 
 STATE=failure
