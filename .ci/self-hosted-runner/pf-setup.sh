@@ -53,6 +53,7 @@ ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与�
 # "必须连不上"的靶子：宿主机上与本方案无关的服务端口、宿主机对外地址、公网。
 # 端口和地址都现探，不写死具体值 —— 测的本来就是机器实际暴露了什么。
 HOST_OWN_ADDR="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^127\.' | head -1)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 BLOCK_TARGETS=("1.1.1.1:443")
 
 # 自造靶子：在宿主上开一个临时监听，容器必须连不上它。不依赖机器上碰巧有什么服务在跑，

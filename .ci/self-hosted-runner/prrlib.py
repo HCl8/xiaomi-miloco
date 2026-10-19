@@ -68,43 +68,6 @@ def canary_port(bind="0.0.0.0"):
     return s, s.getsockname()[1]
 
 
-def guard_ports(gateway, exclude=(), only=None, netstat_text=None, limit=3):
-    """宿主机上从容器够得着的监听端口，当出口自检的靶子（pf-setup.sh 与 launcher.py 共用）。
-
-    只取绑在通配地址或网关地址上的监听：绑在回环或别的地址上的，容器走网关地址本就碰不到。
-    返回 `(ports, ok)`，`ok=False` 表示探测本身没成立（netstat 跑不起来），要与"筛不出靶子"区分。
-    """
-    if netstat_text is None:
-        import subprocess
-        try:
-            proc = subprocess.run(["netstat", "-an", "-f", "inet"],
-                                  capture_output=True, text=True, timeout=20)
-        except (OSError, subprocess.SubprocessError):
-            return [], False
-        if proc.returncode != 0:
-            return [], False
-        netstat_text = proc.stdout
-    skip = {int(p) for p in exclude}
-    # `only` 必须在取前 limit 个之前收窄候选集；顺序反过来会让配置给的靶子变成空集。
-    keep = None if only is None else {int(p) for p in only}
-    found = set()
-    for line in netstat_text.splitlines():
-        if "LISTEN" not in line:
-            continue
-        fields = line.split()
-        if len(fields) < 4:
-            continue
-        addr, _, tail = fields[3].rpartition(".")   # '*.18080' / '127.0.0.1.22'
-        if not tail.isdigit():
-            continue
-        if addr not in ("*", gateway):
-            continue
-        if keep is not None and int(tail) not in keep:
-            continue
-        found.add(int(tail))
-    return sorted(p for p in found if p not in skip)[:limit], True
-
-
 def client_allowed(addr, nets):
     """来源地址是否落在允许网段里。nets 为空表示不限制。
 
@@ -124,28 +87,14 @@ def client_allowed(addr, nets):
 
 
 if __name__ == "__main__":
-    # 给 pf-setup.sh 用的最小 CLI：bash 里 import 不了，让"哪个宿主端口能当靶子"两边共用同一份实现。
-    ap = argparse.ArgumentParser(description="从 netstat 里挑出容器够得着的宿主端口")
-    ap.add_argument("--guard-ports", metavar="GATEWAY",
-                    help="容器侧看到的宿主机地址（网关地址）")
-    ap.add_argument("--exclude", default="", help="逗号分隔，要剔除的端口（网关自己的）")
-    ap.add_argument("--canary-port", action="store_true",
-                    help="开一个临时监听，打印端口后一直保持（给装机脚本当靶子）")
-    _a = ap.parse_args()
-
-    if _a.canary_port:
-        _srv, _port = canary_port()
-        print(_port, flush=True)
-        try:
-            while True:
-                time.sleep(30)
-        finally:
-            _srv.close()
-
-    if not _a.guard_ports:
-        ap.error("要么给 --guard-ports，要么用 --canary-port")
-    _ports, _ok = guard_ports(_a.guard_ports,
-                              [p for p in _a.exclude.replace(" ", "").split(",") if p])
-    if not _ok:
-        raise SystemExit("netstat 跑不起来，探不到宿主端口")
-    print(" ".join(str(p) for p in _ports))
+    # 给 bash 侧的装机脚本用：开一个临时监听并打印端口（给容器当"必须连不上"的靶子）。
+    ap = argparse.ArgumentParser(description="开一个临时监听，打印端口后保持不动")
+    ap.add_argument("--canary-port", action="store_true", required=True)
+    ap.parse_args()
+    srv, port = canary_port()
+    print(port, flush=True)
+    try:
+        while True:
+            time.sleep(30)
+    finally:
+        srv.close()

@@ -307,10 +307,15 @@ def sweep_orphan_containers(cfg):
     """
     prefix = cfg["name_prefix"] + "-"
     for name in live_container_names() or ():
-        if isinstance(name, str) and name.startswith(prefix):
-            log.warning("收掉上次遗留的容器 %s", name)
-            kill_and_delete(name)
-            forget_runners(cfg, [name])
+        if not (isinstance(name, str) and name.startswith(prefix)):
+            continue
+        if container_running_job(name) is not False:
+            # 上一次退出时特意留下让它跑完的 —— 不能杀，让它自己结束
+            log.info("遗留容器 %s 正在跑任务，留着", name)
+            continue
+        log.warning("收掉上次遗留的容器 %s", name)
+        kill_and_delete(name)
+        forget_runners(cfg, [name])
 
 
 def sweep_stale_jit_files(cfg):
