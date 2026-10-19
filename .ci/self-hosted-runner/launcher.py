@@ -332,6 +332,21 @@ def image_info(ref):
     return digest, revision
 
 
+def sweep_orphan_containers(cfg):
+    """收掉上一次留下的容器。
+
+    正常退出会先把容器收干净，但「补槽」与「收到 TERM」之间有个窗口：那一刻新建的容器
+    既不在收尾快照里、也没进 slots，于是没人跟踪。它不会自己退出（runner 在等作业），
+    会一直占着一个槽位和一条 runner 记录。启动时按名字前缀全收一遍。
+    """
+    prefix = cfg["name_prefix"] + "-"
+    for name in live_container_names() or ():
+        if isinstance(name, str) and name.startswith(prefix):
+            log.warning("收掉上次遗留的容器 %s", name)
+            kill_and_delete(name)
+            forget_runners(cfg, [name])
+
+
 def sweep_stale_jit_files(cfg):
     """清掉进程被强杀时留下的临时凭据文件。
 
@@ -715,6 +730,7 @@ def main():
     signal.signal(signal.SIGINT, _on_signal)
 
     sweep_stale_jit_files(cfg)
+    sweep_orphan_containers(cfg)
 
     digest, revision = image_info(cfg["image"])
     log.info("启动：镜像=%s digest=%s commit=%s 网络=%s 仓库=%s 标签=%s 待命容器=%d 空闲回收=%ds",
