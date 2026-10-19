@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 审查 + 门禁 + 打状态的共用实现，供 /review 的自托管与云端两条路径共用。
 #
-# 不做成本地 composite action：issue_comment 的 job checkout 的是 refs/pull/<n>/head，
+# 不做成本地 composite action：issue_comment 的 job checkout 的是 PR 那一侧的代码，
 # 即 PR 那一侧的代码，本地 action 会从那里加载，等于让 PR 决定执行什么。故与门禁脚本
 # 一样从 origin/main 取（调用方已 checkout 并 fetch）。
 #
@@ -13,10 +13,11 @@ PR_NUMBER="$1"
 HEAD_SHA="$2"
 REPO="$3"
 
-# 钉死 head：维护者背书的是触发那一刻的 commit，审查也必须审它（防触发后换包）
-GOT="$(git rev-parse HEAD)"
+# 钉死 head：检出的是 refs/pull/<n>/merge（base 与 PR head 的合并提交），
+# 它的第二个父就是 PR head —— 对不上说明触发之后被换过包
+GOT="$(git rev-parse HEAD^2 2>/dev/null || true)"
 if [ "$GOT" != "$HEAD_SHA" ]; then
-  echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT}，疑似触发后改包，已中止"
+  echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT:-（取不到合并提交的第二个父）}，疑似触发后改包，已中止"
   exit 1
 fi
 

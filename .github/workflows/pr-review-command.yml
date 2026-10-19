@@ -149,7 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
+          ref: refs/pull/${{ github.event.issue.number }}/merge
           fetch-depth: 0
 
       - name: 审查并按严重度门禁
@@ -188,7 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
+          ref: refs/pull/${{ github.event.issue.number }}/merge
           fetch-depth: 0
 
       - name: 审查并按严重度门禁
