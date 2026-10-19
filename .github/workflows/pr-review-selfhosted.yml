@@ -1,0 +1,51 @@
+name: PR Review (self-hosted)
+
+# 自托管审查路径：与 pr-review.yml 同一个门禁脚本，runs-on 指向自托管 runner，
+# 不声明 container:（容器由启动器起）。
+#
+# 用 pull_request_target，而不是 pull_request：
+#   · 外部贡献的 fork PR 也要自动审，而 pull_request 下 fork 拿到的 token 是只读的，
+#     打不了 status、发不了评论；
+#   · 换过来之后工作流定义取自默认分支，外部人改不动 job；
+#   · PR 的代码只作为**数据**被检出，不构建、不执行。
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# 同一 PR 连续 push 时取消上一次，只留最新。自托管下每个作业各起独立容器，
+# 「一个 runner 一次一个作业」的串行保证不成立，并发审查会互相覆盖唯一那条评论。
+concurrency:
+  # 与线上那份（pr-review-<号>）必须不同名；线上那份保持停用，两条同时活着会互相覆盖。
+  group: pr-review-selfhosted-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write # 发 / 改 review-pr-ci 评论
+  statuses: write       # 把结论打成 pr-review commit status
+
+jobs:
+  review:
+    # 认专属标签，避免被 GitHub 托管的机器接走
+    runs-on: [self-hosted, prr-test]
+    timeout-minutes: 60
+    # 草稿不审，靠 ready_for_review 补审
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          fetch-depth: 0
+
+      - name: AI 审查并按严重度门禁
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          # 刻意不声明 ANTHROPIC_* / PR_AGENT_MODEL：由宿主机启动器注入容器（地址指向
+          # 宿主机模型代理，容器只拿假钥匙）。声明空值会覆盖掉注入值。
+        run: |
+          git fetch origin main
+          # 校验 head 未被换、跑 base 分支上的门禁、把结论打到 head —— 都在这个共用脚本里
+          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO"
