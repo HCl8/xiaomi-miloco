@@ -26,9 +26,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 算出镜像名
+        id: img
+        # ghcr 的仓库路径必须小写，而仓库名可能带大写（如 HCl8 / XiaoMi）。转成小写之后
+        # 镜像跟着所属仓库走：fork 推自己的命名空间，不再撞上游的包权限。
+        run: echo "name=$(printf 'ghcr.io/%s/pr-review' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: .ci/Dockerfile.pr-review
           push: true
-          tags: ghcr.io/xiaomi/xiaomi-miloco/pr-review:trixie
+          tags: ${{ steps.img.outputs.name }}:trixie

@@ -7,7 +7,6 @@
 """
 
 import argparse
-import contextlib
 import json
 import logging
 import os
@@ -17,7 +16,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -95,56 +93,24 @@ GUARD_PROBE = (
 )
 
 
-@contextlib.contextmanager
-def _canary_listener():
-    """在宿主机上临时开一个监听，用来验证 pf 有没有挡住容器。
-
-    靶子由我们自己造，不依赖机器上碰巧有什么服务在听：pf 在位时容器连不上，不在时连得上。
-    绑 0.0.0.0 —— 容器网段的 bridge 只在有容器挂着时才存在，绑具体地址会在冷启动时失败。
-    """
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", 0))
-    srv.listen(8)
-    srv.settimeout(0.5)
-    stop = threading.Event()
-
-    def accept_loop():
-        while not stop.is_set():
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            conn.close()
-
-    worker = threading.Thread(target=accept_loop, daemon=True)
-    worker.start()
-    try:
-        yield srv.getsockname()[1]
-    finally:
-        stop.set()
-        srv.close()
-        worker.join(timeout=2)   # 等 accept 从阻塞里退出，端口才真的释放
-
-
 def check_egress_guard(cfg):
     """起一个一次性容器，看它能不能连上宿主上刚开的临时端口。
 
     连得上说明 pf 那层不在了 —— 此时起 runner 等于把网络摊在公网 PR 面前，宁可不干活。
     返回 (ok, 说明)。
     """
+    srv, port = prrlib.canary_port()
     try:
-        with _canary_listener() as port:
-            probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
-                                       control=cfg["github_proxy_port"], canary=port)
-            args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
-                    "--entrypoint", "/bin/bash", cfg["image"], "-c", probe]
-            proc = subprocess.run([CONTAINER] + args, capture_output=True,
-                                  text=True, timeout=180)
+        probe = GUARD_PROBE.format(gw=cfg["host_gateway"],
+                                   control=cfg["github_proxy_port"], canary=port)
+        args = ["run", "--rm", "--arch", "arm64", "--network", cfg["network"],
+                "--entrypoint", "/bin/bash", cfg["image"], "-c", probe]
+        proc = subprocess.run([CONTAINER] + args, capture_output=True,
+                              text=True, timeout=180)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, "自检没跑起来: %s" % exc
+    finally:
+        srv.close()
     out = proc.stdout or ""
     if "control=1" not in out:
         # 正向对照没通：探针跑不起来（缺 timeout / 无 /dev/tcp）或网关端口不通。

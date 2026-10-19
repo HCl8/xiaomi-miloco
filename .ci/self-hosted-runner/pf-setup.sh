@@ -54,17 +54,18 @@ ALLOW_PORTS="$(printf '%s' "$PORTS" | tr -d ' ' | tr ',' ' ')"   # 给探测与�
 # 端口和地址都现探，不写死具体值 —— 测的本来就是机器实际暴露了什么。
 HOST_OWN_ADDR="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^127\.' | head -1)"
 BLOCK_TARGETS=("1.1.1.1:443")
-# 只取「通配」或「就绑在网关地址上」的监听当靶子：绑在回环或别的地址上的端口容器本就碰不到，
-# 拿它当靶子永远不通，那条断言等于没做。判据在 prrlib.guard_ports，与 launcher.py 的出口自检共用。
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-# 这个 CLI 的两种"没东西"必须分开：netstat 跑不起来要中止（规则对不对无从判断）；
-# 确实没有合格监听则正常退出、输出为空，往下走。
-GUARD_OUT="$(python3 "$SCRIPT_DIR/prrlib.py" --guard-ports "$HOST_GW" --exclude "$PORTS" 2>&1)"
-[ $? -eq 0 ] || die "探不到宿主机在监听什么（netstat 跑不起来）：${GUARD_OUT}"
-for _p in $GUARD_OUT; do
-    BLOCK_TARGETS+=("${HOST_GW}:${_p}")
-    [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
-done
+
+# 自造靶子：在宿主上开一个临时监听，容器必须连不上它。不依赖机器上碰巧有什么服务在跑，
+# 也就不存在"netstat 输出变了 / 这台机器没有可测端口"这类判断不出来的情况。
+CANARY_FILE="$(mktemp)"
+python3 "$SCRIPT_DIR/prrlib.py" --canary-port > "$CANARY_FILE" 2>/dev/null &
+CANARY_PID=$!
+trap 'kill "$CANARY_PID" 2>/dev/null; rm -f "$CANARY_FILE"' EXIT
+for _ in $(seq 1 50); do [ -s "$CANARY_FILE" ] && break; sleep 0.1; done
+CANARY_PORT="$(head -1 "$CANARY_FILE" 2>/dev/null)"
+[ -n "$CANARY_PORT" ] || die "起不来临时监听，无法验证宿主端口是否被封"
+BLOCK_TARGETS+=("${HOST_GW}:${CANARY_PORT}")
+
 # 放行端口出现在宿主**别的地址**上时必须不通 —— 规则只放行到 $HOST_GW，这一条守着它。
 if [ -n "$HOST_OWN_ADDR" ]; then
     for _p in $ALLOW_PORTS; do BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}"); done

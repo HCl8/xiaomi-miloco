@@ -173,7 +173,9 @@ jobs:
       cancel-in-progress: true
     timeout-minutes: 60
     container:
-      image: ghcr.io/xiaomi/xiaomi-miloco/pr-review:trixie
+      # 镜像跟着所属仓库走（由 build-image.yml 推）。仓库名可能带大写，而 ghcr 路径必须
+      # 小写，表达式没法转换，所以用仓库变量覆盖；没设时落到上游那份（公开可拉）。
+      image: ${{ vars.PR_REVIEW_IMAGE || 'ghcr.io/xiaomi/xiaomi-miloco/pr-review:trixie' }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

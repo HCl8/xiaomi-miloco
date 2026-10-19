@@ -6,6 +6,8 @@
 
 import argparse
 import ipaddress
+import socket
+import time
 import json
 import logging
 import os
@@ -51,6 +53,19 @@ def read_secret(path):
 
 def parse_cidrs(specs):
     return [ipaddress.ip_network(s) for s in (specs or [])]
+
+
+def canary_port(bind="0.0.0.0"):
+    """开一个临时监听并返回 (socket, port)；调用方负责关。
+
+    只用来判断"连不连得上"，不需要 accept —— TCP 握手由内核用 accept 队列完成，
+    保持 socket 开着，容器侧的 /dev/tcp 就能连上。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((bind, 0))
+    s.listen(8)
+    return s, s.getsockname()[1]
 
 
 def guard_ports(gateway, exclude=(), only=None, netstat_text=None, limit=3):
@@ -111,10 +126,24 @@ def client_allowed(addr, nets):
 if __name__ == "__main__":
     # 给 pf-setup.sh 用的最小 CLI：bash 里 import 不了，让"哪个宿主端口能当靶子"两边共用同一份实现。
     ap = argparse.ArgumentParser(description="从 netstat 里挑出容器够得着的宿主端口")
-    ap.add_argument("--guard-ports", metavar="GATEWAY", required=True,
+    ap.add_argument("--guard-ports", metavar="GATEWAY",
                     help="容器侧看到的宿主机地址（网关地址）")
     ap.add_argument("--exclude", default="", help="逗号分隔，要剔除的端口（网关自己的）")
+    ap.add_argument("--canary-port", action="store_true",
+                    help="开一个临时监听，打印端口后一直保持（给装机脚本当靶子）")
     _a = ap.parse_args()
+
+    if _a.canary_port:
+        _srv, _port = canary_port()
+        print(_port, flush=True)
+        try:
+            while True:
+                time.sleep(30)
+        finally:
+            _srv.close()
+
+    if not _a.guard_ports:
+        ap.error("要么给 --guard-ports，要么用 --canary-port")
     _ports, _ok = guard_ports(_a.guard_ports,
                               [p for p in _a.exclude.replace(" ", "").split(",") if p])
     if not _ok:
