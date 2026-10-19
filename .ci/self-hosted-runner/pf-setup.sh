@@ -57,7 +57,11 @@ BLOCK_TARGETS=("1.1.1.1:443")
 # 只取「通配」或「就绑在网关地址上」的监听当靶子：绑在回环或别的地址上的端口容器本就碰不到，
 # 拿它当靶子永远不通，那条断言等于没做。判据在 prrlib.guard_ports，与 launcher.py 的出口自检共用。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-for _p in $(python3 "$SCRIPT_DIR/prrlib.py" --guard-ports "$HOST_GW" --exclude "$PORTS" 2>/dev/null); do
+# 这个 CLI 的两种"没东西"必须分开：netstat 跑不起来要中止（规则对不对无从判断）；
+# 确实没有合格监听则正常退出、输出为空，往下走。
+GUARD_OUT="$(python3 "$SCRIPT_DIR/prrlib.py" --guard-ports "$HOST_GW" --exclude "$PORTS" 2>&1)"
+[ $? -eq 0 ] || die "探不到宿主机在监听什么（netstat 跑不起来）：${GUARD_OUT}"
+for _p in $GUARD_OUT; do
     BLOCK_TARGETS+=("${HOST_GW}:${_p}")
     [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
 done

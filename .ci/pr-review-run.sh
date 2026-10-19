@@ -17,8 +17,13 @@ git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
 
 # 审的是**合并结果**（base 与 PR head 合出来的提交），base 前进带出的冲突也会落进审查。
 # 有冲突时这个 ref 不存在 —— 没有合并结果可审，直接报错，审 head 没有意义。
-if ! git fetch --no-tags origin "refs/pull/$PR_NUMBER/merge" 2>/dev/null; then
-  echo "::error::PR 有冲突，取不到合并结果（refs/pull/$PR_NUMBER/merge），本次不审查；请先解决冲突"
+if ! merge_err="$(git fetch --no-tags origin "refs/pull/$PR_NUMBER/merge" 2>&1)"; then
+  case "$merge_err" in
+    *"couldn't find remote ref"*)
+      echo "::error::PR 有冲突，取不到合并结果（refs/pull/$PR_NUMBER/merge），本次不审查；请先解决冲突" ;;
+    *)
+      echo "::error::取不到合并结果，原因不是冲突：${merge_err}" ;;
+  esac
   exit 1
 fi
 git checkout --detach FETCH_HEAD >/dev/null 2>&1
@@ -30,13 +35,14 @@ fi
 
 git fetch --no-tags origin main 2>/dev/null || true
 
-STATE=failure
-DESC="发现严重/重要问题"
-# 跑 base 分支上的门禁（fork PR 改不动它；脚本内部还会清掉 PR 树里的不可信配置）
-if git show origin/main:.ci/pr-review-gate.sh | bash -s -- "$PR_NUMBER" "$REPO"; then
-  STATE=success
-  DESC="未发现严重/重要问题"
-fi
+# 跑 base 分支上的门禁（PR 改不动它；脚本内部还会清掉 PR 树里的不可信配置）。
+# 退出码：0 放行 / 1 发现严重或重要问题 / 2 基础设施故障（没产出结论）。
+git show origin/main:.ci/pr-review-gate.sh | bash -s -- "$PR_NUMBER" "$REPO"
+case $? in
+  0) STATE=success; DESC="未发现严重/重要问题" ;;
+  2) STATE=error;   DESC="审查链路故障，未产出结论" ;;
+  *) STATE=failure; DESC="发现严重/重要问题" ;;
+esac
 
 # issue_comment / 自托管 job 都不会自动成为 PR 的 check；打到 head SHA 的 commit status 上，
 # 才能显示在 PR 里、也才能在分支保护里当 required check
