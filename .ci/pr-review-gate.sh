@@ -45,7 +45,9 @@ SETEOF
 comment_stamp() {
   local body
   body="$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate 2>/dev/null)" || return 1
-  printf '%s' "$body" | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->"))] | last | (.updated_at // "")' 2>/dev/null || return 1
+  # 取**第一条**与 skill 一致（skill 的 --ci 模式认 .[0]）；不一致时会出现
+  # "盯的这条没变、被改的那条变了"
+  printf '%s' "$body" | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .updated_at] | .[0] // ""' 2>/dev/null || return 1
 }
 if ! STAMP_BEFORE="$(comment_stamp)"; then
   echo "[FAIL] 读不到 review-pr-ci 评论（gh api 失败），无法建立时间基线，阻断 merge"
@@ -65,7 +67,7 @@ elif [ -n "${ANTHROPIC_FALLBACK_API_KEY:-}" ] && [ -n "${PR_AGENT_FALLBACK_MODEL
     REVIEW_OK=1
   fi
 fi
-# 主备模型同时不可用（或未配 ANTHROPIC_FALLBACK_* secrets）时，下面的 exit 1 会让
+# 主备模型同时不可用（或未配 ANTHROPIC_FALLBACK_* secrets）时，下面的 exit 2 会让
 # pr-review 这条 required check 变红、阻断全仓 merge。
 if [ "$REVIEW_OK" -ne 1 ]; then
   echo "[FAIL] 审查执行失败（主备均不可用），阻断 merge"
