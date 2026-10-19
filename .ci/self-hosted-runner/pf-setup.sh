@@ -61,6 +61,10 @@ for _p in $(python3 "$SCRIPT_DIR/prrlib.py" --guard-ports "$HOST_GW" --exclude "
     BLOCK_TARGETS+=("${HOST_GW}:${_p}")
     [ -n "$HOST_OWN_ADDR" ] && BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}")
 done
+# 放行端口出现在宿主**别的地址**上时必须不通 —— 规则只放行到 $HOST_GW，这一条守着它。
+if [ -n "$HOST_OWN_ADDR" ]; then
+    for _p in $ALLOW_PORTS; do BLOCK_TARGETS+=("${HOST_OWN_ADDR}:${_p}"); done
+fi
 
 # 探针要连网关的两个端口，所以**必须先把服务装起来再跑本脚本**（README 的装法顺序）。
 # 顺序反了的话两个放行靶子必然不通，会把一份正确的规则判成坏的。
@@ -145,7 +149,7 @@ write_rules_subnet() {
 # 放行两个代理端口的 TCP 和 DHCP（免得容器续约失败），其余一律丢。
 # 全部以「源 = 容器网段」为条件，其它网段的容器一条都不匹配。
 pass  quick proto udp from $SUBNET port 68 to any port 67
-pass  quick proto tcp from $SUBNET to any port { $PORTS } flags S/SA keep state
+pass  quick proto tcp from $SUBNET to $HOST_GW port { $PORTS } flags S/SA keep state
 block drop quick from $SUBNET to any
 EOF
     then
@@ -159,7 +163,7 @@ write_rules_iface() {
     sudo tee "$ANCHOR_FILE" >/dev/null <<EOF
 # 备用匹配方式：按接口匹配。只在「按源地址匹配不生效」时用 —— bridge 编号在网络重建后会变。
 pass  quick on $GW_IFACE proto udp from any port 68 to any port 67
-pass  quick on $GW_IFACE proto tcp to any port { $PORTS } flags S/SA keep state
+pass  quick on $GW_IFACE proto tcp to $HOST_GW port { $PORTS } flags S/SA keep state
 block drop quick on $GW_IFACE from any to any
 EOF
     [ -s "$ANCHOR_FILE" ]
@@ -207,9 +211,11 @@ judge() {
     while read -r target result; do
         case "$result" in 通|不通) ;; *) continue ;; esac
         n=$((n + 1))
+        # 只有「宿主机在容器网段上的那个地址 + 放行端口」才算该通；
+        # 同一个端口出现在别的地址上，必须不通。
         is_allow=0
         for p in $ALLOW_PORTS; do
-            case "$target" in *":$p") is_allow=1 ;; esac
+            case "$target" in "$HOST_GW:$p") is_allow=1 ;; esac
         done
         if [ "$is_allow" = 1 ]; then
             [ "$result" = "通" ]   || allow_ok=0
