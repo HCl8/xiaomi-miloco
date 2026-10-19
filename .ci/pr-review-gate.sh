@@ -8,7 +8,7 @@
 # 文件会被当命令执行。故启动前清掉这些文件，只从 base 取回可信版本；调用前须已 fetch origin/main。
 #
 # 用法: pr-review-gate.sh <pr-number> <repo-slug>
-# 退出码: 0=放行；1=不放行（发现严重或重要问题，或基础设施故障——两者都不该 merge）
+# 退出码: 0=放行 / 1=发现严重或重要问题 / 2=基础设施故障（没产出结论；两种都阻断）
 set -uo pipefail
 
 PR_NUMBER="$1"
@@ -43,11 +43,14 @@ SETEOF
 # 跑审查前先记下现有 review-pr-ci 评论的更新时间：这条评论是复用的，"本次没产出"和
 # "产出了结论"只看 body 无法区分，不比对就会把旧结论当本次结果（假绿/假红）。
 comment_stamp() {
-  gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate 2>/dev/null \
-    | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->"))] | last | (.updated_at // "")' 2>/dev/null \
-    || echo ""
+  local body
+  body="$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate 2>/dev/null)" || return 1
+  printf '%s' "$body" | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->"))] | last | (.updated_at // "")' 2>/dev/null || return 1
 }
-STAMP_BEFORE="$(comment_stamp)"
+if ! STAMP_BEFORE="$(comment_stamp)"; then
+  echo "[FAIL] 读不到 review-pr-ci 评论（gh api 失败），无法建立时间基线，阻断 merge"
+  exit 2
+fi
 
 REVIEW_OK=0
 if /usr/local/bin/pr-agent "/review-pr $PR_NUMBER --ci" < /dev/null; then
@@ -66,7 +69,7 @@ fi
 # pr-review 这条 required check 变红、阻断全仓 merge。
 if [ "$REVIEW_OK" -ne 1 ]; then
   echo "[FAIL] 审查执行失败（主备均不可用），阻断 merge"
-  exit 1
+  exit 2
 fi
 
 # gh api 瞬断时回退空串，交给下面的判空分支阻断。
@@ -74,14 +77,17 @@ NOTE_BODY=$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
   | jq -rs 'add | .[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .body') || NOTE_BODY=""
 if [ -z "$NOTE_BODY" ]; then
   echo "[FAIL] 未找到 review-pr-ci 评论（审查结果未产出），阻断 merge"
-  exit 1
+  exit 2
 fi
 
 # 评论必须被本次审查更新过；没更新说明读到的就是旧结论，不能当本次结果用。
-STAMP_AFTER="$(comment_stamp)"
+if ! STAMP_AFTER="$(comment_stamp)"; then
+  echo "[FAIL] 读不到 review-pr-ci 评论（gh api 失败），无法确认本次是否产出结论，阻断 merge"
+  exit 2
+fi
 if [ -z "$STAMP_AFTER" ] || [ "$STAMP_AFTER" = "$STAMP_BEFORE" ]; then
   echo "[FAIL] review-pr-ci 评论未被本次审查更新（本次结果未产出，读到的会是旧结论），阻断 merge"
-  exit 1
+  exit 2
 fi
 
 # 锚定小节标题，避免概述里的提法被误判（review-pr 约定 #### 开头，留 1~4 个 # 余量）。
