@@ -76,7 +76,7 @@ fi
 
 # gh api 瞬断时回退空串，交给下面的判空分支阻断。
 NOTE_BODY=$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-  | jq -rs 'add | .[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .body') || NOTE_BODY=""
+  | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .body] | .[0] // ""') || NOTE_BODY=""
 if [ -z "$NOTE_BODY" ]; then
   echo "[FAIL] 未找到 review-pr-ci 评论（审查结果未产出），阻断 merge"
   exit 2
