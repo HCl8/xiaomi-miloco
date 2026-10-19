@@ -15,7 +15,7 @@ REPO="$3"
 
 # 钉死 head：检出的是 refs/pull/<n>/merge（base 与 PR head 的合并提交），
 # 它的第二个父就是 PR head —— 对不上说明触发之后被换过包
-GOT="$(git rev-parse HEAD^2 2>/dev/null || true)"
+GOT="$(git rev-parse --verify -q HEAD^2 || true)"   # --verify -q：解析失败时回空串，不回显参数
 if [ "$GOT" != "$HEAD_SHA" ]; then
   echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT:-（取不到合并提交的第二个父）}，疑似触发后改包，已中止"
   exit 1
