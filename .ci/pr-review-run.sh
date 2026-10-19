@@ -15,15 +15,14 @@ REPO="$3"
 # 容器 / 不同 runner 的用户不同，工作区所有权会对不上
 git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
 
-# 优先审**合并结果**（base 与 PR head 合出来的提交）：base 前进带出的冲突也会落进审查。
-# PR 有冲突时这个 ref 不存在，退回审 head —— 那种情况下根本没有合并结果可看。
-if git fetch --no-tags origin "refs/pull/$PR_NUMBER/merge" 2>/dev/null; then
-  git checkout --detach FETCH_HEAD >/dev/null 2>&1
-  GOT="$(git rev-parse --verify -q HEAD^2 || true)"   # 合并提交的第二个父就是 PR head
-else
-  echo "::warning::PR 有冲突，取不到合并结果，本次审的是 head"
-  GOT="$(git rev-parse HEAD)"
+# 审的是**合并结果**（base 与 PR head 合出来的提交），base 前进带出的冲突也会落进审查。
+# 有冲突时这个 ref 不存在 —— 没有合并结果可审，直接报错，审 head 没有意义。
+if ! git fetch --no-tags origin "refs/pull/$PR_NUMBER/merge" 2>/dev/null; then
+  echo "::error::PR 有冲突，取不到合并结果（refs/pull/$PR_NUMBER/merge），本次不审查；请先解决冲突"
+  exit 1
 fi
+git checkout --detach FETCH_HEAD >/dev/null 2>&1
+GOT="$(git rev-parse --verify -q HEAD^2 || true)"   # 合并提交的第二个父就是 PR head
 if [ "$GOT" != "$HEAD_SHA" ]; then
   echo "::error::PR head 从触发时的 $HEAD_SHA 变为 ${GOT:-（取不到）}，疑似触发后改包，已中止"
   exit 1
