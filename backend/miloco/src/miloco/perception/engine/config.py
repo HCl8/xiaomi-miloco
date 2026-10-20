@@ -132,6 +132,40 @@ class PersonCropInjectConfig:
 
 
 @dataclass
+class SemanticGateConfig:
+    """二级语义门禁：视觉门禁放行后，问本地 StartLux-Decision sidecar 本窗有没有新事件。
+
+    sidecar 是独立的 MLX 服务（仅 Apple Silicon 可跑），miloco 只走 HTTP，跨平台包不受影响。
+    mode=shadow 只算分写 trace、不改变路由；mode=enforce 才用分数否决本窗。
+    调用失败一律 fail-open（放行），避免 sidecar 挂掉导致感知整体丢事件。
+    """
+
+    enabled: bool = False
+    mode: str = "shadow"  # shadow | enforce
+    base_url: str = "http://127.0.0.1:8090"
+    timeout_sec: float = 10.0
+    # 0.14 ≈ 离线 201 窗上 15/15 召回的工作点（FP 9.1%）；上线后按真实分布再调。
+    min_score: float = 0.14
+    frames: int = 4  # 本窗抽样帧数（不含参考帧）
+    image_short_edge: int = 360
+    jpeg_quality: int = 90
+    max_concurrency: int = 2
+    failure_threshold: int = 3
+    failure_cooldown_sec: float = 60.0
+    # state / instructions 是给用户调的入口：不预设"只看最近最大的人"，按现场机位自行描述。
+    state: str = (
+        "画面共 {n} 张，按时间先后排列。第 1 张是「参考帧」，即上一个窗口的最后一帧；"
+        "第 2 到第 {n} 张是「本窗口」的画面，每秒 1 张。"
+    )
+    instructions: str = (
+        "画面中正在发生的事，跟参考帧相比有变化吗？"
+        "（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）"
+    )
+    true_label: str = "有变化"
+    false_label: str = "没有变化"
+
+
+@dataclass
 class GateConfig:
     check_fps: int = 1
     change_threshold: float = 0.005
@@ -152,6 +186,7 @@ class GateConfig:
     # hold 窗反复续命,期间纯静默窗也被拉起跑下游,浪费 omni 调用。运维侧可在
     # settings.yaml 的 perception.engine.gate.hold_duration_sec 覆盖。
     hold_duration_sec: float = 90.0
+    semantic: SemanticGateConfig = field(default_factory=SemanticGateConfig)
 
 
 @dataclass

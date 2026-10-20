@@ -68,6 +68,8 @@ class GateTiming:
     audio_ms: float
     video_pass: bool
     audio_pass: bool
+    # 视觉原始判定 vs 经二级语义门禁后的有效判定（仅 enforce 且语义否决时二者不同）。
+    video_effective_pass: bool = True
     video_score: float = 0.0
     audio_energy: float = 0.0
     # silero VAD 推理耗时(ms);与 audio_ms(纯 RMS 能量)分开计,避免 gate_audio_ms 语义漂移。
@@ -86,9 +88,18 @@ class GateTiming:
     video_cross_score: float = 0.0
     checked_frame_count: int = 0
 
+    # 二级语义门禁（本地 StartLux sidecar）。semantic_pass 是模型判定（真话），
+    # semantic_veto 是策略结果（enforce 模式下真把本窗拦掉）。
+    semantic_ms: float = 0.0
+    semantic_applied: bool = False
+    semantic_pass: bool = True
+    semantic_score: float = 0.0
+    semantic_veto: bool = False
+    semantic_error: str = ""
+
     @property
     def total_ms(self) -> float:
-        return self.video_ms + self.audio_ms + self.vad_ms
+        return self.video_ms + self.audio_ms + self.vad_ms + self.semantic_ms
 
 
 # =============================================================================

@@ -24,6 +24,7 @@ from miloco.observability.perception_flow import (
 )
 from miloco.perception.engine.config import PerceptionConfig
 from miloco.perception.engine.gate.gate import run_gate
+from miloco.perception.engine.gate.semantic_gate import prepare_reference_frame
 from miloco.perception.engine.identity.identity import run_identity
 from miloco.perception.engine.identity.tracking_service import TrackingService
 from miloco.perception.engine.omni.omni import (
@@ -484,6 +485,7 @@ async def run_batch_pipeline(
     assign_suggestion_link: "Callable[[str, Suggestion, float], bool] | None" = None,
     frame_index_offset: int = 0,
     gate_prev_frames: "dict[str, NDArray[np.uint8]] | None" = None,
+    gate_prev_raw_frames: "dict[str, NDArray[np.uint8]] | None" = None,
     gate_last_visual_pass_ts: "dict[str, float] | None" = None,
     gate_last_audio_pass_ts: "dict[str, float] | None" = None,
     gate_hold_active: "dict[str, bool] | None" = None,
@@ -512,6 +514,9 @@ async def run_batch_pipeline(
                               每窗 cold-start 放行，视觉 gate 永不因静止 skip，
                               hold 也失效。生产流式循环传共享 ``{}``（首窗自动
                               建基准）。
+        gate_prev_raw_frames: per-device 跨窗口**原始彩色**基准帧，只给二级语义门禁
+                              当参考帧（已缩到 image_short_edge）。与上面 448 灰度
+                              基准分开存：灰度图不能喂 VLM。``None``/首窗时跳过语义判定。
         gate_last_visual_pass_ts: 调用方持有的 per-device "visual 最近通过时间戳"
                               字典,喂 gate hold 判定;``None`` 时关闭 hold
                               (等同 on-demand 路径)。
@@ -612,6 +617,10 @@ async def run_batch_pipeline(
         room_timing[f"_device_trace_id_{did}"] = device_trace_id
 
         prev_frame = gate_prev_frames.get(did) if gate_prev_frames is not None else None
+        prev_raw_frame = (
+            gate_prev_raw_frames.get(did)
+            if gate_prev_raw_frames is not None else None
+        )
         last_v = (
             gate_last_visual_pass_ts.get(did)
             if gate_last_visual_pass_ts is not None else None
@@ -626,6 +635,7 @@ async def run_batch_pipeline(
                 prev_frame=prev_frame,
                 last_visual_pass_ts=last_v,
                 last_audio_pass_ts=last_a,
+                prev_raw_frame=prev_raw_frame,
             )
         except asyncio.CancelledError:
             raise
@@ -651,6 +661,16 @@ async def run_batch_pipeline(
                 skipped=True,
                 flow_diagnostics=diagnostics,
             )
+        # 语义参考帧始终推进到"本窗最后一帧"（与 448 灰度基准同一语义：最近实际
+        # 比较过的画面），不论本窗是否放行。只在开启语义门禁时存，省一路全分辨率拷贝。
+        if gate_prev_raw_frames is not None and config.gate.semantic.enabled:
+            video_frames = snapshot.video.frames if snapshot.video else []
+            if video_frames:
+                ref = prepare_reference_frame(
+                    video_frames[-1].data, config.gate.semantic.image_short_edge
+                )
+                if ref is not None:
+                    gate_prev_raw_frames[did] = ref
         if diagnostics is not None:
             diagnostics.gate_checked_frame_count = gate_timing.checked_frame_count
             if last_checked is not None and last_checked.ndim >= 2:
@@ -727,6 +747,15 @@ async def run_batch_pipeline(
         room_timing[f"gate_video_{did}_pass"] = int(gate_timing.video_pass)
         room_timing[f"gate_audio_{did}_pass"] = int(gate_timing.audio_pass)
         room_timing[f"gate_hold_{did}_pass"] = int(gate_timing.hold_opened_window)
+        if config.gate.semantic.enabled:
+            # 非 "_" 前缀 → _merge_results 加 room 前缀 → 落 traces.timing_detail(JSON)，
+            # 不复用 traces_device 固定列，免 DB 迁移。
+            room_timing[f"semantic_{did}_ms"] = gate_timing.semantic_ms
+            room_timing[f"semantic_{did}_applied"] = int(gate_timing.semantic_applied)
+            room_timing[f"semantic_{did}_pass"] = int(gate_timing.semantic_pass)
+            room_timing[f"semantic_{did}_score"] = gate_timing.semantic_score
+            room_timing[f"semantic_{did}_veto"] = int(gate_timing.semantic_veto)
+            room_timing[f"semantic_{did}_error"] = gate_timing.semantic_error
         # "_" 前缀留给 traces_device 有专属列的打分:_merge_results 不加 "{room}/" 前缀,
         # 由 processor._publish_trace 逐 key 显式读。带前缀又没人读的 key 会被
         # timing_detail 的前缀过滤丢掉,写进去等于扔掉。

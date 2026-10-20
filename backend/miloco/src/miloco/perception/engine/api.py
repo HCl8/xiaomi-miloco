@@ -328,6 +328,8 @@ class PerceptionEngine(BasePerceptionEngine):
         self._empty_window_logged: set[str] = set()
         # 上一窗口末次被检帧（gate 预处理后的 448 灰度），visual gate 跨窗口比较用
         self._gate_prev_frames: dict[str, NDArray[np.uint8]] = {}   # key: device_id
+        # 上一窗最后一帧原始彩色（已缩到语义门禁的 image_short_edge），二级语义门禁参考帧
+        self._gate_prev_raw_frames: dict[str, NDArray[np.uint8]] = {}  # key: device_id
         # visual / audio 最近通过的 monotonic ts,喂 gate hold 判定。
         # visual 用于 hold 资格(spec Section 3.1);audio 仅落 traces 不参与判定。
         self._gate_last_visual_pass_ts: dict[str, float] = {}       # key: device_id
@@ -877,6 +879,7 @@ class PerceptionEngine(BasePerceptionEngine):
         self._global_frame_index = 0
         # 旧场景基准帧 vs 新场景首帧的 diff 不代表真实变化,清掉退化为冷启动语义
         self._gate_prev_frames.clear()
+        self._gate_prev_raw_frames.clear()
         # hold 状态机一并清,首通后按 gate.hold_duration_sec(默认 90s)重新起算
         # (原注释写「6min」与配置不符,系历史遗留)
         self._gate_last_visual_pass_ts.clear()
@@ -1165,6 +1168,7 @@ class PerceptionEngine(BasePerceptionEngine):
                 assign_suggestion_link=self.assign_id_and_update_link,
                 frame_index_offset=self._global_frame_index,
                 gate_prev_frames=self._gate_prev_frames,
+                gate_prev_raw_frames=self._gate_prev_raw_frames,
                 gate_last_visual_pass_ts=self._gate_last_visual_pass_ts,
                 gate_last_audio_pass_ts=self._gate_last_audio_pass_ts,
                 gate_hold_active=self._gate_hold_active,

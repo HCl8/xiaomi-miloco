@@ -231,6 +231,61 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "故靠本命令默认的顺手重启生效；带 --no-restart 则改了等于没改）。本命令写的是 "
         "config.json，本机从此固定读它，后续发版改 yaml 对本机不再生效",
     ),
+    # 二级语义门禁（本地 StartLux sidecar）。state / instructions 是给现场调机位的入口，
+    # 不预设"只看最近最大的人"；改完重启后端生效。
+    "perception.engine.gate.semantic.enabled": (
+        bool,
+        False,
+        "二级语义门禁总开关：视觉门禁放行后再问本地 StartLux sidecar 本窗有没有新事件，"
+        "重启生效；sidecar 不可达时自动 fail-open（放行）",
+    ),
+    "perception.engine.gate.semantic.mode": (
+        str,
+        "shadow",
+        "shadow=只算分写 traces.timing_detail、不改变路由；enforce=分数不过阈值就拦本窗，重启生效",
+    ),
+    "perception.engine.gate.semantic.base_url": (
+        str,
+        "http://127.0.0.1:8090",
+        "StartLux sidecar 的 HTTP 地址（容器内访问宿主要用宿主桥 IP），重启生效",
+    ),
+    "perception.engine.gate.semantic.timeout_sec": (
+        float,
+        10.0,
+        "单次语义判定超时（秒）；超时按 fail-open 放行，重启生效",
+    ),
+    "perception.engine.gate.semantic.min_score": (
+        float,
+        0.14,
+        "P(有变化) 阈值；离线 201 窗上 0.14 ≈ 15/15 召回（负样本误报 9.1%），重启生效",
+    ),
+    "perception.engine.gate.semantic.frames": (
+        int,
+        4,
+        "本窗抽样帧数（不含参考帧），重启生效",
+    ),
+    "perception.engine.gate.semantic.state": (
+        str,
+        "画面共 {n} 张，按时间先后排列。第 1 张是「参考帧」，即上一个窗口的最后一帧；"
+        "第 2 到第 {n} 张是「本窗口」的画面，每秒 1 张。",
+        "送给模型的场景描述（{n} 会替换成图片张数）；按机位自己写主体/关注点，重启生效",
+    ),
+    "perception.engine.gate.semantic.instructions": (
+        str,
+        "画面中正在发生的事，跟参考帧相比有变化吗？"
+        "（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）",
+        "送给模型的判定问题；改这里即可换判据，重启生效",
+    ),
+    "perception.engine.gate.semantic.true_label": (
+        str,
+        "有变化",
+        "判定问题的 true 选项文案，重启生效",
+    ),
+    "perception.engine.gate.semantic.false_label": (
+        str,
+        "没有变化",
+        "判定问题的 false 选项文案，重启生效",
+    ),
     "perception.collect.window_size": (
         int,
         4,

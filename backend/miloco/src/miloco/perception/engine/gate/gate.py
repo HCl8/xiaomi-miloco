@@ -12,6 +12,10 @@ from numpy.typing import NDArray
 
 from miloco.perception.engine.config import GateConfig
 from miloco.perception.engine.gate.audio_gate import evaluate_audio
+from miloco.perception.engine.gate.semantic_gate import (
+    SemanticEvalResult,
+    evaluate_semantic,
+)
 from miloco.perception.engine.gate.speech_vad import evaluate_speech
 from miloco.perception.engine.gate.visual_gate import evaluate_visual
 from miloco.perception.engine.types import (
@@ -31,6 +35,7 @@ async def run_gate(
     prev_frame: NDArray[np.uint8] | None = None,
     last_visual_pass_ts: float | None = None,
     last_audio_pass_ts: float | None = None,
+    prev_raw_frame: NDArray[np.uint8] | None = None,
 ) -> tuple[
     GatePacket | None,
     GateTiming,
@@ -48,6 +53,10 @@ async def run_gate(
     ``knowledge/03-features/perception-pipeline.md`` 的 Gate 小节。
 
     on-demand 单次调用路径不传两 ts(默认 None),hold 自然关闭。
+
+    ``prev_raw_frame`` 是上窗最后一帧的原始彩色图,只给二级语义门禁当参考帧;不传则本窗
+    跳过语义判定(首窗/cold-start)。语义结果在 ``mode=enforce`` 且未过阈值时把
+    ``visual_effective`` 置假,``mode=shadow`` 只记分不改变路由。
     """
     t = time.monotonic()
     visual = evaluate_visual(
@@ -57,6 +66,21 @@ async def run_gate(
     visual_score = visual.max_score
     last_checked = visual.last_checked
     video_ms = (time.monotonic() - t) * 1000
+
+    # 二级语义门禁：只在视觉放行时判（视觉没放行的窗本来就不会调 omni）。
+    # 失败/熔断时 applied=False，visual_effective 保持原样 = fail-open。
+    semantic = SemanticEvalResult()
+    if config.semantic.enabled and visual_changed and input_slice.frames:
+        semantic = await evaluate_semantic(
+            input_slice.frames, prev_raw_frame, config.semantic
+        )
+    semantic_veto = (
+        visual_changed
+        and semantic.applied
+        and config.semantic.mode == "enforce"
+        and not semantic.passed
+    )
+    visual_effective = visual_changed and not semantic_veto
 
     t = time.monotonic()
     audio_active, audio_energy = evaluate_audio(input_slice.audio_clip, config)
@@ -74,15 +98,15 @@ async def run_gate(
     vad_ms = (time.monotonic() - t) * 1000
 
     now = time.monotonic()
-    any_pass = visual_changed or audio_active
+    any_pass = visual_effective or audio_active
     hold_active = (
-        not visual_changed
+        not visual_effective
         and last_visual_pass_ts is not None
         and config.hold_duration_sec > 0
         and (now - last_visual_pass_ts) <= config.hold_duration_sec
     )
 
-    new_last_visual_pass_ts = now if visual_changed else last_visual_pass_ts
+    new_last_visual_pass_ts = now if visual_effective else last_visual_pass_ts
     new_last_audio_pass_ts = now if audio_active else last_audio_pass_ts
 
     # 无帧时 hold 不放行:零帧包会一路走到 omni 却拼不出 video 块,模型只能照 schema 编场景。
@@ -91,6 +115,7 @@ async def run_gate(
     timing = GateTiming(
         video_ms=video_ms, audio_ms=audio_ms,
         video_pass=visual_changed, audio_pass=audio_active,
+        video_effective_pass=visual_effective,
         video_score=visual_score, audio_energy=audio_energy,
         vad_ms=vad_ms, speech_prob=speech_prob,
         hold_pass=hold_active,
@@ -98,6 +123,13 @@ async def run_gate(
         video_intra_score=visual.intra_max,
         video_cross_score=visual.cross_max,
         checked_frame_count=visual.checked_frame_count,
+
+        semantic_ms=semantic.latency_ms,
+        semantic_applied=semantic.applied,
+        semantic_pass=semantic.passed,
+        semantic_score=semantic.score,
+        semantic_veto=semantic_veto,
+        semantic_error=semantic.error,
     )
 
     if not any_pass and not hold_opens_window:
@@ -108,7 +140,7 @@ async def run_gate(
         room_name=input_slice.room_name,
         timestamp=input_slice.end_timestamp,
         trigger=GateTrigger(
-            visual_changed=visual_changed,
+            visual_changed=visual_effective,
             visual_change_score=visual_score,
             audio_active=audio_active,
             audio_energy_level=audio_energy,

@@ -143,6 +143,28 @@ perception:
       # 0 = 关闭 hold。过长在画面间歇有变化的场景会持续续命窗口、期间静默窗也被
       # 拉起跑下游 omni,浪费调用;过短则人短暂静止时 video 路由会切走。
       hold_duration_sec: 90
+      # 二级语义门禁(本地 StartLux-Decision sidecar,仅 Apple Silicon)。视觉门禁放行后
+      # 再问一次"本窗有没有新事件",决定要不要调 omni。默认关;sidecar 不可达时调用失败
+      # 会自动 fail-open(放行),不会导致漏事件。
+      semantic:
+        enabled: false
+        # shadow = 只算分写 traces.timing_detail,不改变路由;enforce = 分数不过阈值就拦。
+        mode: shadow
+        base_url: "http://127.0.0.1:8090"
+        timeout_sec: 10.0
+        # 0.14 ≈ 离线 201 窗上 15/15 召回的工作点(FP 9.1%)。上线后按真实分布再调。
+        min_score: 0.14
+        frames: 4              # 本窗抽样帧数(不含参考帧)
+        image_short_edge: 360
+        jpeg_quality: 90
+        max_concurrency: 2     # 多相机同时判时,sidecar 侧串行避免 Metal 争用
+        failure_threshold: 3
+        failure_cooldown_sec: 60
+        # 下面三行是给现场调的入口:不预设"只看最近最大的人",按机位自己描述主体/场景。
+        state: "画面共 {n} 张，按时间先后排列。第 1 张是「参考帧」，即上一个窗口的最后一帧；第 2 到第 {n} 张是「本窗口」的画面，每秒 1 张。"
+        instructions: "画面中正在发生的事，跟参考帧相比有变化吗？（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）"
+        true_label: "有变化"
+        false_label: "没有变化"
     identity:
       # mock | real | deep_sort —— v1.2 主动注册默认 deep_sort,DeepSORT 内置
       # ReID 关联,跟踪更稳;额外暴露 Track.features deque 给陌生人池零额外推理
