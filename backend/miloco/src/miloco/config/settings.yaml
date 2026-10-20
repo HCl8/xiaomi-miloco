@@ -165,6 +165,14 @@ perception:
         instructions: "画面中正在发生的事，跟参考帧相比有变化吗？（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）"
         true_label: "有变化"
         false_label: "没有变化"
+      # 一级门禁窗口留存：过视觉门禁的窗口存 mp4 + meta，供离线分析。
+      # 只写容器内暂存目录，宿主归档由同步脚本负责；max_disk_gb 是暂存上限。
+      dump:
+        enabled: false
+        dir: ""                # 空 = $MILOCO_HOME/gate_dumps
+        max_disk_gb: 1.0
+        short_edge: 512
+        include_audio: true
     identity:
       # mock | real | deep_sort —— v1.2 主动注册默认 deep_sort,DeepSORT 内置
       # ReID 关联,跟踪更稳;额外暴露 Track.features deque 给陌生人池零额外推理

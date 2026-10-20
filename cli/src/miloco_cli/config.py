@@ -286,6 +286,32 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "没有变化",
         "判定问题的 false 选项文案，重启生效",
     ),
+    # 一级门禁窗口留存（过视觉门禁的窗口存 mp4 + meta，供离线分析）
+    "perception.engine.gate.dump.enabled": (
+        bool,
+        False,
+        "一级门禁窗口留存开关：过视觉门禁的窗口存 mp4 + meta.json，重启生效",
+    ),
+    "perception.engine.gate.dump.dir": (
+        str,
+        "",
+        "留存暂存目录；空 = $MILOCO_HOME/gate_dumps，重启生效",
+    ),
+    "perception.engine.gate.dump.max_disk_gb": (
+        float,
+        1.0,
+        "留存暂存上限（GB）；超了停写并告警，重启生效",
+    ),
+    "perception.engine.gate.dump.short_edge": (
+        int,
+        512,
+        "留存 mp4 编码短边像素，重启生效",
+    ),
+    "perception.engine.gate.dump.include_audio": (
+        bool,
+        True,
+        "留存 mp4 是否带音频，重启生效",
+    ),
     "perception.collect.window_size": (
         int,
         4,

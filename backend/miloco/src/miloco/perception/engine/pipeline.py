@@ -23,6 +23,7 @@ from miloco.observability.perception_flow import (
     PerDeviceFlowDiagnostics,
 )
 from miloco.perception.engine.config import PerceptionConfig
+from miloco.perception.engine.gate.dump import dump_gate_window
 from miloco.perception.engine.gate.gate import run_gate
 from miloco.perception.engine.gate.semantic_gate import prepare_reference_frame
 from miloco.perception.engine.identity.identity import run_identity
@@ -671,6 +672,26 @@ async def run_batch_pipeline(
                 )
                 if ref is not None:
                     gate_prev_raw_frames[did] = ref
+        # 一级门禁放行的窗口留存（供离线分析语义门禁）；编码放线程里，失败不影响感知。
+        if config.gate.dump.enabled and gate_timing.video_pass:
+            dump_frames = (
+                [f.data for f in snapshot.video.frames] if snapshot.video else []
+            )
+            if dump_frames:
+                await asyncio.to_thread(
+                    dump_gate_window,
+                    did=did,
+                    room_name=room_name,
+                    start_ms=snapshot.start_timestamp,
+                    end_ms=snapshot.end_timestamp,
+                    frames=dump_frames,
+                    prev_raw_frame=prev_raw_frame,
+                    audio_clip=snapshot.audio_clip,
+                    sample_rate=snapshot.sample_rate,
+                    fps=config.input.fps,
+                    timing=gate_timing,
+                    config=config.gate.dump,
+                )
         if diagnostics is not None:
             diagnostics.gate_checked_frame_count = gate_timing.checked_frame_count
             if last_checked is not None and last_checked.ndim >= 2:

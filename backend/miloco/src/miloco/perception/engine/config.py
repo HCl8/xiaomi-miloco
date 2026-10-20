@@ -132,6 +132,21 @@ class PersonCropInjectConfig:
 
 
 @dataclass
+class GateDumpConfig:
+    """一级门禁窗口留存：过了视觉门禁的窗口存 mp4 + meta，供离线分析。
+
+    只写容器内暂存目录（dir），宿主归档由同步脚本负责；max_disk_gb 是暂存上限，
+    超了停写并告警，不会把容器盘写满。
+    """
+
+    enabled: bool = False
+    dir: str = ""  # 空 = $MILOCO_HOME/gate_dumps
+    max_disk_gb: float = 1.0  # 容器内暂存上限；宿主归档另由同步脚本控制
+    short_edge: int = 512
+    include_audio: bool = True
+
+
+@dataclass
 class SemanticGateConfig:
     """二级语义门禁：视觉门禁放行后，问本地 StartLux-Decision sidecar 本窗有没有新事件。
 
@@ -187,6 +202,7 @@ class GateConfig:
     # settings.yaml 的 perception.engine.gate.hold_duration_sec 覆盖。
     hold_duration_sec: float = 90.0
     semantic: SemanticGateConfig = field(default_factory=SemanticGateConfig)
+    dump: GateDumpConfig = field(default_factory=GateDumpConfig)
 
 
 @dataclass

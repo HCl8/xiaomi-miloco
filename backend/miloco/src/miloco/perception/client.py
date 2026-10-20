@@ -445,6 +445,7 @@ class PerceptionEngineProxy:
         """构建 PerceptionConfig 并创建引擎实例。"""
         from miloco.perception.engine.config import (
             GateConfig,
+            GateDumpConfig,
             IdentityConfig,
             OmniConfig,
             PerceptionConfig,
@@ -463,10 +464,11 @@ class PerceptionEngineProxy:
 
         gate_cfg = dict(engine_cfg.get("gate", {}))
         semantic_cfg = SemanticGateConfig(**gate_cfg.pop("semantic", {}))
+        dump_cfg = GateDumpConfig(**gate_cfg.pop("dump", {}))
 
         config = PerceptionConfig(
             input=InputConfig(**engine_cfg.get("input", {})),
-            gate=GateConfig(**gate_cfg, semantic=semantic_cfg),
+            gate=GateConfig(**gate_cfg, semantic=semantic_cfg, dump=dump_cfg),
             identity=IdentityConfig(**identity_kwargs),
             omni=OmniConfig(**omni_kwargs),
             identity_engine=identity_engine_cfg,
