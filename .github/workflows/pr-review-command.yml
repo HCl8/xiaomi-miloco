@@ -146,16 +146,13 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # 只放标签：模型名在宿主机的网关配置里，容器只发 a / b
       matrix:
         include:
           - tag: a
-            model: deepseek/deepseek-flash
           - tag: b
-            model: xiaomi/mimo-v2.6-pro
     env:
       GH_TOKEN: ${{ github.token }}
-      # 覆盖启动器注入的那份，两个 job 各跑各的模型
-      PR_AGENT_MODEL: ${{ matrix.model }}
       PRR_REVIEW_TAG: ${{ matrix.tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -177,20 +174,12 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'cloud'
     runs-on: ubuntu-latest
-    # 同样与自托管审查共用组（带 tag）：路由判完之后又推了新 commit 时，后来的那条取消这条，
-    # 不会出现云端与自托管两条同时写同一条评论和同一个 status。
+    # 自托管那边按 tag 分成了两个组，云端这条不再与它们同名。互斥由 authorize 里的
+    # 「取消并等停所有自托管任务」保证：这条起来时，同 PR 上已经没有自托管任务在跑。
     concurrency:
-      group: pr-review-selfhosted-${{ github.event.issue.number }}-${{ matrix.tag }}
+      group: pr-review-cloud-${{ github.event.issue.number }}
       cancel-in-progress: true
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - tag: a
-            model: deepseek/deepseek-flash
-          - tag: b
-            model: xiaomi/mimo-v2.6-pro
     container:
       # 镜像跟着所属仓库走（由 build-image.yml 推）。仓库名可能带大写，而 ghcr 路径必须
       # 小写，表达式没法转换，所以用仓库变量覆盖；没设时落到上游那份（公开可拉）。
@@ -201,9 +190,10 @@ jobs:
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-      # 模型名走 matrix（云端没有启动器注入，这里是唯一来源）
-      PR_AGENT_MODEL: ${{ matrix.model }}
-      PRR_REVIEW_TAG: ${{ matrix.tag }}
+      # 云端是兜底路径，只跑一个模型；模型名走 vars（云端没有宿主网关做别名替换）。
+      PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL }}
+      # 但结论要同时打到两条 required check 上，否则兜底跑完 merge 仍然被卡。
+      PRR_STATUS_CONTEXTS: pr-review-a,pr-review-b
       ANTHROPIC_FALLBACK_API_KEY: ${{ secrets.ANTHROPIC_FALLBACK_API_KEY }}
       ANTHROPIC_FALLBACK_BASE_URL: ${{ secrets.ANTHROPIC_FALLBACK_BASE_URL }}
       PR_AGENT_FALLBACK_MODEL: ${{ vars.PR_AGENT_FALLBACK_MODEL }}

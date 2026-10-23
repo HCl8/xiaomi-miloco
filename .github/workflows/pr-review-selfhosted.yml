@@ -32,20 +32,19 @@ jobs:
     strategy:
       # 一个模型挂了不能顺带取消另一个 —— 两份结论要各自独立成立
       fail-fast: false
+      # 只放标签，不放模型名：模型名会出现在 job 名称和日志里，而这里是公开仓库。
+      # 真名在宿主机的网关配置（model_aliases）里，容器只发 a / b。
       matrix:
         include:
           - tag: a
-            model: deepseek/deepseek-flash
           - tag: b
-            model: xiaomi/mimo-v2.6-pro
     # 同一 PR + 同一个模型只留最新。组名带上 tag，两个模型互不取消；
     # 与线上那份（pr-review-<号>）也必须不同名，那条保持停用。
     concurrency:
       group: pr-review-selfhosted-${{ github.event.pull_request.number }}-${{ matrix.tag }}
       cancel-in-progress: true
     env:
-      # job 级 env 优先于启动器注入容器的那份，两个 job 因此各跑各的模型
-      PR_AGENT_MODEL: ${{ matrix.model }}
+      # 只传标签：门禁据此选模型别名、决定评论标记和 status context
       PRR_REVIEW_TAG: ${{ matrix.tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
