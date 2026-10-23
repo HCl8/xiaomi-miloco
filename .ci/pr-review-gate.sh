@@ -28,8 +28,9 @@ if [ -n "$TAG" ]; then
   # 模型真名不进容器：自托管侧这里只填别名（a/b），由宿主代理换成真名；
   # 云端没有代理，靠 PR_AGENT_MODEL_<TAG> 注入（secrets，日志里会被打码）。
   # 真实模型名一旦以环境变量形式留在容器里，被诱导的 agent 跑 `env` 就能公开它。
+  # 自托管侧用 "<别名>[1m]"：CLI 靠这个后缀按 1M 上下文估算，网关替换别名时会把方括号剥掉。
   _v="PR_AGENT_MODEL_${TAG_U}"
-  export PR_AGENT_MODEL="${!_v:-$TAG}"
+  export PR_AGENT_MODEL="${!_v:-${TAG}[1m]}"
 fi
 
 # 取可信文件依赖 origin/main；调用方通常已 fetch，这里保底一次以支持脚本独立运行。
