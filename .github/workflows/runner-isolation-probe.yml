@@ -1,0 +1,26 @@
+name: Runner Isolation Probe
+
+# 目的：把「任务跑在一次性容器里、碰不到宿主以外的网络」变成可自行运行的检查。
+# 只留维护者能发起的触发方式，绝不接 pull_request_target —— 否则外部人就能
+# 往自托管 runner 投递任务。
+on:
+  workflow_dispatch:
+  push:
+    branches: [prr-smoke]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    # 认专属标签，避免被 GitHub 托管的机器接走
+    runs-on: [self-hosted, prr-test]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # 断言只有一份，在 .ci/self-hosted-runner/probe.sh。这里刻意不传任何环境变量：
+      # 靶子（网关地址、两个代理端口）的取值只在脚本里写一份，避免两处漂移。
+      # 换部署网段时改脚本顶部的默认值（或临时用环境变量覆盖），不用动 workflow。
+      - name: 逐条断言
+        run: bash .ci/self-hosted-runner/probe.sh
