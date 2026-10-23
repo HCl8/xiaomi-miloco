@@ -50,7 +50,7 @@ render_command() {   # render_command <页脚里那段的文字>
   git show "origin/main:.agents/commands/review-pr.md" \
     | sed "s#XiaoMi/xiaomi-miloco#${REPO}#g" \
     | sed "s#<!-- review-pr-ci -->#${MARKER}#g" \
-    | sed "s@^## \[PR #@${TITLE_PREFIX}## [PR #@" \
+    | sed "s@^## \[PR #@## ${TITLE_PREFIX}[PR #@" \
     | sed "s#生成</sub>#生成${1}</sub>#" \
     > .claude/commands/review-pr.md
 }

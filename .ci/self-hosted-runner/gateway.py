@@ -8,6 +8,7 @@ import argparse
 import http.client
 import json
 import logging
+import re
 import selectors
 import signal
 import socket
@@ -30,6 +31,7 @@ MODEL_UPSTREAM = None
 MODEL_REAL_KEY = None
 MODEL_EXPECT_TOKEN = None
 MODEL_ALIASES = {}
+MODEL_ALIAS_REV = {}
 
 _stopping = False
 
@@ -240,6 +242,49 @@ def _apply_model_alias(body):
     return json.dumps(data, ensure_ascii=False).encode()
 
 
+def _build_alias_rev(aliases):
+    """{真名: 别名}。上游回显的 model 常常去掉了 provider 前缀，两种都收。"""
+    rev = {}
+    for alias, real in aliases.items():
+        rev[real] = alias
+        rev.setdefault(real.rsplit("/", 1)[-1], alias)
+    return rev
+
+
+class _ModelScrubber:
+    """把上游响应里的真实模型名换回别名。
+
+    CLI 会把响应里的 model 字段原样写进 ~/.claude/projects/*.jsonl，agent 一条 jq 就能读到
+    真名——只改请求侧挡不住。按行处理：SSE 每帧以换行结尾，普通 JSON 只有一行。
+    """
+
+    def __init__(self, rev):
+        self.rev = rev
+        self.buf = b""
+        self.pattern = None
+        if rev:
+            names = sorted(rev, key=len, reverse=True)
+            alt = b"|".join(re.escape(n.encode()) for n in names)
+            self.pattern = re.compile(rb'("model"\s*:\s*")(%s)(")' % alt)
+
+    def _fix(self, line):
+        return self.pattern.sub(
+            lambda m: m.group(1) + self.rev[m.group(2).decode()].encode() + m.group(3), line)
+
+    def feed(self, chunk, final=False):
+        if not self.pattern:
+            return chunk
+        self.buf += chunk
+        out = []
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            out.append(self._fix(line) + b"\n")
+        if final and self.buf:
+            out.append(self._fix(self.buf))
+            self.buf = b""
+        return b"".join(out)
+
+
 class ModelProxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "prr-gw-model"
@@ -315,13 +360,20 @@ class ModelProxy(BaseHTTPRequestHandler):
         # 不给 Content-Length：靠 close 划界，这样 SSE 是一段段流出来的
         self.send_header("Connection", "close")
         self.end_headers()
+        scrubber = _ModelScrubber(MODEL_ALIAS_REV)
         try:
             while True:
                 # 必须用 read1：read(n) 会阻塞到攒够 n 字节，SSE 就会一坨一坨地到。
                 chunk = resp.read1(8192)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                out = scrubber.feed(chunk)
+                if out:
+                    self.wfile.write(out)
+                    self.wfile.flush()
+            tail = scrubber.feed(b"", final=True)
+            if tail:
+                self.wfile.write(tail)
                 self.wfile.flush()
         except OSError:
             pass
@@ -341,7 +393,7 @@ def _on_signal(signum, _frame):
 
 
 def main():
-    global ALLOWED_NETS, MODEL_UPSTREAM, MODEL_REAL_KEY, MODEL_EXPECT_TOKEN, MODEL_ALIASES
+    global ALLOWED_NETS, MODEL_UPSTREAM, MODEL_REAL_KEY, MODEL_EXPECT_TOKEN, MODEL_ALIASES, MODEL_ALIAS_REV
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="~/prreview/prreview.json")
@@ -365,6 +417,7 @@ def main():
     MODEL_EXPECT_TOKEN = prrlib.read_secret(cfg["container_token_file"])
     # 别名表：容器只发别名，真名在这里换。只打条数，不打内容。
     MODEL_ALIASES = {str(k): str(v) for k, v in (cfg.get("model_aliases") or {}).items()}
+    MODEL_ALIAS_REV = _build_alias_rev(MODEL_ALIASES)
     if MODEL_ALIASES:
         LOG.info("模型别名：已配置 %d 条", len(MODEL_ALIASES))
 
