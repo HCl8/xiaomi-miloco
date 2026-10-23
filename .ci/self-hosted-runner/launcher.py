@@ -7,6 +7,7 @@
 """
 
 import argparse
+import calendar
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import ghapp
 import prrlib
 
 CONTAINER = os.environ.get("PRR_CONTAINER_BIN", "/usr/local/bin/container")
@@ -45,13 +47,18 @@ def _on_signal(signum, _frame):
 
 REQUIRED = (
     "image", "network", "host_gateway", "github_proxy_port", "model_proxy_port",
-    "github_repo", "github_token_file",
+    "github_repo",
 )
 
 
 def load_config(path):
     """读 JSON 配置。缺必填项就直接退出——启动器在一个错配置上转圈没有意义。"""
     cfg = prrlib.load_json_config(path, required=REQUIRED)
+    # 两种凭据二选一：GitHub App（推荐，私钥现签、token 一小时失效）或长期 token 文件。
+    if not cfg.get("github_app_id") and not cfg.get("github_token_file"):
+        raise SystemExit("凭据没配：github_app_id（推荐）或 github_token_file，二选一")
+    if cfg.get("github_app_id") and not cfg.get("github_app_private_key_file"):
+        raise SystemExit("配了 github_app_id 就必须给 github_app_private_key_file")
     cfg.setdefault("cpus", 4)
     cfg.setdefault("memory", "4g")
     cfg.setdefault("idle_recycle_seconds", 3000)   # 50 分钟，留足余量给 1 小时的凭据
@@ -72,7 +79,8 @@ def load_config(path):
     # 定期清理：容器 churn 快（镜像与快照会持续堆积），一小时清一次
     cfg.setdefault("maintenance_interval_seconds", 3600)
     # JSON 里写不了 ~，所以路径字段在这里统一展开
-    for key in ("log_dir", "github_token_file", "container_token_file"):
+    for key in ("log_dir", "github_token_file", "container_token_file",
+                "github_app_private_key_file"):
         if cfg.get(key):
             cfg[key] = prrlib.expand(cfg[key])
     return cfg
@@ -144,13 +152,60 @@ def check_gateway(cfg):
 
 # ---------------------------------------------------------------- 凭据
 
+# App 的 installation token 只有一小时，这里缓存到过期前 10 分钟再换。池子常驻，每次现签
+# 既浪费也更容易撞限流。
+_app_token = {"value": None, "expires": 0.0}
+
+
+def check_app_key(cfg):
+    """私钥是这套里最值钱的文件：权限不对就不干活。
+
+    同组/其他人可读等于已经泄露，此时启动只会让人以为一切正常。
+    """
+    path = Path(cfg["github_app_private_key_file"])
+    if not path.is_file():
+        raise SystemExit("找不到 GitHub App 私钥：%s" % path)
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        raise SystemExit("GitHub App 私钥 %s 权限是 0o%o，必须是 600" % (path, mode))
+
+
+def get_token(cfg):
+    """给 runner 管理接口用的 GitHub token。
+
+    配了 App 就现签一枚，否则退回长期 token 文件。**两条路不自动降级**：配了 App 却签不出来
+    就直接抛错——悄悄改用旧 token 会把"私钥失效"这类问题一直掩盖到出事。
+    """
+    if not cfg.get("github_app_id"):
+        return prrlib.read_secret(cfg["github_token_file"])
+
+    if _app_token["value"] and _app_token["expires"] - time.time() > 600:
+        return _app_token["value"]
+
+    token, payload = ghapp.installation_token(
+        cfg["github_app_id"],
+        cfg["github_app_private_key_file"],
+        cfg.get("github_app_installation_id"),
+    )
+    expires = time.time() + 3600                      # 解析不出来时按一小时算
+    raw = payload.get("expires_at")
+    if isinstance(raw, str):
+        try:
+            expires = calendar.timegm(time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            pass
+    _app_token.update(value=token, expires=expires)
+    log.info("换了新的 App token（%s 过期）", raw or "约一小时后")
+    return token
+
+
 def mint_jit(cfg, name=None):
     """要一份一次性登记凭据（跑在宿主机：容器没有直连 api.github.com 的路由）。
 
     name 用容器名，GitHub 上的 runner 记录才能和容器一一对上，强杀留下的记录才清得掉。
     凭据只作为返回值在内存里流动，不写文件也不打日志。
     """
-    token = Path(cfg["github_token_file"]).read_text().strip()
+    token = get_token(cfg)
     body = json.dumps({
         "name": name or ("%s-%d" % (cfg["name_prefix"], int(time.time()))),
         "runner_group_id": cfg["runner_group_id"],
@@ -403,9 +458,8 @@ def _list_runners(base, headers, timeout=30):
 
 
 def _runners_api(cfg):
-    token = Path(cfg["github_token_file"]).read_text().strip()
     base = "%s/repos/%s/actions/runners" % (GITHUB_API, cfg["github_repo"])
-    headers = {"Authorization": "Bearer " + token,
+    headers = {"Authorization": "Bearer " + get_token(cfg),
                "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
     return base, headers
@@ -420,10 +474,10 @@ def forget_runners(cfg, names):
     names = set(names)
     if not names:
         return
-    base, headers = _runners_api(cfg)
     try:
+        base, headers = _runners_api(cfg)
         runners = _list_runners(base, headers, timeout=20)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
         log.warning("查 runner 记录失败，这几条留到定期清理再收：%s", exc)
         return
     hit = [r for r in runners if r.get("name") in names]
@@ -464,10 +518,10 @@ def cleanup_runner_records(cfg):
     if live is None:
         log.warning("拿不到容器清单，跳过 runner 记录清理")
         return
-    base, headers = _runners_api(cfg)
     try:
+        base, headers = _runners_api(cfg)
         runners = _list_runners(base, headers)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
         log.warning("查 runner 记录失败：%s", exc)
         return
 
@@ -696,6 +750,13 @@ def main():
             logging.StreamHandler(sys.stderr),
         ],
     )
+
+    if cfg.get("github_app_id"):
+        check_app_key(cfg)
+        log.info("GitHub 凭据：App %s（installation %s）", cfg["github_app_id"],
+                 cfg.get("github_app_installation_id") or "自动发现")
+    else:
+        log.info("GitHub 凭据：长期 token 文件 %s", cfg["github_token_file"])
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)

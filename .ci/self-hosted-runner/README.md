@@ -22,13 +22,15 @@ prreview/
 │                             18080 按域名白名单转发 GitHub
 │                             18081 把假钥匙换成真 key 后转发模型
 ├── launcher.py             启动器：池子 + 启动前自检 + 内存准入 + 定期清理
+├── ghapp.py                GitHub App 凭据：私钥签 JWT → 换 installation token（也可单独跑来自检）
 ├── pull_image.py           从 ghcr 取镜像（public 包，不需要 registry 凭据）
 ├── pf-setup.sh             装宿主机侧出口过滤（容器只能到宿主机）
 ├── prreview.example.json   配置模板，拷成 prreview.json 再改（不含凭据）
 ├── probe.sh                隔离探针（可手工跑，也可以在 workflow 里跑）
-├── install-launchd.sh      装两个 LaunchAgent（gateway + launcher）
+├── install-launchd.sh      装三个 LaunchAgent（container 服务自启 + gateway + launcher）
 ├── secrets/                chmod 600，全部不进 git
-│   ├── github-token        能申请 runner 登记凭据的那把凭据
+│   ├── github-app.pem      GitHub App 私钥（推荐，见下「凭据来源」）
+│   ├── github-token        长期凭据（不配 App 时才用）
 │   ├── model-key           模型真 key（只在宿主机网关手里）
 │   └── container-token     给容器的假钥匙
 └── logs/
@@ -70,11 +72,45 @@ prreview/
    （这一步必须在装出口过滤**之前**：`pf-setup.sh` 的探针要连网关那两个端口，网关没起来
    时两个「应当能通」的靶子必然不通，会把一份正确的规则判成坏的。）
 
+   顺带装上 `com.prreview.container-system`：Apple container 的服务不是登录项，机器重启
+   或重新登录后不会自己回来，而启动器的出口自检要起容器，会一直报
+   `XPC connection error` 并停掉待命容器。这条 agent 在登录时补一次 `container system start`。
+
 6. **装出口过滤**（关键，见下节）：`bash ~/prreview/pf-setup.sh`
    然后 `bash ~/prreview/pf-setup.sh --persist`（macOS 开机不自动启用 pf）
 
    这一步之前启动器是**故意不干活**的：它起容器前会检查"容器还够不够得着宿主机上与本方案
    无关的端口"，够得着说明这层还没装，于是停掉待命容器、不再起新的并报警。
+
+## 凭据来源（App 或长期 token，二选一）
+
+仓库级的 runner 接口要仓库 Admin 权限。用长期 token 实现这一点，等于在这台机器上放一把
+"能改整个仓库设置"的钥匙；换成 **GitHub App** 可以把口径收到仓库内、且钥匙一小时就失效。
+
+配了 `github_app_id` 就走 App，否则读 `github_token_file`。**两条路不自动降级**：App 签不出来
+就报错，免得私钥失效被"悄悄改用旧 token"一直掩盖。
+
+建 App（网页操作，只能由账号持有人做）：
+
+1. Settings → Developer settings → GitHub Apps → New。Homepage URL 必填，Webhook **不要**勾。
+2. Repository permissions **只勾 `Administration: Read and write`**，其余保持 No access。
+   不要勾 `Contents` / `Workflows` —— 少了这两项，这枚 token 推不了代码、也改不了流水线。
+3. 记下 **App ID**；**Generate a private key**，把下载的 `.pem` 放到 `secrets/github-app.pem`（600）。
+4. Install App → 选 Only select repositories → 勾目标仓。
+
+配置里加三项（`github_app_installation_id` 可省，只有一处安装时自动发现）：
+
+```json
+"github_app_id": 12345,
+"github_app_private_key_file": "~/prreview/secrets/github-app.pem",
+```
+
+装完先单独验一次，不用改启动器：
+
+```bash
+python3 ~/prreview/ghapp.py --app-id 12345 --key ~/prreview/secrets/github-app.pem \
+  --check --repo owner/name
+```
 
 ## 出口过滤的必要性
 
@@ -101,8 +137,8 @@ block drop quick from 192.168.100.0/24 to any
 - **出口过滤依赖 pf 一直在位**。规则本身由 `/etc/pf.anchors/prreview` 提供、`/etc/pf.conf` 引用，
   开机生效要装 `--persist` 那个 LaunchDaemon。`launcher.py` 有自检兜底（封不住就不起容器），
   但那是发现，不是阻止。
-- **长期凭据的权限**：`secrets/github-token` 必须是"只够本仓注册 runner"的最小权限，
-  别用宽口径的 OAuth token。
+- **长期凭据的权限**：不配 App 时，`secrets/github-token` 的权限往往比需要的宽——仓库级 runner
+  接口要求仓库 Admin，落到 token 上就是"能管这个仓的全部设置"。优先用下面的 App。
 - **假钥匙会进容器记录**：`ANTHROPIC_API_KEY`（给容器的那把假钥匙）走环境变量，
   因而会出现在容器的 `config.json` 里。这条是有意接受的——它是我们自己造的、
   只在本地代理上有效，而代理本身还限了来源网段。真凭据一律不走环境变量。

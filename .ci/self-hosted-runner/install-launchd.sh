@@ -1,6 +1,7 @@
 #!/bin/bash
-# 装两个 LaunchAgent：com.prreview.gateway（一个进程两个端口）和 com.prreview.launcher。
-# 分成两个进程是因为寿命不同：启动器频繁重启会掐断在飞请求，网关不该陪它一起重启。
+# 装三个 LaunchAgent：com.prreview.gateway（一个进程两个端口）、com.prreview.launcher，
+# 以及 com.prreview.container-system（登录后把 Apple container 的服务拉起来）。
+# 网关与启动器分成两个进程是因为寿命不同：启动器频繁重启会掐断在飞请求，网关不该陪它一起重启。
 # 幂等：重复跑等于重装。凭据文件不在这里创建，见 README。
 set -euo pipefail
 
@@ -58,6 +59,30 @@ write_agent() {  # write_agent <label> <plist路径> <可执行> <参数...>
     } > "$plist"
 }
 
+# Apple container 的服务（apiserver）不是登录项：机器重启或重新登录之后不会自己回来，
+# 而启动器的出口自检要起容器，于是会一直报 XPC connection error、拒绝干活。
+# 这条只在登录时跑一次就退出，所以不能沿用上面的 KeepAlive=true（那会变成每 30 秒重启一次，
+# 永远起不去），改成只在失败时重试。
+write_container_agent() {  # write_container_agent <plist路径>
+    local plist="$1"
+    {
+        echo '<?xml version="1.0" encoding="UTF-8"?>'
+        echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        echo '<plist version="1.0"><dict>'
+        echo '  <key>Label</key><string>com.prreview.container-system</string>'
+        echo '  <key>ProgramArguments</key><array>'
+        echo "    <string>$CONTAINER_BIN</string>"
+        echo '    <string>system</string><string>start</string>'
+        echo '  </array>'
+        echo '  <key>RunAtLoad</key><true/>'
+        echo '  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>'
+        echo '  <key>ThrottleInterval</key><integer>30</integer>'
+        echo "  <key>StandardOutPath</key><string>$PRR_DIR/logs/com.prreview.container-system.out</string>"
+        echo "  <key>StandardErrorPath</key><string>$PRR_DIR/logs/com.prreview.container-system.err</string>"
+        echo '</dict></plist>'
+    } > "$plist"
+}
+
 bootstrap() {
     local label="$1" plist="$2"
     cp "$plist" "$AGENTS/$label.plist"
@@ -81,6 +106,10 @@ for old in com.prreview.github-proxy com.prreview.model-proxy; do
     fi
 done
 
+echo "== 装 container 服务自启 =="
+write_container_agent "$PRR_DIR/logs/container-system.plist"
+bootstrap com.prreview.container-system "$PRR_DIR/logs/container-system.plist"
+
 echo "== 装网关（两个端口一个进程）=="
 write_agent com.prreview.gateway "$PRR_DIR/logs/gateway.plist" \
     "$PY" "$PRR_DIR/gateway.py" --config "$CONF"
@@ -99,6 +128,8 @@ fi
 echo
 echo "== 自检 =="
 sleep 4
+printf "  container 服务: "
+"$CONTAINER_BIN" system status 2>/dev/null | awk '$1=="status"{print $2}' || echo "取不到（起容器会失败）"
 printf "  网关 %s 转发 GitHub: " "$GH_PORT"
 curl -s -o /dev/null -w "%{http_code}\n" --max-time 8 -x "http://127.0.0.1:$GH_PORT" https://api.github.com || echo "  连不上"
 printf "  网关 %s 模型存活探针: " "$MODEL_PORT"
