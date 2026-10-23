@@ -6,6 +6,7 @@
 
 import argparse
 import http.client
+import json
 import logging
 import selectors
 import signal
@@ -28,6 +29,7 @@ ALLOWED_NETS = []
 MODEL_UPSTREAM = None
 MODEL_REAL_KEY = None
 MODEL_EXPECT_TOKEN = None
+MODEL_ALIASES = {}
 
 _stopping = False
 
@@ -216,6 +218,28 @@ class GitHubProxy(BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- 模型代理
 
+def _apply_model_alias(body):
+    """把容器递来的模型别名换成真名，原样返回改过的 body。
+
+    容器里只知道别名（a / b）。真名一旦以环境变量形式进容器，被 prompt injection 诱导的
+    agent 跑一句 `env` 就能把它写进公开的 PR 评论。别名表只存在于宿主机配置里。
+    不是 JSON、没有 model 字段、或不在表里 —— 一律原样透传。
+    """
+    if not body or not MODEL_ALIASES:
+        return body
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+    real = MODEL_ALIASES.get(data.get("model"))
+    if not real:
+        return body
+    data["model"] = real
+    return json.dumps(data, ensure_ascii=False).encode()
+
+
 class ModelProxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "prr-gw-model"
@@ -254,6 +278,7 @@ class ModelProxy(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
+        body = _apply_model_alias(body)
 
         target = MODEL_UPSTREAM.path.rstrip("/") + self.path
         headers = {}
@@ -316,7 +341,7 @@ def _on_signal(signum, _frame):
 
 
 def main():
-    global ALLOWED_NETS, MODEL_UPSTREAM, MODEL_REAL_KEY, MODEL_EXPECT_TOKEN
+    global ALLOWED_NETS, MODEL_UPSTREAM, MODEL_REAL_KEY, MODEL_EXPECT_TOKEN, MODEL_ALIASES
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="~/prreview/prreview.json")
@@ -338,6 +363,10 @@ def main():
     MODEL_UPSTREAM = urlsplit(cfg["model_upstream"])
     MODEL_REAL_KEY = prrlib.read_secret(cfg["model_key_file"])
     MODEL_EXPECT_TOKEN = prrlib.read_secret(cfg["container_token_file"])
+    # 别名表：容器只发别名，真名在这里换。只打条数，不打内容。
+    MODEL_ALIASES = {str(k): str(v) for k, v in (cfg.get("model_aliases") or {}).items()}
+    if MODEL_ALIASES:
+        LOG.info("模型别名：已配置 %d 条", len(MODEL_ALIASES))
 
     gh_port = int(cfg["github_proxy_port"])
     model_port = int(cfg["model_proxy_port"])

@@ -18,8 +18,11 @@
     "192.168.100.0/24",
     "127.0.0.1/32"
   ],
-  "_comment_model": "审查用哪个模型（pr-agent 经 PR_AGENT_MODEL 读取）；网关要求两段式名字，别带 [1m] 后缀。",
-  "agent_model": "provider/model-name",
+  "_comment_model": "模型别名：容器只发 a / b，真名在宿主代理这里换。真名一旦以环境变量形式进容器，被诱导的 agent 跑 env 就能把它写进公开评论。网关要求两段式名字，别带 [1m] 后缀。",
+  "model_aliases": {
+    "a": "provider/model-a",
+    "b": "provider/model-b"
+  },
   "model_upstream": "https://your-model-gateway.example/anthropic",
   "model_key_file": "~/prreview/secrets/model-key",
   "container_token_file": "~/prreview/secrets/container-token",

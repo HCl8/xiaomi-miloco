@@ -295,13 +295,12 @@ def start_container(cfg, jit, name, round_no):
     if cfg.get("model_proxy_port") and token_file and Path(token_file).is_file():
         env["ANTHROPIC_API_KEY"] = Path(token_file).read_text().strip()
         env["ANTHROPIC_BASE_URL"] = "http://%s:%s" % (cfg["host_gateway"], cfg["model_proxy_port"])
-        # pr-agent 靠这个决定用哪个模型；漏了就会用 CLI 自己的默认模型
-        if cfg.get("agent_model"):
-            env["PR_AGENT_MODEL"] = cfg["agent_model"]
     else:
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_BASE_URL", None)
-        env.pop("PR_AGENT_MODEL", None)
+    # 模型名刻意不注入：容器只发别名（a/b），真名在网关的 model_aliases 里换。
+    # 真名一旦留在容器环境里，被诱导的 agent 跑 env 就能把它写进公开评论。
+    env.pop("PR_AGENT_MODEL", None)
 
     args = [
         "run", "--detach",
@@ -316,8 +315,6 @@ def start_container(cfg, jit, name, round_no):
     ]
     if "ANTHROPIC_API_KEY" in env:
         args += ["--env", "ANTHROPIC_API_KEY", "--env", "ANTHROPIC_BASE_URL"]
-    if "PR_AGENT_MODEL" in env:
-        args += ["--env", "PR_AGENT_MODEL"]
     args.append(cfg["image"])
 
     proc = subprocess.run([CONTAINER] + args, env=env, capture_output=True, text=True)
