@@ -4,13 +4,19 @@
 # 不做成本地 composite action：job checkout 的是 PR 那一侧的代码，本地 action 会从
 # 那里加载，等于让 PR 决定执行什么。故与门禁脚本一样从 origin/main 取。
 #
-# 用法: git show origin/main:.ci/pr-review-run.sh | bash -s -- <pr> <head-sha> <repo>
+# 用法: git show origin/main:.ci/pr-review-run.sh | bash -s -- <pr> <head-sha> <repo> [tag]
+#   tag 用来区分同一 PR 上并发跑的两个模型：评论标记和 status context 都会带上它。
+#   不给 tag 时与传统单模型行为一致。
 # 退出码: 0 = 放行 / 1 = 没放行（具体是「有问题」还是「链路故障」看 status 的 description）
 set -uo pipefail
 
 PR_NUMBER="$1"
 HEAD_SHA="$2"
 REPO="$3"
+TAG="${4:-}"
+# 每个模型一条独立 status：分支保护里两条都设为 required，"任一红则红"由 GitHub 保证。
+# 刻意不合并成一条 —— 那需要额外的汇总 job，还要处理"取消/跳过"的语义。
+STATUS_CTX="pr-review${TAG:+-$TAG}"
 
 # 容器 / 不同 runner 的用户不同，工作区所有权会对不上
 git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
@@ -46,17 +52,17 @@ if ! gate_src="$(git show origin/main:.ci/pr-review-gate.sh 2>/dev/null)"; then
   STATE=error
   DESC="审查链路故障，未产出结论"
 else
-  printf '%s' "$gate_src" | bash -s -- "$PR_NUMBER" "$REPO"
+  printf '%s' "$gate_src" | bash -s -- "$PR_NUMBER" "$REPO" "$TAG"
   case $? in
-    0) STATE=success; DESC="未发现严重/重要问题" ;;
+    0) STATE=success; DESC="未发现严重/重要问题（${PR_AGENT_MODEL:-默认模型}）" ;;
     2) STATE=error;   DESC="审查链路故障，未产出结论" ;;
-    *) STATE=failure; DESC="发现严重/重要问题" ;;
+    *) STATE=failure; DESC="发现严重/重要问题（${PR_AGENT_MODEL:-默认模型}）" ;;
   esac
 fi
 
 # issue_comment / 自托管 job 都不会自动成为 PR 的 check；打到 head SHA 的 commit status 上，
 # 才能显示在 PR 里、也才能在分支保护里当 required check
 gh api "repos/$REPO/statuses/$HEAD_SHA" \
-  -f state="$STATE" -f context="pr-review" -f description="$DESC" >/dev/null
+  -f state="$STATE" -f context="$STATUS_CTX" -f description="$DESC" >/dev/null
 
 [ "$STATE" = success ]

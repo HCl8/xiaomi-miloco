@@ -7,12 +7,19 @@
 # .claude/settings.json（hooks=RCE）、.mcp.json（MCP server=RCE），.claude/commands/ 下的
 # 文件会被当命令执行。故启动前清掉这些文件，只从 base 取回可信版本；调用前须已 fetch origin/main。
 #
-# 用法: pr-review-gate.sh <pr-number> <repo-slug>
+# 用法: pr-review-gate.sh <pr-number> <repo-slug> [tag]
+#   tag 区分"同一 PR 上的多个模型"：评论标记与 status context 都会带上它。
+#   不给 tag 时行为与单模型时完全一致（标记仍是 <!-- review-pr-ci -->）。
 # 退出码: 0=放行 / 1=发现严重或重要问题 / 2=基础设施故障（没产出结论；两种都阻断）
 set -uo pipefail
 
 PR_NUMBER="$1"
 REPO="$2"
+TAG="${3:-}"
+# 评论标记按模型分离：两个模型各维护自己那条，互不覆盖。
+# 注意 startswith 的语义——"<!-- review-pr-ci-a -->" 不以 "<!-- review-pr-ci -->" 开头，
+# 所以单模型与多模型的评论不会互相误认。
+MARKER="<!-- review-pr-ci${TAG:+-$TAG} -->"
 
 # 取可信文件依赖 origin/main；调用方通常已 fetch，这里保底一次以支持脚本独立运行。
 git fetch --no-tags origin main 2>/dev/null || true
@@ -25,9 +32,18 @@ find . \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' \) -print0 | xargs -0 -r 
 rm -rf .claude .mcp.json
 git show origin/main:CLAUDE.md > CLAUDE.md 2>/dev/null || true
 mkdir -p .claude/commands
-git show "origin/main:.agents/commands/review-pr.md" \
-  | sed "s#XiaoMi/xiaomi-miloco#${REPO}#g" \
-  > .claude/commands/review-pr.md
+# 渲染 skill：仓库名（fork 用）、本模型的评论标记、页脚的模型名。
+# 标记必须换掉——两个模型同时跑时，认同一条评论会互相覆盖。
+render_command() {   # render_command <页脚里模型那段的文字>
+  git show "origin/main:.agents/commands/review-pr.md" \
+    | sed "s#XiaoMi/xiaomi-miloco#${REPO}#g" \
+    | sed "s#<!-- review-pr-ci -->#${MARKER}#g" \
+    | sed "s#生成</sub>#生成${1}</sub>#" \
+    > .claude/commands/review-pr.md
+}
+MODEL_NOTE=""
+[ -n "${PR_AGENT_MODEL:-}" ] && MODEL_NOTE="（模型：${PR_AGENT_MODEL}）"
+render_command "$MODEL_NOTE"
 
 # 写死 Bash 子命令白名单：dontAsk 下只有 permissions.allow 内的命令能执行，其余自拒。
 # 这份 settings 不会被自动加载，必须由 .ci/pr-agent.sh 用 --settings 显式喂给 CLI。
@@ -47,10 +63,10 @@ comment_stamp() {
   body="$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate 2>/dev/null)" || return 1
   # 取**第一条**与 skill 一致（skill 的 --ci 模式认 .[0]）；不一致时会出现
   # "盯的这条没变、被改的那条变了"
-  printf '%s' "$body" | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .updated_at] | .[0] // ""' 2>/dev/null || return 1
+  printf '%s' "$body" | jq -rs --arg m "$MARKER" 'add | [.[] | select((.body // "") | startswith($m)) | .updated_at] | .[0] // ""' 2>/dev/null || return 1
 }
 if ! STAMP_BEFORE="$(comment_stamp)"; then
-  echo "[FAIL] 读不到 review-pr-ci 评论（gh api 失败），无法建立时间基线，阻断 merge"
+  echo "[FAIL] 读不到 ${MARKER} 评论（gh api 失败），无法建立时间基线，阻断 merge"
   exit 2
 fi
 
@@ -63,6 +79,8 @@ elif [ -n "${ANTHROPIC_FALLBACK_API_KEY:-}" ] && [ -n "${PR_AGENT_FALLBACK_MODEL
   [ -n "${ANTHROPIC_FALLBACK_BASE_URL:-}" ] && export ANTHROPIC_BASE_URL="$ANTHROPIC_FALLBACK_BASE_URL"
   export PR_AGENT_MODEL="$PR_AGENT_FALLBACK_MODEL"
   export PR_AGENT_FALLBACK_USED=1
+  # 页脚署名要跟着换，否则评论会写成是主模型给的结论
+  render_command "（模型：${PR_AGENT_FALLBACK_MODEL}，降级）"
   if /usr/local/bin/pr-agent "/review-pr $PR_NUMBER --ci" < /dev/null; then
     REVIEW_OK=1
   fi
@@ -76,19 +94,19 @@ fi
 
 # gh api 瞬断时回退空串，交给下面的判空分支阻断。
 NOTE_BODY=$(gh api "/repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-  | jq -rs 'add | [.[] | select((.body // "") | startswith("<!-- review-pr-ci -->")) | .body] | .[0] // ""') || NOTE_BODY=""
+  | jq -rs --arg m "$MARKER" 'add | [.[] | select((.body // "") | startswith($m)) | .body] | .[0] // ""') || NOTE_BODY=""
 if [ -z "$NOTE_BODY" ]; then
-  echo "[FAIL] 未找到 review-pr-ci 评论（审查结果未产出），阻断 merge"
+  echo "[FAIL] 未找到 ${MARKER} 评论（审查结果未产出），阻断 merge"
   exit 2
 fi
 
 # 评论必须被本次审查更新过；没更新说明读到的就是旧结论，不能当本次结果用。
 if ! STAMP_AFTER="$(comment_stamp)"; then
-  echo "[FAIL] 读不到 review-pr-ci 评论（gh api 失败），无法确认本次是否产出结论，阻断 merge"
+  echo "[FAIL] 读不到 ${MARKER} 评论（gh api 失败），无法确认本次是否产出结论，阻断 merge"
   exit 2
 fi
 if [ -z "$STAMP_AFTER" ] || [ "$STAMP_AFTER" = "$STAMP_BEFORE" ]; then
-  echo "[FAIL] review-pr-ci 评论未被本次审查更新（本次结果未产出，读到的会是旧结论），阻断 merge"
+  echo "[FAIL] ${MARKER} 评论未被本次审查更新（本次结果未产出，读到的会是旧结论），阻断 merge"
   exit 2
 fi
 
