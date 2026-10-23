@@ -20,6 +20,17 @@ TAG="${3:-}"
 # 注意 startswith 的语义——"<!-- review-pr-ci-a -->" 不以 "<!-- review-pr-ci -->" 开头，
 # 所以单模型与多模型的评论不会互相误认。
 MARKER="<!-- review-pr-ci${TAG:+-$TAG} -->"
+TAG_U=""
+LABEL=""
+if [ -n "$TAG" ]; then
+  TAG_U="$(printf '%s' "$TAG" | tr '[:lower:]' '[:upper:]')"
+  LABEL="模型 ${TAG_U}"
+  # 模型真名不进容器：自托管侧这里只填别名（a/b），由宿主代理换成真名；
+  # 云端没有代理，靠 PR_AGENT_MODEL_<TAG> 注入（secrets，日志里会被打码）。
+  # 真实模型名一旦以环境变量形式留在容器里，被诱导的 agent 跑 `env` 就能公开它。
+  _v="PR_AGENT_MODEL_${TAG_U}"
+  export PR_AGENT_MODEL="${!_v:-$TAG}"
+fi
 
 # 取可信文件依赖 origin/main；调用方通常已 fetch，这里保底一次以支持脚本独立运行。
 git fetch --no-tags origin main 2>/dev/null || true
@@ -34,15 +45,21 @@ git show origin/main:CLAUDE.md > CLAUDE.md 2>/dev/null || true
 mkdir -p .claude/commands
 # 渲染 skill：仓库名（fork 用）、本模型的评论标记、页脚的模型名。
 # 标记必须换掉——两个模型同时跑时，认同一条评论会互相覆盖。
-render_command() {   # render_command <页脚里模型那段的文字>
+render_command() {   # render_command <页脚里那段的文字>
+  # 标题前缀让读者一眼看出这条是哪个模型出的；正文里不出现真实模型名。
   git show "origin/main:.agents/commands/review-pr.md" \
     | sed "s#XiaoMi/xiaomi-miloco#${REPO}#g" \
     | sed "s#<!-- review-pr-ci -->#${MARKER}#g" \
+    | sed "s@^## \[PR #@${TITLE_PREFIX}## [PR #@" \
     | sed "s#生成</sub>#生成${1}</sub>#" \
     > .claude/commands/review-pr.md
 }
+TITLE_PREFIX=""
 MODEL_NOTE=""
-[ -n "${PR_AGENT_MODEL:-}" ] && MODEL_NOTE="（模型：${PR_AGENT_MODEL}）"
+if [ -n "$LABEL" ]; then
+  TITLE_PREFIX="【${LABEL}】"
+  MODEL_NOTE="（${LABEL}）"
+fi
 render_command "$MODEL_NOTE"
 
 # 写死 Bash 子命令白名单：dontAsk 下只有 permissions.allow 内的命令能执行，其余自拒。
@@ -79,8 +96,8 @@ elif [ -n "${ANTHROPIC_FALLBACK_API_KEY:-}" ] && [ -n "${PR_AGENT_FALLBACK_MODEL
   [ -n "${ANTHROPIC_FALLBACK_BASE_URL:-}" ] && export ANTHROPIC_BASE_URL="$ANTHROPIC_FALLBACK_BASE_URL"
   export PR_AGENT_MODEL="$PR_AGENT_FALLBACK_MODEL"
   export PR_AGENT_FALLBACK_USED=1
-  # 页脚署名要跟着换，否则评论会写成是主模型给的结论
-  render_command "（模型：${PR_AGENT_FALLBACK_MODEL}，降级）"
+  # 页脚要标出这是降级结果，否则读者会当成主模型给的结论
+  render_command "（降级）"
   if /usr/local/bin/pr-agent "/review-pr $PR_NUMBER --ci" < /dev/null; then
     REVIEW_OK=1
   fi

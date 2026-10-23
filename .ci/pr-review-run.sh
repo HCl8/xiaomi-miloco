@@ -17,6 +17,16 @@ TAG="${4:-}"
 # 每个模型一条独立 status：分支保护里两条都设为 required，"任一红则红"由 GitHub 保证。
 # 刻意不合并成一条 —— 那需要额外的汇总 job，还要处理"取消/跳过"的语义。
 STATUS_CTX="pr-review${TAG:+-$TAG}"
+# 云端兜底只跑一个模型，但分支保护要的是 a/b 两条 required check —— 一条不打就永远卡住 merge。
+# 所以那条路径用 PRR_STATUS_CONTEXTS 指定要打的全部 context，结论原样复制。
+CONTEXTS="${PRR_STATUS_CONTEXTS:-$STATUS_CTX}"
+# 状态描述里只写标签，不写真实模型名（它会公开显示在 PR 页面和分支保护里）
+TAG_LABEL=""
+if [ -n "$TAG" ]; then
+  TAG_LABEL="（模型 $(printf '%s' "$TAG" | tr '[:lower:]' '[:upper:]')）"
+elif [ -n "${PRR_STATUS_CONTEXTS:-}" ]; then
+  TAG_LABEL="（云端兜底·单模型）"
+fi
 
 # 容器 / 不同 runner 的用户不同，工作区所有权会对不上
 git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
@@ -54,15 +64,17 @@ if ! gate_src="$(git show origin/main:.ci/pr-review-gate.sh 2>/dev/null)"; then
 else
   printf '%s' "$gate_src" | bash -s -- "$PR_NUMBER" "$REPO" "$TAG"
   case $? in
-    0) STATE=success; DESC="未发现严重/重要问题（${PR_AGENT_MODEL:-默认模型}）" ;;
+    0) STATE=success; DESC="未发现严重/重要问题${TAG_LABEL}" ;;
     2) STATE=error;   DESC="审查链路故障，未产出结论" ;;
-    *) STATE=failure; DESC="发现严重/重要问题（${PR_AGENT_MODEL:-默认模型}）" ;;
+    *) STATE=failure; DESC="发现严重/重要问题${TAG_LABEL}" ;;
   esac
 fi
 
 # issue_comment / 自托管 job 都不会自动成为 PR 的 check；打到 head SHA 的 commit status 上，
 # 才能显示在 PR 里、也才能在分支保护里当 required check
-gh api "repos/$REPO/statuses/$HEAD_SHA" \
-  -f state="$STATE" -f context="$STATUS_CTX" -f description="$DESC" >/dev/null
+for _ctx in $(printf '%s' "$CONTEXTS" | tr ',' ' '); do
+  gh api "repos/$REPO/statuses/$HEAD_SHA" \
+    -f state="$STATE" -f context="$_ctx" -f description="$DESC" >/dev/null
+done
 
 [ "$STATE" = success ]
