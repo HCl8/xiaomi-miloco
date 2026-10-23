@@ -8,21 +8,19 @@ name: PR Review (self-hosted)
 #     打不了 status、发不了评论；
 #   · 换过来之后工作流定义取自默认分支，外部人改不动 job；
 #   · PR 的代码只作为**数据**被检出，不构建、不执行。
+#
+# 一次推送跑两个模型：matrix 展开成两个 job，各自落在一个待命容器里（一个 job 一个容器），
+# 所以两个审查进程天然隔离，不共享工作树。各自维护一条带自己 tag 的评论、各打一条 status。
+#
+# ⚠️ 模型清单在三处出现，改的时候一起改：本文件、pr-review-command.yml（两个 job）。
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
-# 同一 PR 连续 push 时取消上一次，只留最新。自托管下每个作业各起独立容器，
-# 「一个 runner 一次一个作业」的串行保证不成立，并发审查会互相覆盖唯一那条评论。
-concurrency:
-  # 与线上那份（pr-review-<号>）必须不同名；线上那份保持停用，两条同时活着会互相覆盖。
-  group: pr-review-selfhosted-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
-  pull-requests: write # 发 / 改 review-pr-ci 评论
-  statuses: write       # 把结论打成 pr-review commit status
+  pull-requests: write # 发 / 改自己那条 review-pr-ci-<tag> 评论
+  statuses: write       # 把结论打成 pr-review-<tag> commit status
 
 jobs:
   review:
@@ -31,6 +29,24 @@ jobs:
     timeout-minutes: 60
     # 草稿不审，靠 ready_for_review 补审
     if: github.event.pull_request.draft == false
+    strategy:
+      # 一个模型挂了不能顺带取消另一个 —— 两份结论要各自独立成立
+      fail-fast: false
+      matrix:
+        include:
+          - tag: a
+            model: deepseek/deepseek-flash
+          - tag: b
+            model: xiaomi/mimo-v2.6-pro
+    # 同一 PR + 同一个模型只留最新。组名带上 tag，两个模型互不取消；
+    # 与线上那份（pr-review-<号>）也必须不同名，那条保持停用。
+    concurrency:
+      group: pr-review-selfhosted-${{ github.event.pull_request.number }}-${{ matrix.tag }}
+      cancel-in-progress: true
+    env:
+      # job 级 env 优先于启动器注入容器的那份，两个 job 因此各跑各的模型
+      PR_AGENT_MODEL: ${{ matrix.model }}
+      PRR_REVIEW_TAG: ${{ matrix.tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -43,9 +59,8 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
-          # 刻意不声明 ANTHROPIC_* / PR_AGENT_MODEL：由宿主机启动器注入容器（地址指向
-          # 宿主机模型代理，容器只拿假钥匙）。声明空值会覆盖掉注入值。
+          # 启动器注入的 ANTHROPIC_BASE_URL / 假钥匙照旧生效；只有模型名被上面的 env 覆盖。
         run: |
           git fetch origin main
           # 校验 head 未被换、跑 base 分支上的门禁、把结论打到 head —— 都在这个共用脚本里
-          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO"
+          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO" "$PRR_REVIEW_TAG"

@@ -138,14 +138,25 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'self'
     runs-on: [self-hosted, prr-test]
-    # 与 push 触发的自托管审查**共用同一个组**：路由判完之后又推了新 commit 时，
+    # 与 push 触发的自托管审查**共用同一个组**（同样带 tag）：路由判完之后又推了新 commit 时，
     # 后来的那条会取消这条（反之亦然），不会出现两条同时写同一条评论和同一个 status。
     concurrency:
-      group: pr-review-selfhosted-${{ github.event.issue.number }}
+      group: pr-review-selfhosted-${{ github.event.issue.number }}-${{ matrix.tag }}
       cancel-in-progress: true
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: a
+            model: deepseek/deepseek-flash
+          - tag: b
+            model: xiaomi/mimo-v2.6-pro
     env:
       GH_TOKEN: ${{ github.token }}
+      # 覆盖启动器注入的那份，两个 job 各跑各的模型
+      PR_AGENT_MODEL: ${{ matrix.model }}
+      PRR_REVIEW_TAG: ${{ matrix.tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -159,19 +170,27 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           git fetch origin main
-          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO"
+          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO" "$PRR_REVIEW_TAG"
 
   # 公共 runner：审查环境来自 ghcr 上的镜像，模型凭据来自仓库 secrets。
   review_cloud:
     needs: authorize
     if: needs.authorize.outputs.matched == 'true' && needs.authorize.outputs.where == 'cloud'
     runs-on: ubuntu-latest
-    # 同样与自托管审查共用组：路由判完之后又推了新 commit 时，后来的那条取消这条，
+    # 同样与自托管审查共用组（带 tag）：路由判完之后又推了新 commit 时，后来的那条取消这条，
     # 不会出现云端与自托管两条同时写同一条评论和同一个 status。
     concurrency:
-      group: pr-review-selfhosted-${{ github.event.issue.number }}
+      group: pr-review-selfhosted-${{ github.event.issue.number }}-${{ matrix.tag }}
       cancel-in-progress: true
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: a
+            model: deepseek/deepseek-flash
+          - tag: b
+            model: xiaomi/mimo-v2.6-pro
     container:
       # 镜像跟着所属仓库走（由 build-image.yml 推）。仓库名可能带大写，而 ghcr 路径必须
       # 小写，表达式没法转换，所以用仓库变量覆盖；没设时落到上游那份（公开可拉）。
@@ -182,7 +201,9 @@ jobs:
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-      PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL }}
+      # 模型名走 matrix（云端没有启动器注入，这里是唯一来源）
+      PR_AGENT_MODEL: ${{ matrix.model }}
+      PRR_REVIEW_TAG: ${{ matrix.tag }}
       ANTHROPIC_FALLBACK_API_KEY: ${{ secrets.ANTHROPIC_FALLBACK_API_KEY }}
       ANTHROPIC_FALLBACK_BASE_URL: ${{ secrets.ANTHROPIC_FALLBACK_BASE_URL }}
       PR_AGENT_FALLBACK_MODEL: ${{ vars.PR_AGENT_FALLBACK_MODEL }}
@@ -200,4 +221,4 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           git fetch origin main
-          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO"
+          git show origin/main:.ci/pr-review-run.sh | bash -s -- "$PR" "$HEAD_SHA" "$REPO" "$PRR_REVIEW_TAG"
