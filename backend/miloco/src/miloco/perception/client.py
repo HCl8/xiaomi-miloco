@@ -450,6 +450,7 @@ class PerceptionEngineProxy:
             OmniConfig,
             PerceptionConfig,
             SemanticGateConfig,
+            SpecialPassConfig,
         )
         from miloco.perception.engine.identity.config_loader import (
             load_identity_engine_config,
@@ -463,7 +464,11 @@ class PerceptionEngineProxy:
         )
 
         gate_cfg = dict(engine_cfg.get("gate", {}))
-        semantic_cfg = SemanticGateConfig(**gate_cfg.pop("semantic", {}))
+        semantic_raw = dict(gate_cfg.pop("semantic", {}))
+        special_raw = dict(semantic_raw.pop("special_pass", {}))
+        semantic_cfg = SemanticGateConfig(
+            **semantic_raw, special_pass=SpecialPassConfig(**special_raw)
+        )
         dump_cfg = GateDumpConfig(**gate_cfg.pop("dump", {}))
 
         config = PerceptionConfig(

@@ -23,6 +23,7 @@ from miloco.perception.engine.types import (
     GateTiming,
     GateTrigger,
     InputSlice,
+    SemanticGateContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ async def run_gate(
     last_visual_pass_ts: float | None = None,
     last_audio_pass_ts: float | None = None,
     prev_raw_frame: NDArray[np.uint8] | None = None,
+    semantic_context: SemanticGateContext | None = None,
 ) -> tuple[
     GatePacket | None,
     GateTiming,
@@ -55,8 +57,10 @@ async def run_gate(
     on-demand 单次调用路径不传两 ts(默认 None),hold 自然关闭。
 
     ``prev_raw_frame`` 是上窗最后一帧的原始彩色图,只给二级语义门禁当参考帧;不传则本窗
-    跳过语义判定(首窗/cold-start)。语义结果在 ``mode=enforce`` 且未过阈值时把
-    ``visual_effective`` 置假,``mode=shadow`` 只记分不改变路由。
+    跳过语义判定(首窗/cold-start)。``semantic_context`` 带本机位提炼出的特殊放行项
+    （自定义任务 + 家庭档案经 LLM 提炼），sidecar 一次请求里逐条判 yes/no,任一命中即放行。
+    语义结果在 ``mode=enforce`` 且未过阈值时把 ``visual_effective`` 置假,``mode=shadow``
+    只记分不改变路由。
     """
     t = time.monotonic()
     visual = evaluate_visual(
@@ -72,7 +76,7 @@ async def run_gate(
     semantic = SemanticEvalResult()
     if config.semantic.enabled and visual_changed and input_slice.frames:
         semantic = await evaluate_semantic(
-            input_slice.frames, prev_raw_frame, config.semantic
+            input_slice.frames, prev_raw_frame, config.semantic, semantic_context
         )
     semantic_veto = (
         visual_changed
@@ -81,6 +85,15 @@ async def run_gate(
         and not semantic.passed
     )
     visual_effective = visual_changed and not semantic_veto
+
+    # 命中项写成 "下标:动作" 便于在 traces.timing_detail 里直接看到是哪个特殊放行项。
+    semantic_pass_hits = ""
+    if semantic_context is not None and semantic.pass_hits:
+        semantic_pass_hits = ",".join(
+            f"{i}:{semantic_context.special_items[i].action[:30]}"
+            for i in semantic.pass_hits
+            if i < len(semantic_context.special_items)
+        )[:300]
 
     t = time.monotonic()
     audio_active, audio_energy = evaluate_audio(input_slice.audio_clip, config)
@@ -130,6 +143,10 @@ async def run_gate(
         semantic_score=semantic.score,
         semantic_veto=semantic_veto,
         semantic_error=semantic.error,
+        semantic_pass_score=semantic.pass_score,
+        semantic_pass_hits=semantic_pass_hits,
+        semantic_pass_count=semantic.pass_count,
+        semantic_question_count=semantic.question_count,
     )
 
     if not any_pass and not hold_opens_window:

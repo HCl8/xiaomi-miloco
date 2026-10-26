@@ -259,6 +259,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         0.14,
         "P(有变化) 阈值；离线 201 窗上 0.14 ≈ 15/15 召回（负样本误报 9.1%），重启生效",
     ),
+    "perception.engine.gate.semantic.extra_min_score": (
+        float,
+        0.14,
+        "特殊放行问题（规则/档案经 LLM 提炼）的阈值；任一过阈即放行，重启生效",
+    ),
     "perception.engine.gate.semantic.frames": (
         int,
         4,
@@ -285,6 +290,47 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         str,
         "没有变化",
         "判定问题的 false 选项文案，重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.enabled": (
+        bool,
+        True,
+        "特殊放行提炼开关：用 omni LLM 读本机位自定义任务 + 家庭档案，产出默认问题"
+        "覆盖不到的判定问题；失败只退回默认问题，重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.max_items": (
+        int,
+        4,
+        "每机位最多几条特殊放行问题（LLM 输出按重要性排序取前 N），重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.refresh_after_hours": (
+        float,
+        24.0,
+        "档案/规则不变时也重跑一次提炼的兜底周期（小时），重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.retry_after_sec": (
+        float,
+        300.0,
+        "提炼失败后的重试间隔（秒），重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.timeout_sec": (
+        float,
+        60.0,
+        "提炼 LLM 调用超时（秒），重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.cache_path": (
+        str,
+        "",
+        "特殊放行提炼结果缓存路径；空 = $MILOCO_HOME/gate_special_pass.json，重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.max_action_chars": (
+        int,
+        60,
+        "单条特殊放行动作描述的长度上限（字符），重启生效",
+    ),
+    "perception.engine.gate.semantic.special_pass.extra_instructions": (
+        str,
+        "",
+        "追加到特殊放行提炼提示词末尾的现场补充要求；改了会触发重提炼，重启生效",
     ),
     # 一级门禁窗口留存（过视觉门禁的窗口存 mp4 + meta，供离线分析）
     "perception.engine.gate.dump.enabled": (

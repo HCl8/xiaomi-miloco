@@ -88,14 +88,20 @@ class GateTiming:
     video_cross_score: float = 0.0
     checked_frame_count: int = 0
 
-    # 二级语义门禁（本地 StartLux sidecar）。semantic_pass 是模型判定（真话），
-    # semantic_veto 是策略结果（enforce 模式下真把本窗拦掉）。
+    # 二级语义门禁（本地 StartLux sidecar）。semantic_pass = 默认问题或任一特殊放行
+    # 问题过阈值（routing 用的最终判定）；semantic_veto 是 enforce 下真把本窗拦掉。
     semantic_ms: float = 0.0
     semantic_applied: bool = False
     semantic_pass: bool = True
     semantic_score: float = 0.0
     semantic_veto: bool = False
     semantic_error: str = ""
+    # 特殊放行问题（规则 / 档案经 LLM 提炼）：最高分、命中项下标、问了几条、总题数。
+    # 默认问题分数仍在 semantic_score，这两组分开记，便于离线分别看阈值。
+    semantic_pass_score: float = 0.0
+    semantic_pass_hits: str = ""
+    semantic_pass_count: int = 0
+    semantic_question_count: int = 0
 
     @property
     def total_ms(self) -> float:
@@ -313,6 +319,30 @@ class RuleCondition:
     rule_id: str
     rule_name: str
     query: str  # natural language condition for Omni to judge
+
+
+@dataclass(frozen=True)
+class SpecialPassItem:
+    """LLM 从「家庭档案 + 本机位自定义任务」提炼出的一条特殊放行判定项。
+
+    action 是画面可直接观察的动作/状态描述；StartLux 逐条问 yes/no，任一过阈值
+    即放行本窗。source 形如 ``rule:<rule_id>`` 或 ``profile``，只用于排查。
+    """
+
+    action: str
+    reason: str = ""
+    source: str = "profile"
+
+
+@dataclass(frozen=True)
+class SemanticGateContext:
+    """二级语义门禁的按窗上下文（只含提示词侧信息，不含图像）。"""
+
+    special_items: tuple[SpecialPassItem, ...] = ()
+    # 机位须知 / 房间 / 时间只进 state，帮 sidecar 理解场景；家庭档案原文不注入。
+    camera_prompt: str | None = None
+    room_name: str | None = None
+    current_time: str | None = None
 
 
 @dataclass

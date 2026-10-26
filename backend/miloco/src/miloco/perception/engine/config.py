@@ -147,6 +147,31 @@ class GateDumpConfig:
 
 
 @dataclass
+class SpecialPassConfig:
+    """LLM 提炼「特殊放行」判定项（家庭档案 + 本机位自定义任务）。
+
+    默认问题只判「相对参考帧有没有变化」；持续状态、缺席、身份相关、细微局部状态
+    这些它判不出来。这里让 omni 模型读档案与本机位规则，产出默认问题覆盖不到、
+    必须放行的动作/状态，逐条变成 StartLux 的 yes/no 问题（任一命中即放行）。
+    """
+
+    enabled: bool = True
+    # 每机位最多几条特殊放行问题。LLM 输出已按重要性排序，取前 N 条。
+    max_items: int = 4
+    # 档案/规则不变时，超过这个时长也重跑一次（兜底模型或提示词漂移）。
+    refresh_after_hours: float = 24.0
+    # 提炼失败后的重试间隔；期间沿用旧结果（key 匹配时）或只用默认问题。
+    retry_after_sec: float = 300.0
+    timeout_sec: float = 60.0
+    # 空 = $MILOCO_HOME/gate_special_pass.json
+    cache_path: str = ""
+    # 单条动作描述长度上限（字符）。超出截断，避免异常长输出撑爆 sidecar prompt。
+    max_action_chars: int = 60
+    # 追加到提炼提示词末尾的现场补充要求（可空）；改这个或上面的上限都会触发重提炼。
+    extra_instructions: str = ""
+
+
+@dataclass
 class SemanticGateConfig:
     """二级语义门禁：视觉门禁放行后，问本地 StartLux-Decision sidecar 本窗有没有新事件。
 
@@ -161,6 +186,9 @@ class SemanticGateConfig:
     timeout_sec: float = 10.0
     # 0.14 ≈ 离线 201 窗上 15/15 召回的工作点（FP 9.1%）；上线后按真实分布再调。
     min_score: float = 0.14
+    # 特殊放行问题（规则提炼 / 档案提炼）的阈值。与默认问题语义不同，单独可调；
+    # 默认同 0.14，保持「宁可多放、不可漏放」。
+    extra_min_score: float = 0.14
     frames: int = 4  # 本窗抽样帧数（不含参考帧）
     image_short_edge: int = 360
     jpeg_quality: int = 90
@@ -178,6 +206,7 @@ class SemanticGateConfig:
     )
     true_label: str = "有变化"
     false_label: str = "没有变化"
+    special_pass: SpecialPassConfig = field(default_factory=SpecialPassConfig)
 
 
 @dataclass

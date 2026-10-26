@@ -9,11 +9,13 @@ from miloco.perception.engine.gate import semantic_gate
 from miloco.perception.engine.gate.gate import run_gate
 from miloco.perception.engine.gate.semantic_gate import (
     SemanticEvalResult,
+    build_payload,
     evaluate_semantic,
     select_frames,
 )
 from miloco.perception.engine.gate.visual_gate import _preprocess
 from miloco.perception.engine.input.video_splitter import create_input_slice
+from miloco.perception.engine.types import SemanticGateContext, SpecialPassItem
 
 
 @pytest.fixture(autouse=True)
@@ -26,27 +28,33 @@ def _reset_circuit():
 
 
 class _FakeResponse:
-    def __init__(self, noul: float):
-        self._noul = noul
+    def __init__(self, noul: float, answers: dict | None = None):
+        self._answers = answers or {"event": {"noul": noul}}
 
     def raise_for_status(self):
         return None
 
     def json(self):
-        return {"answers": {"event": {"noul": self._noul}}}
+        return {"answers": self._answers}
 
 
 class _FakeClient:
-    def __init__(self, noul: float = 0.0, exc: Exception | None = None):
+    def __init__(
+        self,
+        noul: float = 0.0,
+        exc: Exception | None = None,
+        answers: dict | None = None,
+    ):
         self._noul = noul
         self._exc = exc
+        self._answers = answers
         self.calls = 0
 
     async def post(self, url, json=None):  # noqa: A002 - matches httpx signature
         self.calls += 1
         if self._exc is not None:
             raise self._exc
-        return _FakeResponse(self._noul)
+        return _FakeResponse(self._noul, self._answers)
 
 
 def _frames(n: int = 12, value: int = 10) -> list[np.ndarray]:
@@ -195,3 +203,105 @@ async def test_enforce_fail_open_keeps_window(monkeypatch):
     assert packet is not None
     assert timing.semantic_applied is False
     assert timing.semantic_veto is False
+
+
+# =============================================================================
+# 特殊放行问题（规则/档案经 LLM 提炼）
+# =============================================================================
+
+
+def _ctx(*actions: str, room: str = "客厅") -> SemanticGateContext:
+    return SemanticGateContext(
+        special_items=tuple(SpecialPassItem(action=a) for a in actions),
+        room_name=room,
+        current_time="10:00:00",
+    )
+
+
+def test_payload_adds_special_questions_and_context():
+    payload = build_payload(
+        _frames(1)[0], _frames(4), _cfg(), _ctx("老人捂胸口", "宝宝在爬行垫上")
+    )
+    assert set(payload["questions"]) == {"event", "pass:0", "pass:1"}
+    assert "老人捂胸口" in payload["questions"]["pass:0"]["instructions"]
+    assert "参考帧" in payload["questions"]["pass:0"]["instructions"]
+    assert "客厅" in payload["state"]
+    assert "10:00:00" in payload["state"]
+
+
+def test_payload_without_context_has_only_default_question():
+    payload = build_payload(_frames(1)[0], _frames(4), _cfg())
+    assert set(payload["questions"]) == {"event"}
+
+
+async def test_special_item_pass_keeps_window(monkeypatch):
+    client = _FakeClient(answers={"event": {"noul": 0.05}, "pass:0": {"noul": 0.8}})
+    monkeypatch.setattr(semantic_gate, "_client", lambda *a: client)
+
+    result = await evaluate_semantic(
+        _frames(), _frames(1)[0], _cfg(extra_min_score=0.5), _ctx("老人捂胸口")
+    )
+    assert result.applied is True
+    assert result.passed is True  # 默认问题 0.05 < 0.5，但特殊放行项过阈值
+    assert result.score == pytest.approx(0.05)
+    assert result.pass_score == pytest.approx(0.8)
+    assert result.pass_hits == (0,)
+    assert result.question_count == 2
+
+
+async def test_special_item_below_threshold_still_vetoes(monkeypatch):
+    client = _FakeClient(answers={"event": {"noul": 0.05}, "pass:0": {"noul": 0.1}})
+    monkeypatch.setattr(semantic_gate, "_client", lambda *a: client)
+
+    result = await evaluate_semantic(
+        _frames(), _frames(1)[0], _cfg(extra_min_score=0.5), _ctx("老人捂胸口")
+    )
+    assert result.applied is True
+    assert result.passed is False
+    assert result.pass_hits == ()
+
+
+async def test_missing_special_answer_is_ignored(monkeypatch):
+    client = _FakeClient(answers={"event": {"noul": 0.9}})
+    monkeypatch.setattr(semantic_gate, "_client", lambda *a: client)
+
+    result = await evaluate_semantic(
+        _frames(), _frames(1)[0], _cfg(), _ctx("老人捂胸口")
+    )
+    assert result.passed is True
+    assert result.pass_hits == ()
+    assert result.question_count == 2
+
+
+async def test_enforce_special_pass_keeps_window(monkeypatch):
+    async def _pass(*a, **kw):
+        return SemanticEvalResult(
+            applied=True,
+            passed=True,
+            score=0.01,
+            pass_score=0.9,
+            pass_hits=(0,),
+            pass_count=1,
+            question_count=2,
+        )
+
+    monkeypatch.setattr(gate_mod, "evaluate_semantic", _pass)
+    cfg = GateConfig(semantic=SemanticGateConfig(enabled=True, mode="enforce"))
+    ctx = SemanticGateContext(
+        special_items=(SpecialPassItem(action="老人捂胸口"),), room_name="客厅"
+    )
+
+    packet, timing, *_ = await run_gate(
+        _slice_with_change(),
+        cfg,
+        prev_frame=_baseline(),
+        prev_raw_frame=_solid(100),
+        semantic_context=ctx,
+    )
+    assert packet is not None
+    assert timing.semantic_pass is True
+    assert timing.semantic_veto is False
+    assert timing.semantic_pass_score == pytest.approx(0.9)
+    assert timing.semantic_pass_count == 1
+    assert timing.semantic_question_count == 2
+    assert "老人捂胸口" in timing.semantic_pass_hits

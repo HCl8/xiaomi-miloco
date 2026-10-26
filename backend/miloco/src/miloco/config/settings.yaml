@@ -154,6 +154,8 @@ perception:
         timeout_sec: 10.0
         # 0.14 ≈ 离线 201 窗上 15/15 召回的工作点(FP 9.1%)。上线后按真实分布再调。
         min_score: 0.14
+        # 特殊放行问题(规则/档案经 LLM 提炼)的阈值，与默认问题分开调。
+        extra_min_score: 0.14
         frames: 4              # 本窗抽样帧数(不含参考帧)
         image_short_edge: 360
         jpeg_quality: 90
@@ -165,6 +167,19 @@ perception:
         instructions: "画面中正在发生的事，跟参考帧相比有变化吗？（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）"
         true_label: "有变化"
         false_label: "没有变化"
+        # 特殊放行：用 omni LLM（model.omni 当前配置，text-only）读「本机位自定义任务
+        # + 家庭档案」，提炼默认问题覆盖不到的持续状态/缺席/身份相关/细微状态，逐条变成
+        # sidecar 的 yes/no 问题。提炼按机位缓存，档案/规则不变不重跑；失败只退回默认
+        # 问题，不影响感知。
+        special_pass:
+          enabled: true
+          max_items: 4             # 每机位最多几条特殊放行问题
+          refresh_after_hours: 24  # 档案/规则不变时也重跑一次的兜底周期
+          retry_after_sec: 300     # 提炼失败后的重试间隔
+          timeout_sec: 60          # 提炼 LLM 调用超时
+          cache_path: ""           # 空 = $MILOCO_HOME/gate_special_pass.json
+          max_action_chars: 60     # 单条动作描述长度上限
+          extra_instructions: ""   # 追加到提炼提示词末尾的现场补充要求
       # 一级门禁窗口留存：过视觉门禁的窗口存 mp4 + meta，供离线分析。
       # 只写容器内暂存目录，宿主归档由同步脚本负责；max_disk_gb 是暂存上限。
       dump:

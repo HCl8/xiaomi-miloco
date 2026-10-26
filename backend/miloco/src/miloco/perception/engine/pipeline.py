@@ -26,6 +26,7 @@ from miloco.perception.engine.config import PerceptionConfig
 from miloco.perception.engine.gate.dump import dump_gate_window
 from miloco.perception.engine.gate.gate import run_gate
 from miloco.perception.engine.gate.semantic_gate import prepare_reference_frame
+from miloco.perception.engine.gate.special_pass import prepare_camera
 from miloco.perception.engine.identity.identity import run_identity
 from miloco.perception.engine.identity.tracking_service import TrackingService
 from miloco.perception.engine.omni.omni import (
@@ -58,6 +59,8 @@ from miloco.perception.engine.types import (
     PipelineResult,
     QueryOutput,
     RoomPipelineResult,
+    SemanticGateContext,
+    SpecialPassItem,
 )
 from miloco.perception.types import (
     BatchedSnapshot,
@@ -541,6 +544,28 @@ async def run_batch_pipeline(
         " | ".join(f"{s.device.did}-{s.device.name}" for s in batch.snapshots),
     )
 
+    # 二级语义门禁的「特殊放行」项：按机位用 LLM 把自定义任务 + 家庭档案提炼成
+    # 默认问题覆盖不到的判定问题。prepare 只读缓存/起后台任务，本窗不阻塞；
+    # 首次或档案/规则变更时，这一两窗只有默认问题。
+    special_pass_by_did: dict[str, tuple[SpecialPassItem, ...]] = {}
+    semantic_cfg = config.gate.semantic
+    if semantic_cfg.enabled and semantic_cfg.special_pass.enabled:
+        for snapshot in batch.snapshots:
+            sem_ctx = contexts.get(snapshot.device.did)
+            if sem_ctx is None:
+                continue
+            special_pass_by_did[snapshot.device.did] = tuple(
+                prepare_camera(
+                    did=snapshot.device.did,
+                    room_name=sem_ctx.room_name or snapshot.device.room_name,
+                    camera_prompt=sem_ctx.camera_prompt,
+                    rules=sem_ctx.rule_conditions,
+                    generic_instructions=semantic_cfg.instructions,
+                    config=semantic_cfg.special_pass,
+                    omni_config=config.omni,
+                )
+            )
+
     async def _run_device(
         snapshot: DeviceSnapshot,
         room_name: str,
@@ -637,6 +662,12 @@ async def run_batch_pipeline(
                 last_visual_pass_ts=last_v,
                 last_audio_pass_ts=last_a,
                 prev_raw_frame=prev_raw_frame,
+                semantic_context=SemanticGateContext(
+                    special_items=special_pass_by_did.get(did, ()),
+                    camera_prompt=context.camera_prompt,
+                    room_name=context.room_name or room_name,
+                    current_time=context.current_time,
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -777,6 +808,10 @@ async def run_batch_pipeline(
             room_timing[f"semantic_{did}_score"] = gate_timing.semantic_score
             room_timing[f"semantic_{did}_veto"] = int(gate_timing.semantic_veto)
             room_timing[f"semantic_{did}_error"] = gate_timing.semantic_error
+            room_timing[f"semantic_{did}_pass_score"] = gate_timing.semantic_pass_score
+            room_timing[f"semantic_{did}_pass_hits"] = gate_timing.semantic_pass_hits
+            room_timing[f"semantic_{did}_pass_count"] = gate_timing.semantic_pass_count
+            room_timing[f"semantic_{did}_questions"] = gate_timing.semantic_question_count
         # "_" 前缀留给 traces_device 有专属列的打分:_merge_results 不加 "{room}/" 前缀,
         # 由 processor._publish_trace 逐 key 显式读。带前缀又没人读的 key 会被
         # timing_detail 的前缀过滤丢掉,写进去等于扔掉。

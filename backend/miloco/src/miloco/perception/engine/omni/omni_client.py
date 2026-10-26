@@ -225,12 +225,21 @@ def _maybe_reset_breaker_on_config_change(resolved: OmniConfig) -> None:
 
 
 async def call_omni(
-    payload: dict, config: OmniConfig, type: str = "realtime"
+    payload: dict,
+    config: OmniConfig,
+    type: str = "realtime",
+    *,
+    use_circuit_breaker: bool = True,
+    record_trace: bool = True,
 ) -> dict[str, Any]:
     """Call the omni model via MiMo API platform.
 
     `type` is either ``"realtime"`` (perception-loop driven, default) or
     ``"on_demand"`` (user-initiated query).
+
+    ``use_circuit_breaker`` / ``record_trace`` 给感知链路之外的辅助调用（如门禁的
+    档案提炼）用：辅助调用失败不应把感知的熔断器打到软停，也不应把它的 prompt/响应
+    塞进当前窗口的 omni trace。
     """
     api_key = resolve_api_key(config)
     if not api_key:
@@ -253,20 +262,22 @@ async def call_omni(
     forced_stream = body.get("stream", False)
     url = adapter.endpoint(config.base_url, config.model, stream=forced_stream)
 
-    cb = get_omni_circuit_breaker()
+    cb = get_omni_circuit_breaker() if use_circuit_breaker else None
     t0 = time.monotonic()
     raw: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     short_circuited = False
     headers = build_request_headers(adapter, config.base_url, api_key)
     try:
-        await cb.before_call()  # 熔断 OPEN → 直接抛 CircuitOpenError
+        if cb is not None:
+            await cb.before_call()  # 熔断 OPEN → 直接抛 CircuitOpenError
         async with httpx.AsyncClient(timeout=config.timeout) as client:
             if not forced_stream:
                 resp = await client.post(url, headers=headers, json=body)
                 classified = classify_response(resp)
                 if classified is not None:
-                    await cb.record_failure(classified)
+                    if cb is not None:
+                        await cb.record_failure(classified)
                     logger.error(
                         "Omni API error %d: %s", resp.status_code, resp.text[:500]
                     )
@@ -285,7 +296,8 @@ async def call_omni(
                 except httpx.HTTPStatusError as e:
                     classified = classify_response(e.response)
                     if classified is not None:
-                        await cb.record_failure(classified)
+                        if cb is not None:
+                            await cb.record_failure(classified)
                         logger.error(
                             "Omni API error %d (stream): %s",
                             e.response.status_code,
@@ -295,15 +307,17 @@ async def call_omni(
             if not isinstance(raw, dict):
                 # 用 __class__.__name__ 而非 type(...) 避免遮盖问题(参数名 type)
                 raw_cls = raw.__class__.__name__
-                await cb.record_failure(
-                    ClassifiedError(
-                        "bad_response",
-                        f"non-dict body ({raw_cls})",
-                        ErrorCategory.RECOVERABLE,
+                if cb is not None:
+                    await cb.record_failure(
+                        ClassifiedError(
+                            "bad_response",
+                            f"non-dict body ({raw_cls})",
+                            ErrorCategory.RECOVERABLE,
+                        )
                     )
-                )
                 raise OmniError(f"omni response is not a dict (got {raw_cls})")
-            await cb.record_success()
+            if cb is not None:
+                await cb.record_success()
             fire_record(config.model, config.base_url, raw.get("usage") or {}, type)
         return raw
     except CircuitOpenError as ce:
@@ -314,7 +328,7 @@ async def call_omni(
         raise
     except Exception as e:
         # HTTP 响应异常已在 record_failure 里记过;这里补记 exception 类。
-        if not isinstance(e, httpx.HTTPStatusError):
+        if not isinstance(e, httpx.HTTPStatusError) and cb is not None:
             await cb.record_failure(classify_exception(e))
         error = {"code": e.__class__.__name__, "msg": str(e)[:512]}
         raise OmniError(
@@ -322,19 +336,20 @@ async def call_omni(
         ) from e
     finally:
         # 熔断短路 latency=0(不占实际墙钟),便于 dashboard 区分"实际尝试失败"和"熔断跳过"
-        latency_ms = 0.0 if short_circuited else (time.monotonic() - t0) * 1000
-        push_omni_trace(
-            request_messages=messages,
-            response_raw=raw,
-            latency_ms=latency_ms,
-            error=error,
-            model=config.model,
-            inference_params={
-                "temperature": config.temperature,
-                "top_p": config.top_p,
-                "max_tokens": config.max_completion_tokens,
-            },
-        )
+        if record_trace:
+            latency_ms = 0.0 if short_circuited else (time.monotonic() - t0) * 1000
+            push_omni_trace(
+                request_messages=messages,
+                response_raw=raw,
+                latency_ms=latency_ms,
+                error=error,
+                model=config.model,
+                inference_params={
+                    "temperature": config.temperature,
+                    "top_p": config.top_p,
+                    "max_tokens": config.max_completion_tokens,
+                },
+            )
 
 
 async def _iter_sse_chunks(resp) -> AsyncGenerator[dict, None]:
