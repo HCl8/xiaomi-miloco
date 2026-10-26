@@ -86,6 +86,32 @@ class TestParseOmniResponse:
         result = parse_omni_response(_wrap(json.dumps(data)))
         assert len(result.matched_rules) == 1
 
+    def test_hit_false_in_reason_dropped(self):
+        """模型把 hit=false 写进 reason、又漏了 hit 字段时，也要按 reason 丢弃。
+
+        线上实测：一次出门会让"进入/出去/经过"三条互斥规则都进回调，其中两条
+        reason 明确写"不符合...的定义，hit=false"。只看缺省 hit=True 会把它当命中。
+        """
+        data = {
+            "matched_rules": [
+                {
+                    "rule_name": "[c700] 进入",
+                    "reason": "该男子由内向外，不符合进入的定义，hit=false",
+                },
+                {
+                    "rule_name": "[c700] 出去",
+                    "reason": "从室内走向门外，符合出去的定义，hit=true",
+                },
+            ],
+        }
+        result = parse_omni_response(_wrap(json.dumps(data)))
+        assert [r.rule_name for r in result.matched_rules] == ["[c700] 出去"]
+
+    def test_hit_zero_dropped(self):
+        data = {"matched_rules": [{"rule_name": "[x] test", "reason": "no", "hit": 0}]}
+        result = parse_omni_response(_wrap(json.dumps(data)))
+        assert result.matched_rules == []
+
     def test_hit_string_false_dropped(self):
         """模型输出字符串 "false" 也被正确拦截。"""
         data = {"matched_rules": [{"rule_name": "[x] test", "reason": "no", "hit": "false"}]}

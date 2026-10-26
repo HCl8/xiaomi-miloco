@@ -358,7 +358,18 @@ def _parse_matched_rules(
         # B 结构：hit=false = 模型评估为"未命中"（reason 是否定理由），直接丢弃、不触发下游。
         # hit 缺省视作命中，兼容旧 prompt 输出（无 hit 字段）。
         hit = item.get("hit", True)
-        if hit is False or (isinstance(hit, str) and hit.strip().lower() in ("false", "0", "no")):
+        reason = str(item.get("reason", ""))
+        if "hit" not in item:
+            # 实测模型常把结论写成 reason 末尾的 "hit=false/true" 而不是独立字段。
+            # 缺字段时按 reason 推断，否则一次出门会被进入/出去/经过全标成命中。
+            m = re.search(
+                r"hit\s*[=:：]\s*(true|false|1|0|yes|no)", reason, re.IGNORECASE
+            )
+            if m:
+                hit = m.group(1).lower() in ("true", "1", "yes")
+        if hit is False or hit == 0 or (
+            isinstance(hit, str) and hit.strip().lower() in ("false", "0", "no")
+        ):
             continue
         # rule_name（模型照抄的完整规则名）→ 还原 rule_id（下游稳定键）；rule_name 一并存供展示
         name = str(item.get("rule_name", ""))
@@ -373,7 +384,7 @@ def _parse_matched_rules(
             MatchedRule(
                 rule_id=rid,
                 rule_name=name,
-                reason=str(item.get("reason", "")),
+                reason=reason,
             )
         )
     return result
