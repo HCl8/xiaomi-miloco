@@ -1738,6 +1738,7 @@ class TestGateHoldPipelineIntegration:
         batch = BatchedSnapshot(snapshots=[snap_a, snap_b])
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
         contexts = {
             "cam-A": OmniContext(),
@@ -1778,6 +1779,7 @@ class TestGateHoldPipelineIntegration:
         silent = np.zeros(16000, dtype=np.int16)
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
         contexts = {"cam-1": OmniContext()}
         tracking = MockTrackingService(create_default_mock_response())
@@ -1841,6 +1843,7 @@ class TestGateHoldPipelineIntegration:
         slice_obj = create_input_slice("r1", [gray] * 6, silent)
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
 
         with patch(
@@ -1866,6 +1869,7 @@ class TestGateHoldPipelineIntegration:
         silent = np.zeros(16000, dtype=np.int16)
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
         contexts = {"cam-1": OmniContext()}
         tracking = MockTrackingService(create_default_mock_response())
@@ -1927,6 +1931,7 @@ class TestGateHoldStateTransitionLogs:
         silent = np.zeros(16000, dtype=np.int16)
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
         contexts = {"cam-1": OmniContext()}
         tracking = MockTrackingService(create_default_mock_response())
@@ -1991,6 +1996,7 @@ class TestGateHoldStateTransitionLogs:
         silent = np.zeros(16000, dtype=np.int16)
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
         contexts = {"cam-1": OmniContext()}
         tracking = MockTrackingService(create_default_mock_response())
@@ -2036,6 +2042,7 @@ class TestGateHoldStateTransitionLogs:
         silent = np.zeros(16000, dtype=np.int16)
 
         config = PerceptionConfig()
+        config.gate.hold_duration_sec = 360.0
         config.omni.api_key = "test-key"
         contexts = {"cam-1": OmniContext()}
         tracking = MockTrackingService(create_default_mock_response())

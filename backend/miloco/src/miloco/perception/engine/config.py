@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 VisualInputMode = Literal["video", "image"]
 
@@ -144,6 +147,8 @@ class GateDumpConfig:
     max_disk_gb: float = 1.0  # 容器内暂存上限；宿主归档另由同步脚本控制
     short_edge: int = 512
     include_audio: bool = True
+    # hold 窗只有过了二级语义才落视频；关掉则完全不落 hold 窗（保持旧行为）。
+    include_hold: bool = True
 
 
 @dataclass
@@ -157,7 +162,8 @@ class SpecialPassConfig:
 
     enabled: bool = True
     # 每机位最多几条特殊放行问题。LLM 输出已按重要性排序，取前 N 条。
-    max_items: int = 4
+    # 6 条可覆盖「打哈欠/喝水/拿手机/起身/离开/回到」这类短动作。
+    max_items: int = 6
     # 档案/规则不变时，超过这个时长也重跑一次（兜底模型或提示词漂移）。
     refresh_after_hours: float = 24.0
     # 提炼失败后的重试间隔；期间沿用旧结果（key 匹配时）或只用默认问题。
@@ -181,14 +187,17 @@ class SemanticGateConfig:
     """
 
     enabled: bool = False
-    mode: str = "shadow"  # shadow | enforce
+    # 2.4：状态是否还在/是否大幅动作交给本地 VLM 门禁过滤，因此默认 enforce；
+    # 需要只看分不改路由时显式配 shadow。
+    mode: str = "enforce"  # shadow | enforce
     base_url: str = "http://127.0.0.1:8090"
     timeout_sec: float = 10.0
-    # 0.14 ≈ 离线 201 窗上 15/15 召回的工作点（FP 9.1%）；上线后按真实分布再调。
-    min_score: float = 0.14
-    # 特殊放行问题（规则提炼 / 档案提炼）的阈值。与默认问题语义不同，单独可调；
-    # 默认同 0.14，保持「宁可多放、不可漏放」。
-    extra_min_score: float = 0.14
+    # 0.35 = 通用「活动级事件」提示词的折中：60 窗人工标注 6/6 召回、
+    # 加权通过 22%、精度 32%；0.4 开始丢真变化，0.2 放进太多姿势/背景小动作。
+    min_score: float = 0.35
+    # 特殊放行问题（变化句式）的阈值。特殊项自带「相对参考帧的变化」约束，
+    # 0.2 在 60 窗人工标注上和 0.14 召回相同、少放行 3 个背景/手势误报。
+    extra_min_score: float = 0.2
     frames: int = 4  # 本窗抽样帧数（不含参考帧）
     image_short_edge: int = 360
     jpeg_quality: int = 90
@@ -201,9 +210,30 @@ class SemanticGateConfig:
         "第 2 到第 {n} 张是「本窗口」的画面，每秒 1 张。"
     )
     instructions: str = (
-        "画面中正在发生的事，跟参考帧相比有变化吗？"
-        "（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）"
+        "相对参考帧，画面里**活动级的事件**变了吗？即主体或主要对象开始/结束/切换了一个活动，或进出画面、位置明显改变、物品交互、异常出现。不是动作级的小变化；同一活动持续、姿势/手脚/头部移动、打字、摸脸、托腮、转头、光线变化都不算。"
     )
+    # 机位须知只给 omni/特殊项提炼；门禁默认不注入。A/B（200 窗人工标签）：
+    # 客厅 full P19.3%/R92.6% → 不注入 P21.8%/R92.6%，玄关几乎不变。
+    include_camera_prompt: bool = False
+    # hold 窗也过二级语义：过了才继续开窗/调 omni/落视频；语义否决则跳过。
+    # 默认开；关掉即恢复「hold 绕过语义、直接调 omni」的旧行为。
+    hold_semantic_gate: bool = True
+    # 「结束/离开」补问：默认问题对「人消失/事件结束」不敏感（玄关漏报主因）。
+    # 200 窗上 E@0.35 OR end@0.1：玄关 R72%→95%，P99%→95%；客厅不变。
+    end_enabled: bool = True
+    end_instructions: str = (
+        "相对参考帧，主体/主要对象是否消失、离开画面，或结束了参考帧里正在做的事？"
+        "（例如人离开/不见了、动作停止、物品放下、一件事结束）"
+    )
+    end_min_score: float = 0.1
+    # 生理关怀补问：状态容器 skip_omni 前唯一的小动作兜底。P1 只要过阈值，
+    # 本窗就不跳过 omni（用本地 VLM 换 omni，避免喝水/打哈欠被状态容器吞掉）。
+    physio_enabled: bool = True
+    physio_instructions: str = (
+        "相对参考帧，主体是否出现**生理关怀相关动作**：喝水/喝饮料、吃东西、打哈欠、"
+        "揉眼睛/明显疲劳、打瞌睡、捂肚子/身体不适、起身去卫生间？只判断身体/生理动作，工作动作不算。"
+    )
+    physio_min_score: float = 0.1
     true_label: str = "有变化"
     false_label: str = "没有变化"
     special_pass: SpecialPassConfig = field(default_factory=SpecialPassConfig)
@@ -212,7 +242,9 @@ class SemanticGateConfig:
 @dataclass
 class GateConfig:
     check_fps: int = 1
-    change_threshold: float = 0.005
+    # 2.4：取消 hold，用高召回 gate + 状态容器替代。视觉门禁保持高召回
+    # （0.2% 像素变化即触发），由 state_memory 判断「状态是否真的变了」。
+    change_threshold: float = 0.002
     cooldown_ms: int = 1000
     audio_energy_threshold: float = 0.015
     # VAD(silero)门控 speeches 字段:音频过能量 gate 后,再用 VAD 判本窗有没有真人声。
@@ -229,7 +261,7 @@ class GateConfig:
     # 默认 90s:过长(如 6min)在画面间歇有变化的场景会持续刷新 last_visual_pass_ts、
     # hold 窗反复续命,期间纯静默窗也被拉起跑下游,浪费 omni 调用。运维侧可在
     # settings.yaml 的 perception.engine.gate.hold_duration_sec 覆盖。
-    hold_duration_sec: float = 90.0
+    hold_duration_sec: float = 0.0
     semantic: SemanticGateConfig = field(default_factory=SemanticGateConfig)
     dump: GateDumpConfig = field(default_factory=GateDumpConfig)
 
@@ -532,12 +564,53 @@ class OmniConfig:
 
 
 @dataclass
+class TrackLineCameraConfig:
+    """单个机位的过线计数几何（归一化坐标，与分辨率无关）。
+
+    line 是门线两端点，inside 是室内侧任一点；track 的框中心越过门线且
+    与 inside 同侧即室内。pass_min_dx 是"经过"所需的横向位移；max_gap_sec
+    内没再看到该 track 就结算（未过线且横向位移够 → 经过）。
+    """
+
+    line: list[list[float]]
+    inside: list[float]
+    task_id: str = "c700_gate_count"
+    pass_min_dx: float = 0.15
+    max_gap_sec: float = 8.0
+    line_deadband: float = 0.015
+
+
+@dataclass
+class TrackCountConfig:
+    """Tracking 过线计数：进入/出去/经过，直接写 task_record event。"""
+
+    enabled: bool = False
+    cameras: dict[str, TrackLineCameraConfig] = field(default_factory=dict)
+
+
+@dataclass
+class StateMemoryConfig:
+    """状态容器：新链只报一次、到点提醒；门禁拦截时续命 + 定时强制复核。
+
+    - 门禁判「无活动级变化」= 状态延续：刷新建议链、给规则喂 True；
+    - 每隔 ``recheck_interval_sec`` 强制放一窗给 omni 复核，确认状态或结束；
+    - 不做画面基线/帧差（状态是否变了由本地 VLM / omni 回答）。
+    """
+
+    enabled: bool = True
+    # 状态还在时，最长多久不调 omni 就强制放一窗复核。
+    recheck_interval_sec: float = 300.0
+
+
+@dataclass
 class PerceptionConfig:
     input: InputConfig = field(default_factory=InputConfig)
     gate: GateConfig = field(default_factory=GateConfig)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     omni: OmniConfig = field(default_factory=OmniConfig)
     identity_engine: IdentityEngineConfig = field(default_factory=IdentityEngineConfig)
+    track_count: TrackCountConfig = field(default_factory=TrackCountConfig)
+    state_memory: StateMemoryConfig = field(default_factory=StateMemoryConfig)
 
 
 # =============================================================================
@@ -587,3 +660,29 @@ def identity_engine_config_from_dict(d: dict | None) -> IdentityEngineConfig:
         kwargs[k] = cls(**_filter(cls, d.get(k)))
 
     return IdentityEngineConfig(**kwargs)
+
+
+def track_count_config_from_dict(d: dict | None) -> TrackCountConfig:
+    """``perception.engine.track_count`` dict → TrackCountConfig（逐机位几何）。"""
+    if not d:
+        return TrackCountConfig()
+    cameras: dict[str, TrackLineCameraConfig] = {}
+    for did, raw in (d.get("cameras") or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        try:
+            line = [[float(v) for v in p] for p in raw["line"]]
+            inside = [float(v) for v in raw["inside"]]
+            if len(line) != 2 or any(len(p) != 2 for p in line) or len(inside) != 2:
+                raise ValueError("line needs two [x,y] points and inside one [x,y]")
+            cameras[str(did)] = TrackLineCameraConfig(
+                line=line,
+                inside=inside,
+                task_id=str(raw.get("task_id") or "c700_gate_count"),
+                pass_min_dx=float(raw.get("pass_min_dx", 0.15)),
+                max_gap_sec=float(raw.get("max_gap_sec", 8.0)),
+                line_deadband=float(raw.get("line_deadband", 0.015)),
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning("track_count camera %s config invalid", did, exc_info=True)
+    return TrackCountConfig(enabled=bool(d.get("enabled", False)), cameras=cameras)

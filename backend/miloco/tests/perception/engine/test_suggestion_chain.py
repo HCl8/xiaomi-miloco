@@ -12,6 +12,12 @@ from __future__ import annotations
 
 import numpy as np
 from miloco.perception.engine.api import PerceptionEngine
+from miloco.perception.engine.state_memory import StateContainer
+from miloco.perception.engine.types import (
+    BatchPipelineResult,
+    DevicePipelineResult,
+    RoomPipelineResult,
+)
 from miloco.perception.types import Suggestion
 
 
@@ -43,6 +49,9 @@ def _engine(embedder=None) -> PerceptionEngine:
     eng._sugg_table = {}
     eng._next_sugg_id = {}
     eng._embedder = embedder
+    eng._current_frames = {}
+    eng._current_rooms = {}
+    eng._current_device_names = {}
     return eng
 
 
@@ -106,31 +115,48 @@ def test_escalation_within_cooldown_updates_text_but_suppressed():
     assert entry["urgency"] == "high"
 
 
-def test_escalation_to_high_rereports_after_high_cooldown():
-    """升级到 high 后采用更短的 high 冷却(60s)：过了 60s 即复报，让 agent 重新惊动。"""
+def test_heartbeat_after_old_cooldown_still_suppressed():
+    """3.2 上报策略：心跳不再按 urgency cooldown 复报，改为状态定时器补提醒。"""
     eng = _engine(_FakeEmbedder(_DRIFT_GROUP))
     eng.assign_id_and_update_link("room", _sugg("靠近刀具", urgency="low"), now=100.0)  # 首报 low
     # 升级到 high，但距首报仅 10s < 60s → 抑制
     assert eng.assign_id_and_update_link("room", _sugg("挥舞刀具", urgency="high"), now=110.0) is True
-    # 距上次上报(t=100) 已过 high 冷却 60s → 复报
+    # 即使超过旧的 high 冷却，也仍是心跳 → 抑制；提醒由 state_memory 到点发
     s = _sugg("挥舞刀具", urgency="high")
-    assert eng.assign_id_and_update_link("room", s, now=161.0) is False  # 61s ≥ 60s
+    assert eng.assign_id_and_update_link("room", s, now=161.0) is True
     assert s.urgency == "high"
 
 
-def test_persistent_event_rereports_after_cooldown():
-    """同一持续事件按 urgency 的冷却节奏周期复报：low=300s，冷却内抑制、过了才再上报。"""
+def test_persistent_event_heartbeat_never_rereports():
+    """3.2：持续事件只在状态进入时报一次；之后心跳一律抑制，不再按 cooldown 复报。"""
     eng = _engine(_FakeEmbedder())
     assert eng.assign_id_and_update_link("room", _sugg("冰箱门敞开", urgency="low"), now=0.0) is False  # 首报
-    # 冷却内的心跳全部抑制
+    # 之后所有心跳都只维持状态，不再复报
     assert eng.assign_id_and_update_link("room", _sugg("冰箱门敞开", urgency="low"), now=100.0) is True
     assert eng.assign_id_and_update_link("room", _sugg("冰箱门敞开", urgency="low"), now=299.0) is True
-    # 过了 low 冷却 300s → 复报一次
-    assert eng.assign_id_and_update_link("room", _sugg("冰箱门敞开", urgency="low"), now=300.0) is False
-    # 复报后重新进入冷却
+    assert eng.assign_id_and_update_link("room", _sugg("冰箱门敞开", urgency="low"), now=300.0) is True
     assert eng.assign_id_and_update_link("room", _sugg("冰箱门敞开", urgency="low"), now=400.0) is True
 
 
+def test_state_timer_reminder_only():
+    """3.2 上报：状态进入报一次；到点发提醒；不做帧差/不清状态。"""
+    eng = _engine(_FakeEmbedder())
+    s = _sugg("冰箱门敞开", action="关门", urgency="low")
+    assert eng.assign_id_and_update_link("room", s, now=0.0) is False
+    entry = eng._sugg_table["room"][1]
+    assert entry["next_check_ts"] == 300.0
+    assert entry["state_suggestion"].event == "冰箱门敞开"
+
+    assert eng._collect_state_reminders(299.0) == []
+    reminders = eng._collect_state_reminders(300.0)
+    assert len(reminders) == 1
+    assert reminders[0].id == 1
+    assert reminders[0].event == "冰箱门敞开"
+    assert entry["next_check_ts"] == 600.0
+    assert eng._collect_state_reminders(599.0) == []
+    assert len(eng._collect_state_reminders(600.0)) == 1
+    # 状态链仍在（不再有帧差清除逻辑）
+    assert 1 in eng._sugg_table["room"]
 def test_downgrade_ignored_keeps_peak_urgency():
     """urgency 单调不降级：链接轮报更低 urgency → 忽略，沿用历史峰值，仍当心跳抑制。"""
     eng = _engine(_FakeEmbedder(_DRIFT_GROUP))
@@ -177,3 +203,79 @@ def test_fallback_exact_match_when_no_embedder():
     assert eng.assign_id_and_update_link("room", other, now=106.0) is False
     assert other.id == 2
     assert len(eng._sugg_table["room"]) == 2
+
+
+def test_touch_active_chain_keeps_it_past_reminder_deadline():
+    """门禁拦截窗：状态容器续命后，链不会在提醒到点那一刻被 TTL 淘汰。"""
+    eng = _engine(_FakeEmbedder())
+    eng._state_container = StateContainer(recheck_interval_sec=300.0)
+    assert (
+        eng.assign_id_and_update_link(
+            "room", _sugg("冰箱门敞开", urgency="low"), now=0.0
+        )
+        is False
+    )
+    eng._state_container.note_omni("room", ["r1"], ["r1"], now=0.0)
+
+    # 对照组：不续命时，300s 恰好触发 low 的淘汰阈值
+    untouch = _engine(_FakeEmbedder())
+    untouch.assign_id_and_update_link(
+        "room", _sugg("冰箱门敞开", urgency="low"), now=0.0
+    )
+    untouch._evict_expired_links("room", now=300.0)
+    assert untouch._sugg_table.get("room", {}) == {}
+
+    # 续命后 last_ts 被刷新 → 链保留，提醒定时器仍能到点
+    eng._touch_active_chains("room", now=290.0)
+    assert eng._sugg_table["room"][1]["last_ts"] == 290.0
+    eng._evict_expired_links("room", now=300.0)
+    assert 1 in eng._sugg_table["room"]
+    reminders = eng._collect_state_reminders(300.0)
+    assert len(reminders) == 1
+
+
+def test_touch_skips_chain_without_recent_heartbeat():
+    """被新事件替换掉的旧链不会被无限续命。"""
+    eng = _engine(_FakeEmbedder())
+    eng._state_container = StateContainer(recheck_interval_sec=300.0)
+    eng.assign_id_and_update_link("room", _sugg("旧事件", urgency="low"), now=0.0)
+    eng.assign_id_and_update_link("room", _sugg("新事件", urgency="low"), now=0.0)
+    eng._state_container.note_omni("room", [], [], now=0.0, has_signal=True)
+
+    # 旧链的最近心跳是 0；在 2×复核间隔之后不再 touch
+    eng._touch_active_chains("room", now=601.0)
+    assert eng._sugg_table["room"][1]["last_ts"] == 0.0
+
+
+def test_merge_results_gate_blocked_touches_chain_without_feeding_rules():
+    """整间房被门禁拦住时：收集 blocked did、刷新链 TTL；不产生规则续命样本。"""
+    eng = _engine(_FakeEmbedder())
+    eng._state_container = StateContainer(recheck_interval_sec=300.0)
+    assert (
+        eng.assign_id_and_update_link(
+            "cam_A", _sugg("人在工位工作", urgency="low"), now=0.0
+        )
+        is False
+    )
+    eng._state_container.note_omni("cam_A", ["rule_work"], ["rule_work"], now=0.0)
+
+    result = BatchPipelineResult(
+        rooms={
+            "客厅": RoomPipelineResult(
+                room_name="客厅",
+                skipped=True,
+                device_results={
+                    "cam_A": DevicePipelineResult(
+                        device_id="cam_A", skipped=True, gate_blocked=True
+                    )
+                },
+            )
+        }
+    )
+    merged = eng._merge_results(
+        result, device_rule_map={"cam_A": ["rule_work"]}, now=290.0
+    )
+
+    assert merged.skipped is True
+    assert merged.gate_blocked_dids == ["cam_A"]
+    assert eng._sugg_table["cam_A"][1]["last_ts"] == 290.0

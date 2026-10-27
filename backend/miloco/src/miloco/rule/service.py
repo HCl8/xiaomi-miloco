@@ -367,17 +367,12 @@ def _validate_rule_consistency(rule: Rule) -> None:
     # condition.query 的两条校验 (非空 / 措辞) 不在这里 —— 它们必须排在服务端渲染
     # 之后, 见 RuleService._prepare_condition 的五步。
 
-    if rule.resolved_source_type == IOT_SOURCE_TYPE and rule.duration_seconds:
-        # _evaluate_duration 的滑窗按墙上时钟分 round、采样断流用 0 补齐, 且窗口未填满
-        # 就早返。事件驱动的喂法填不满窗口 ——「空调开了两小时」这条规则永远不会触发。
-        # 拒绝比静默不触发好: 后者用户看不出来, 而且规则看起来配得完全正确。
-        #
-        # 装在这里而不是条件项那五步里: 那五步只在 PATCH 真的碰了条件时才跑, 而
-        # `rule update --duration-seconds` 一个条件字段都不碰。本函数是三条写入路径
-        # 的必经处。
+    if rule.duration_seconds and rule.resolved_direction is not RuleDirection.SESSION:
+        # duration_seconds 现在是「会话连续目标时长」：会话 ENTERED 后起定时器，
+        # 退出重置。单方向的 enter/exit 没有会话边界，定时器无处挂，配了也不会触发。
         raise ValidationException(
-            "iot 条件项不支持 duration_seconds: 累计滑窗要连续采样, "
-            "而属性是被推来的、填不满窗口, 规则会永远不触发"
+            "duration_seconds 只支持 direction=session: 它表示会话进入后的连续"
+            "目标时长；单方向规则请改用 record 累计或去掉该字段"
         )
 
     if rule.resolved_direction is RuleDirection.MILESTONE:
@@ -1125,16 +1120,6 @@ class RuleService:
                 f"available: {', '.join(sorted(scenes)) or '(none)'}"
             )
 
-    def _fill_default_duration_ratio(self, rule: Rule) -> None:
-        """未显式指定时回填 settings.rule.default_duration_ratio。
-
-        优先级：API/CLI 显式 > settings.rule.default_duration_ratio > 代码默认 0.6。
-        """
-        if rule.duration_ratio is None:
-            from miloco.config import get_settings
-
-            rule.duration_ratio = get_settings().rule.default_duration_ratio
-
     # ---- CRUD ----
 
     async def create_rule(self, rule: Rule) -> str:
@@ -1151,7 +1136,6 @@ class RuleService:
 
         self._require_task_exists(rule.task_id)
 
-        self._fill_default_duration_ratio(rule)
 
         await self._prepare_condition(rule, stored_query=None)
         _validate_rule_consistency(rule)
@@ -1232,7 +1216,6 @@ class RuleService:
         self._require_task_exists(rule.task_id)
         _reject_task_move(previous.task_id, rule.task_id)
 
-        self._fill_default_duration_ratio(rule)
 
         # PUT 收的是完整 Rule, 输入形态与 create 相同 (pydantic 强制带 condition),
         # 所以走 create 那套而不是 PATCH 那套 —— 照搬 PATCH 的「不许同时给」会让
@@ -1406,11 +1389,11 @@ class RuleService:
         ):
             existing.exit_debounce_seconds = update.exit_debounce_seconds
 
-        # duration_seconds: nullable，None = 清空滑窗
+        # duration_seconds: 会话连续目标时长（秒），None = 关闭
         if "duration_seconds" in fields:
             existing.duration_seconds = update.duration_seconds
 
-        # duration_ratio: DB 读出始终为 concrete float；PATCH None = 不动
+        # duration_ratio: 已废弃；DB 读出始终为 concrete float，PATCH None = 不动
         if "duration_ratio" in fields and update.duration_ratio is not None:
             existing.duration_ratio = update.duration_ratio
 
@@ -1810,6 +1793,7 @@ class RuleService:
         # 排一次: arm 自带撤旧, 等于按当前累计重排, 阈值改了也一并跟上。
         if sm.runtime_state(task_id) is TaskRuntimeState.ON:
             self._runner.record_source.arm(task_id)
+            self._runner.arm_state_targets(task_id)
 
     def apply_task_status(self, task_id: str, active: bool) -> None:
         """task 启停 → 刷新派生的「有效启用」并走重新配置路径。
@@ -1857,6 +1841,14 @@ class RuleService:
         """
         return await self._runner.trigger_rule(rule_id, context)
 
+    def is_condition_satisfied(self, rule_id: str) -> bool | None:
+        """该 rule 的条件当前是否为真（``None`` = 未就绪）。
+
+        感知侧状态容器续命前用它兜底：只给「本来就在态内」的规则喂 True，
+        不会把一条已退出的规则重新拉起来。
+        """
+        return self._runner.is_condition_satisfied(rule_id)
+
     async def update_state(
         self,
         rule_id: str,
@@ -1869,6 +1861,7 @@ class RuleService:
         device_name: str = "",
         cycle_source_states: dict[str, bool] | None = None,
         trigger_event_id: str | None = None,
+        skip_flicker: bool = False,
     ) -> TriggerOutcome:
         """Per-frame, per-source state report from the perception engine.
 
@@ -1877,12 +1870,16 @@ class RuleService:
 
         ``trigger_event_id`` 是感知路径专有的（感知侧 mint 的那条事件行）；record
         源达标那条路直接调 runner、不走这里，故那边留空。
+
+        ``skip_flicker``：感知只在 VLM 确认的过渡窗调用 omni，一帧 False 就是真
+        过渡，不再等第二帧；退出宽限由 ``exit_debounce_seconds`` 在任务层提供。
         """
         return await self._runner.update_state(
             rule_id, source_did, current_bool, context, trigger_room, trigger_dids,
             caption=caption, device_name=device_name,
             cycle_source_states=cycle_source_states,
             trigger_event_id=trigger_event_id,
+            skip_flicker=skip_flicker,
         )
 
     # ---- Logs ----

@@ -75,6 +75,7 @@ async def test_extract_includes_rules_profile_and_caps(monkeypatch):
             RuleCondition(rule_id="r2", rule_name="[fall] 摔倒", query="有人摔倒"),
         ],
         generic_instructions="有没有变化？",
+        input_layout="画面共 5 张，第 1 张是参考帧，第 2 到第 5 张是本窗口。",
         config=SpecialPassConfig(max_items=2, extra_instructions="重点看宠物"),
         omni_config=OmniConfig(model="test-model"),
     )
@@ -84,6 +85,12 @@ async def test_extract_includes_rules_profile_and_caps(monkeypatch):
     assert "宝宝在爬行垫上爬" in user
     assert "有人摔倒" in user
     assert "关注老人" in user
+    assert "画面共 5 张，第 1 张是参考帧" in user
+    # 写 prompt 的规范必须强调「变化」、禁止静态状态，且常规活动要交给默认问题
+    assert "变化时刻" in user
+    assert "禁止输出静态或持续状态" in user
+    assert "常规活动默认问题已经明确覆盖" in user
+    assert "喝水/吃东西、打哈欠、看手机" in user
     assert "补充要求：\n重点看宠物" in user
     assert captured["cfg"].max_completion_tokens == 10000
     assert model == "test-model"
@@ -278,6 +285,7 @@ def test_camera_key_changes_with_rules_profile_and_room():
         room_name="客厅",
         camera_prompt=None,
         generic_instructions="q",
+        input_layout="第 1 张是参考帧，其余是本窗口。",
         model_name="m",
         max_items=4,
         max_action_chars=60,
@@ -292,6 +300,10 @@ def test_camera_key_changes_with_rules_profile_and_room():
     assert k0 != sp._camera_key(**{**base, "profile": "p2"}, rules=[rule_a])
     assert k0 != sp._camera_key(**{**base, "room_name": "厨房"}, rules=[rule_a])
     assert k0 != sp._camera_key(**{**base, "max_items": 2}, rules=[rule_a])
+    # 公共输入布局改了（参考帧/本窗口描述），提炼结果必须重跑
+    assert k0 != sp._camera_key(
+        **{**base, "input_layout": "玩法不同的布局"}, rules=[rule_a]
+    )
 
 
 def test_cache_round_trip(tmp_path):

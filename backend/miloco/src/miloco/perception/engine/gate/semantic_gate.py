@@ -4,7 +4,9 @@
 这里把参考帧 + 本窗抽样帧发给本地决策模型，取 P(有变化) 作为语义分。
 
 除了默认的「相对参考帧有没有变化」问题，还会带上本机位经 LLM 提炼的「特殊放行」
-问题（自定义任务 + 家庭档案），一次请求多问、任一过阈值即放行。
+问题（自定义任务 + 家庭档案）。特殊放行项也只描述**变化**（新出现/刚开始/刚切换），
+和默认问题一样对比第 1 张参考帧；静态持续状态不参与，避免状态在就整段放行。
+一次请求多问、任一过阈值即放行。
 
 sidecar 是独立 MLX 服务，本模块只依赖 HTTP；调用失败一律 fail-open，由上层决定
 shadow（只记分）还是 enforce（真否决）。
@@ -29,10 +31,13 @@ from miloco.perception.engine.types import SemanticGateContext
 logger = logging.getLogger(__name__)
 
 _QUESTION_KEY = "event"
+_END_KEY = "event_end"
+_PHYSIO_KEY = "event_physio"
 _PASS_KEY_PREFIX = "pass:"
 _DECISION_PATH = "/v1/systemone"
 _PASS_INSTRUCTIONS_SUFFIX = (
-    "（只看本窗口画面，不要求跟参考帧相比有变化；画面里没有出现就选否。）"
+    "（只判断这个变化；描述里点名了主体/某人/宠物时，只看对应对象；"
+    "相对第 1 张参考帧没有出现这个变化就选否。）"
 )
 
 # 后端单事件循环：按 base_url 缓存客户端/并发闸/熔断状态即可。
@@ -49,6 +54,12 @@ class SemanticEvalResult:
     score: float = 0.0  # 默认问题（相对参考帧有没有变化）的分数
     latency_ms: float = 0.0
     error: str = ""
+    # 「结束/离开」补问的分数与是否命中（默认问题对消失/结束不敏感）。
+    end_score: float = 0.0
+    end_passed: bool = False
+    # 生理关怀补问（喝水/吃东西/打哈欠等）：过阈值时状态容器不跳 omni。
+    physio_score: float = 0.0
+    physio_passed: bool = False
     # 特殊放行问题（规则/档案经 LLM 提炼）：最高分、命中下标、问了几条、总题数。
     pass_score: float = 0.0
     pass_hits: tuple[int, ...] = ()
@@ -165,7 +176,10 @@ def _render_context_block(context: SemanticGateContext | None) -> str:
     if context.camera_prompt:
         parts.append(f"【机位须知】{context.camera_prompt.strip()}")
     if context.special_items:
-        parts.append("（特殊放行问题只看第 2 张起的本窗口画面；参考帧只用于默认问题。）")
+        parts.append(
+            "（特殊放行问题同样以第 1 张为参考帧；只判相对参考帧的变化；"
+            "描述里点名了对象时只看该对象。）"
+        )
     return "\n".join(parts)
 
 
@@ -181,8 +195,12 @@ def _special_questions(
             continue
         questions[f"{_PASS_KEY_PREFIX}{i}"] = {
             "type": "noul",
-            "instructions": f"本窗口画面里，是否正在出现：{action}？{_PASS_INSTRUCTIONS_SUFFIX}",
-            "criteria": {"true": "出现了", "false": "没有出现"},
+            "instructions": (
+                "第 1 张是参考帧，第 2 张起是本窗口。"
+                f"相对参考帧，本窗口里是否出现了以下变化：{action}？"
+                f"{_PASS_INSTRUCTIONS_SUFFIX}"
+            ),
+            "criteria": {"true": "出现了这个变化", "false": "没有出现这个变化"},
         }
     return questions
 
@@ -208,6 +226,18 @@ def build_payload(
             },
         }
     }
+    if config.end_enabled:
+        questions[_END_KEY] = {
+            "type": "noul",
+            "instructions": config.end_instructions,
+            "criteria": {"true": "消失/结束/离开", "false": "没有"},
+        }
+    if config.physio_enabled:
+        questions[_PHYSIO_KEY] = {
+            "type": "noul",
+            "instructions": config.physio_instructions,
+            "criteria": {"true": "有生理动作", "false": "没有"},
+        }
     questions.update(_special_questions(context))
     return {"state": state, "questions": questions, "images": images}
 
@@ -235,7 +265,12 @@ async def evaluate_semantic(
         return SemanticEvalResult(error="cooldown")
 
     special_items = context.special_items if context is not None else ()
-    question_count = 1 + len(special_items)
+    question_count = (
+        1
+        + int(config.end_enabled)
+        + int(config.physio_enabled)
+        + len(special_items)
+    )
 
     try:
         payload = await asyncio.to_thread(
@@ -248,6 +283,20 @@ async def evaluate_semantic(
         resp.raise_for_status()
         answers = resp.json()["answers"]
         score = float(answers[_QUESTION_KEY]["noul"])
+        end_score = 0.0
+        if config.end_enabled:
+            end_answer = answers.get(_END_KEY)
+            if isinstance(end_answer, dict) and "noul" in end_answer:
+                end_score = float(end_answer["noul"])
+        end_passed = config.end_enabled and end_score >= config.end_min_score
+        physio_score = 0.0
+        if config.physio_enabled:
+            physio_answer = answers.get(_PHYSIO_KEY)
+            if isinstance(physio_answer, dict) and "noul" in physio_answer:
+                physio_score = float(physio_answer["noul"])
+        physio_passed = (
+            config.physio_enabled and physio_score >= config.physio_min_score
+        )
         pass_scores: list[float] = []
         pass_hits: list[int] = []
         for i in range(len(special_items)):
@@ -272,9 +321,18 @@ async def evaluate_semantic(
     _record_success(base_url)
     return SemanticEvalResult(
         applied=True,
-        passed=score >= config.min_score or bool(pass_hits),
+        passed=(
+            score >= config.min_score
+            or end_passed
+            or physio_passed
+            or bool(pass_hits)
+        ),
         score=score,
         latency_ms=(time.monotonic() - t0) * 1000,
+        end_score=end_score,
+        end_passed=end_passed,
+        physio_score=physio_score,
+        physio_passed=physio_passed,
         pass_score=max(pass_scores) if pass_scores else 0.0,
         pass_hits=tuple(pass_hits),
         pass_count=len(special_items),

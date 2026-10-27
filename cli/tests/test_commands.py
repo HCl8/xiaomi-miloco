@@ -1005,7 +1005,7 @@ def test_rule_create_dynamic(runner):
 
 
 def test_rule_create_with_duration_payload(runner):
-    """event + duration_seconds + duration_ratio 透传到 payload."""
+    """session + duration_seconds + duration_ratio 透传到 payload."""
     with patch("miloco_cli.client.api_post") as mock:
         mock.return_value = {"code": 0, "data": {"rule_id": "r-dur"}}
         result = runner.invoke(
@@ -1021,8 +1021,10 @@ def test_rule_create_with_duration_payload(runner):
                 "cam_study",
                 "--condition",
                 "用户坐在书桌前",
-                "--action-desc",
-                "播报起来活动",
+                "--mode",
+                "state",
+                "--on-enter-desc",
+                "进入久坐状态",
                 "--duration-seconds",
                 "60",
                 "--duration-ratio",
@@ -1036,7 +1038,7 @@ def test_rule_create_with_duration_payload(runner):
 
 
 def test_rule_create_duration_state_mode_payload(runner):
-    """STATE mode + --duration-seconds 也合法（ENTERED 前置确认门槛），payload 含两字段."""
+    """STATE mode + --duration-seconds：会话连续目标时长，payload 含两字段."""
     with patch("miloco_cli.client.api_post") as mock:
         mock.return_value = {"code": 0, "data": {"rule_id": "r-state-dur"}}
         result = runner.invoke(
@@ -1111,7 +1113,9 @@ def test_rule_create_duration_seconds_zero_rejected(runner):
             "cam",
             "--condition",
             "y",
-            "--action-desc",
+            "--mode",
+            "state",
+            "--on-enter-desc",
             "z",
             "--duration-seconds",
             "0",
@@ -1131,7 +1135,8 @@ def test_rule_create_duration_seconds_over_86400_rejected(runner):
             "--name", "[x] x",
             "--source", "cam",
             "--condition", "y",
-            "--action-desc", "z",
+            "--mode", "state",
+            "--on-enter-desc", "z",
             "--duration-seconds", "86401",
         ],
     )
@@ -1154,7 +1159,9 @@ def test_rule_create_duration_ratio_zero_rejected(runner):
             "cam",
             "--condition",
             "y",
-            "--action-desc",
+            "--mode",
+            "state",
+            "--on-enter-desc",
             "z",
             "--duration-seconds",
             "60",

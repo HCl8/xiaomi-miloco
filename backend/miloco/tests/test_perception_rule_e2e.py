@@ -6,7 +6,7 @@
 
 层 1-3 mock 出 update_state 调用观察参数;本层用真 RuleRunner 让状态机跑起
 来,catch 多函数组合后的边界 bug——比如 cam_A 离线 N 个周期后回归,rule
-状态是否真的保持;duration 跨摄像头 OR 是否真的累计;pending_exit 是否真
+状态是否真的保持;多 source 桶是否互相污染;pending_exit 是否真
 的不被旁观摄像头污染。
 """
 
@@ -521,8 +521,10 @@ async def test_e2e_multi_cam_or_aggregation(proxy_with_runner, mock_miot_proxy):
 async def test_e2e_pending_exit_no_cross_pollution(
     proxy_with_runner, mock_miot_proxy
 ):
-    """cam_A 进 pending_exit 时 cam_B 帧不应清掉 cam_A 的 pending(per-did 桶隔离)。
-    本 case 走完整 perception client 入口 + 多 source matched_rules。"""
+    """cam_A 的一帧 False 直接确认（skip_flicker），cam_B 仍 True → rule 不退出。
+
+    本 case 走完整 perception client 入口 + 多 source matched_rules；锁的是
+    per-source 桶隔离：A 退出不影响 B。"""
     proxy, runner, mgr_ctx = proxy_with_runner
     runner.add_rule(_make_state_rule("rule_pex", ["cam_A", "cam_B"]))
     runner.set_task_actions(f"{TASK_ID}-rule_pex", {'on_enter_actions': [{'did': 'enter-rule_pex', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-rule_pex', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
@@ -544,17 +546,14 @@ async def test_e2e_pending_exit_no_cross_pollution(
         assert runner._last_source_state[("rule_pex", "cam_A")] is True
         assert runner._last_source_state[("rule_pex", "cam_B")] is True
 
-        # cycle 2: 只有 B 命中 → A 桶喂 false(false 广播路径),1st pending
+        # cycle 2: 只有 B 命中 → A 桶喂 false（感知过渡一帧确认）
         await proxy.handle_realtime_perception_result(
             _result(matched=[("rule_pex", ["cam_B"], "B")], device_rule_map=dm),
             artifacts=None,
         )
-        # A 应在 pending_source_exit 里(prev=True, this=False, 1st frame)
-        assert ("rule_pex", "cam_A") in runner._pending_source_exit, (
-            "A 的 1st false 未进 pending"
-        )
-        # B 不应在 pending(B 这一帧仍 True,update_state 路径不进 pending_exit)
-        assert ("rule_pex", "cam_B") not in runner._pending_source_exit
+        assert runner._last_source_state[("rule_pex", "cam_A")] is False
+        assert ("rule_pex", "cam_A") not in runner._pending_source_exit
+        assert runner._last_source_state[("rule_pex", "cam_B")] is True
 
     await runner.drain()
     # rule 仍 True(B 桶为真)
@@ -568,89 +567,6 @@ async def test_e2e_pending_exit_no_cross_pollution(
 
 
 @pytest.mark.asyncio
-async def test_e2e_duration_multi_source_sync_transition_no_overcount(
-    proxy_with_runner, mock_miot_proxy, mock_log_repo
-):
-    """duration_seconds 配置 rule,多 source 同步翻 True→False 时不应过计数。
-
-    场景:rule 绑 [cam_A, cam_B] duration_seconds=1, ratio=1.0, sample_interval=0.5
-    (maxlen=2 → 满 ratio 即 fire)。
-    - cycle 1 (round=200): A=True, B=True → 累计 [1]
-    - cycle 2 (round=201): A=False, B=False → 实际应累计 [1, 0]，不 fire;
-      false 广播 cam_A 先到时也不能把 cam_B 的上一帧 True 当成本轮 True。
-    """
-    from miloco.rule.runner import RuleRunner
-    from miloco.rule.schema import (
-        Rule,
-        RuleAction,
-        RuleCondition,
-        RuleLifecycle,
-        RuleMode,
-    )
-
-    proxy, _runner, _mgr_ctx = proxy_with_runner
-    runner_dur = RuleRunner(
-        rules=[],
-        miot_proxy=mock_miot_proxy,
-        rule_log_repo=mock_log_repo,
-        sample_interval_seconds=0.5,
-    )
-    rule = Rule(
-        id="rule_dur_or",
-        name=f"[{TASK_ID}] dur-or",
-        task_id=TASK_ID,
-        mode=RuleMode.EVENT,
-        lifecycle=RuleLifecycle.PERMANENT,
-        enabled=True,
-        condition=RuleCondition(perceive_device_ids=["cam_A", "cam_B"], query="人"),
-        actions=[
-            RuleAction(did="fire-d", iid="prop.2.1", value=True, idempotent=True)
-        ],
-        duration_seconds=1,
-        duration_ratio=1.0,
-    )
-    runner_dur.add_rule(rule)
-
-    fake_mgr = MagicMock()
-    fake_mgr.rule_service.update_state = runner_dur.update_state
-    fake_mgr.rule_service.get_enabled_rule_ids = lambda: [
-        r.id for r in runner_dur.get_enabled_rules()
-    ]
-
-    dm = {"cam_A": ["rule_dur_or"], "cam_B": ["rule_dur_or"]}
-
-    with patch("miloco.manager.get_manager", return_value=fake_mgr), \
-         patch("miloco.rule.runner.time.time") as mt:
-        mt.return_value = 100.0
-        await proxy.handle_realtime_perception_result(
-            _result(
-                matched=[
-                    ("rule_dur_or", ["cam_A"], "A"),
-                    ("rule_dur_or", ["cam_B"], "B"),
-                ],
-                device_rule_map=dm,
-            ),
-            artifacts=None,
-        )
-        mt.return_value = 100.5
-        await proxy.handle_realtime_perception_result(
-            _result(device_rule_map=dm),
-            artifacts=None,
-        )
-
-    await runner_dur.drain()
-
-    # 两 source 同步退出时，本轮状态应按 cycle 快照聚合为 False，不能沿用任一
-    # source 的上一帧 True 过计入 duration 窗口。
-    dids = [
-        call[0][0][0].did
-        for call in mock_miot_proxy.set_device_properties.call_args_list
-    ]
-    assert "fire-d" not in dids, (
-        f"两 source 同步翻 False 不应触发 duration fire,实际 fire 列表 {dids}"
-    )
-
-
 @pytest.mark.asyncio
 async def test_e2e_disabled_rule_during_cycle(proxy_with_runner, mock_miot_proxy):
     """rule 下发到 omni 后 cycle 内被 disable:false 广播路径应跳过该 rule,

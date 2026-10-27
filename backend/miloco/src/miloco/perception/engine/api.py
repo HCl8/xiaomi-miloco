@@ -19,6 +19,12 @@ from numpy.typing import NDArray
 
 from miloco.perception.engine.identity.names import build_name_lookup
 from miloco.perception.engine.identity.tier_u import cam_id_from_device_id
+from miloco.perception.engine.state_memory import (
+    URGENCY_INTERVAL_SEC,
+    StateContainer,
+    remember_state,
+    tick_state,
+)
 from miloco.perception.engine_base import BasePerceptionEngine
 from miloco.perception.types import (
     URGENCY_RANK,
@@ -48,10 +54,10 @@ _PENDING_SPEECH_TIMEOUT_SEC = 30
 _ENGINE_RETRY_INTERVAL_SEC = 600.0
 
 # === suggestion 事件链表参数 ===（URGENCY_RANK 已上移至 perception.types,单一真值）
-# COOLDOWN_SEC 同时是「同一持续事件的再提醒间隔」与「链条无心跳后的淘汰 TTL」。
-# urgency 只决定这个间隔的长短：越紧急催得越勤（high 1min / medium 2min / low 5min）。
-# 复报只看「距上次上报是否过了当前 urgency 的冷却」——见 assign_id_and_update_link。
-COOLDOWN_SEC: dict[str, float] = {"high": 60.0, "medium": 120.0, "low": 300.0}
+# 事件链仍负责语义去重；上报节奏改由 state_memory 的「状态记忆 + 定时复核」接管：
+# 新链只报一次，心跳不复报；定时器到点由本地基线复核决定「继续提醒」或「清除记忆」。
+# COOLDOWN_SEC 保留为旧字段的淘汰 TTL / 状态定时器间隔（与 state_memory 同源）。
+COOLDOWN_SEC: dict[str, float] = dict(URGENCY_INTERVAL_SEC)
 MAX_EID: int = 999
 
 # suggestion 事件链匹配阈值：本轮 event 与已有链 event 的句向量余弦 ≥ 此值即判为
@@ -306,6 +312,16 @@ class PerceptionEngine(BasePerceptionEngine):
         # Per-device 事件链表：device_id -> {eid: {"event","action","urgency","last_ts","embedding"}}
         # urgency 单调不降级（only-up），故单字段即可，不再区分 current/max
         self._sugg_table: dict[str, dict[int, dict]] = {}           # key: device_id
+        # 上报状态记忆只做「报一次 + 到点提醒」；房间/设备名只用于提醒元信息。
+        self._current_rooms: dict[str, str] = {}
+        self._current_device_names: dict[str, str] = {}
+        # 状态容器：记住每台相机当前被 omni 确认过的规则/事件，门禁持续拦截时续命，
+        # 并每隔 recheck_interval_sec 强制放一窗给 omni 复核。
+        sm_cfg = self._config.state_memory
+        self._state_container = StateContainer(
+            recheck_interval_sec=sm_cfg.recheck_interval_sec,
+            enabled=sm_cfg.enabled,
+        )
 
         # suggestion 语义去重的句向量编码器；缺模型/依赖时降级为精确文本匹配，不影响主流程。
         self._embedder = None
@@ -814,15 +830,12 @@ class PerceptionEngine(BasePerceptionEngine):
             # urgency 单调不降级：对外回写链条当前（峰值）紧急度
             sugg.urgency = entry["urgency"]
             entry["last_ts"] = now  # refresh TTL — 事件仍在持续，延长链条生存期
+            entry["last_seen_ts"] = now
+            entry["last_heartbeat_ts"] = now  # 真实 omni 心跳（续命 touch 不算）
             sugg.id = eid
-            # 冷却节流：复报只看「距上次上报是否过了当前 urgency 的冷却」。urgency 只决定
-            # 冷却长短——升级到 high 即采用更短冷却(60s)、因而更易够到门槛，但仍须过完该冷却
-            # 才复报，没过就抑制。替代旧的「升级即复报 / 30s TTL 过期重建」两条刷屏路径。
-            cooldown = COOLDOWN_SEC.get(entry["urgency"], COOLDOWN_SEC["medium"])
-            if now - entry.get("last_report_ts", 0.0) >= cooldown:
-                entry["last_report_ts"] = now
-                return False  # 过了冷却 → 复报
-            return True  # 冷却内 → 抑制
+            # 3.2 上报策略：心跳只维持状态，不按窗口/cooldown 复报。真正的「继续提醒」
+            # 由 state_memory 定时器在到点时发一次；门禁拦截期间由状态容器续命。
+            return True  # 心跳 → 抑制上报
         else:
             if not sugg.event:
                 # event 为空又无可匹配链：丢弃，不开空链、不外发（否则 agent 会收到一条
@@ -830,26 +843,77 @@ class PerceptionEngine(BasePerceptionEngine):
                 logger.info("[sugg-link drop] room=%s event 为空，丢弃", room)
                 return True  # 视为已处理（抑制上报），不创建新链
             eid = self._alloc_eid(room, table)
-            table[eid] = {
+            entry = {
                 "event": sugg.event,
                 "action": sugg.action,
                 "urgency": urgency,
                 "last_ts": now,         # 最后一次「被检测到」——驱动淘汰
-                "last_report_ts": now,  # 最后一次「上报给 agent」——驱动冷却复报
+                "last_seen_ts": now,
+                "last_heartbeat_ts": now,  # 真实 omni 心跳（续命 touch 不算）
                 "embedding": emb,  # 可能为 None（embedder 不可用），匹配时跳过
             }
+            # 状态进入：报一次并起提醒定时器；不做画面基线/帧差，状态过滤
+            # 交给本地 VLM 门禁。
+            sm = getattr(getattr(self, "_config", None), "state_memory", None)
+            if sm is None or getattr(sm, "enabled", True):
+                remember_state(entry, sugg, now)
+            table[eid] = entry
             sugg.id = eid
-            return False  # new chain — report
+            return False  # new chain — report once
+
+    def _touch_active_chains(self, did: str, now: float) -> None:
+        """门禁拦截窗：状态容器说状态还在，刷新链的 TTL，避免它在提醒到点前被淘汰。
+
+        只 touch 最近两个复核周期内还有真实 omni 心跳的链——被新事件替换掉的旧链
+        不会被无限续命。
+        """
+        table = self._sugg_table.get(did)
+        if not table:
+            return
+        horizon = self._state_container.recheck_interval_sec * 2
+        for entry in table.values():
+            last_hb = float(entry.get("last_heartbeat_ts") or entry["last_ts"])
+            if now - last_hb <= horizon:
+                entry["last_ts"] = now
+                entry["last_seen_ts"] = now
 
     def _evict_expired_links(self, room: str, now: float) -> None:
-        """淘汰超过 COOLDOWN_SEC 的事件链（TTL = 对应 urgency 的 cooldown）。"""
+        """淘汰超过 urgency cooldown 没再被心跳/状态容器续命的事件链。"""
         table = self._sugg_table.get(room)
         if not table:
             return
         self._sugg_table[room] = {
-            eid: v for eid, v in table.items()
-            if (now - v["last_ts"]) < COOLDOWN_SEC.get(v["urgency"], COOLDOWN_SEC["medium"])
+            eid: v
+            for eid, v in table.items()
+            if (now - v["last_ts"])
+            < COOLDOWN_SEC.get(v["urgency"], COOLDOWN_SEC["medium"])
         }
+
+    def _collect_state_reminders(self, now: float) -> list[Suggestion]:
+        """收集到点的状态提醒；不做任何帧差/状态变更判断。"""
+        sm = getattr(getattr(self, "_config", None), "state_memory", None)
+        if sm is not None and not getattr(sm, "enabled", True):
+            return []
+        reminders: list[Suggestion] = []
+        for did, table in list(self._sugg_table.items()):
+            for eid, entry in list(table.items()):
+                tick = tick_state(
+                    entry,
+                    now,
+                    eid=eid,
+                    did=did,
+                    room=getattr(self, "_current_rooms", {}).get(did, ""),
+                    device_name=getattr(self, "_current_device_names", {}).get(did, ""),
+                )
+                if tick.reminder is not None:
+                    reminders.append(tick.reminder)
+                    logger.info(
+                        "[state-memory] reminder did=%s eid=%d event=%r",
+                        did,
+                        eid,
+                        entry.get("event"),
+                    )
+        return reminders
 
     def _alloc_eid(self, room: str, table: dict[int, dict]) -> int:
         """分配新链 id。1..MAX_EID 单调累加；超过后从空位复用。"""
@@ -886,6 +950,7 @@ class PerceptionEngine(BasePerceptionEngine):
         self._gate_last_audio_pass_ts.clear()
         self._gate_hold_active.clear()
         self._gate_hold_started_at.clear()
+        self._state_container.reset()
 
     def apply_omni_fps(self, omni_fps: int) -> None:
         """运行时热更 omni_fps（含其经 adjust_fps_for_omni 顶起的 tracker fps），
@@ -1075,10 +1140,33 @@ class PerceptionEngine(BasePerceptionEngine):
             # 剔除 BatchedSnapshot.snapshots 影响。
             return RealtimePerceptionResult(skipped=True)
 
+        # 状态提醒只需要房间/设备名；不做画面基线/帧差。
+        for room_name, snapshots in batch.by_room().items():
+            for snapshot in snapshots:
+                did = snapshot.device.did
+                self._current_rooms[did] = room_name
+                self._current_device_names[did] = (
+                    getattr(snapshot.device, "name", "") or did
+                )
+
         # 进入新一轮前先按 TTL 淘汰过期事件链
         now = time.monotonic()
         for did in list(self._sugg_table.keys()):
             self._evict_expired_links(did, now)
+
+        # 3.2 上报：到点补一次提醒；不做画面基线/帧差。
+        state_reminders: list[Suggestion] = self._collect_state_reminders(now)
+
+        # 状态容器到点复核：只对本轮真的有数据的相机放行，避免对离线相机空放。
+        batch_dids = {s.device.did for s in batch.snapshots}
+        recheck_dids = [
+            did for did in self._state_container.recheck_due(now)
+            if did in batch_dids
+        ]
+        for did in recheck_dids:
+            self._state_container.mark_recheck_issued(did, now)
+        if recheck_dids:
+            logger.info("[state-container] recheck dids=%s", recheck_dids)
 
         # Build per-device contexts with filtered rules（rules 按 device 维度精确筛选——
         # rule.condition.perceive_device_ids 命中该 device 才下发；空列表表示全部感知
@@ -1173,6 +1261,7 @@ class PerceptionEngine(BasePerceptionEngine):
                 gate_last_audio_pass_ts=self._gate_last_audio_pass_ts,
                 gate_hold_active=self._gate_hold_active,
                 gate_hold_started_at=self._gate_hold_started_at,
+                force_omni_dids=set(recheck_dids),
                 trace_id=trace_id,
                 device_trace_ids=device_trace_ids,
                 collect_flow_diagnostics=collect_flow_diagnostics,
@@ -1187,7 +1276,17 @@ class PerceptionEngine(BasePerceptionEngine):
         self._global_frame_index += self._config.input.fps * self._config.input.period_sec
 
         # Merge all rooms into a single RealtimePerceptionResult
-        return self._merge_results(result, contexts, device_rule_map=device_rule_map)
+        merged = self._merge_results(
+            result,
+            contexts,
+            device_rule_map=device_rule_map,
+            now=now,
+        )
+        merged.recheck_dids = list(recheck_dids)
+        # 状态记忆到点的提醒与 omni 本轮新链一起交给 client → agent；心跳本身不重复报。
+        if state_reminders:
+            merged.suggestions.extend(state_reminders)
+        return merged
 
     async def on_demand_perceive(
         self,
@@ -1266,6 +1365,7 @@ class PerceptionEngine(BasePerceptionEngine):
         result: BatchPipelineResult,
         contexts: dict[str, OmniContext] | None = None,
         device_rule_map: dict[str, list[str]] | None = None,
+        now: float | None = None,
     ) -> RealtimePerceptionResult:
         """把所有 room × device 的 OmniOutput 合并成一份 RealtimePerceptionResult。
 
@@ -1298,11 +1398,21 @@ class PerceptionEngine(BasePerceptionEngine):
             flow_diagnostics=result.flow_diagnostics,
         )
 
-        for room_name, room_result in result.rooms.items():
-            if room_result.skipped:
-                continue
+        state_now = time.monotonic() if now is None else now
+        rule_map = device_rule_map or {}
 
+        for room_name, room_result in result.rooms.items():
+            # 整间房被门禁拦住时 room_result.skipped=True，但 device_results 仍在；
+            # 状态容器要给这些相机续命，不能整间跳过。
             for did, dr in room_result.device_results.items():
+                if dr.gate_blocked:
+                    merged.gate_blocked_dids.append(did)
+                    if self._state_container.is_active(did):
+                        self._touch_active_chains(did, state_now)
+                    continue
+                if room_result.skipped:
+                    continue
+
                 out = dr.omni_output
                 # out.skipped=True 来自 response_parser._fallback（JSON 解析失败
                 # 等异常路径）。fallback 的 caption=[{description: "[解析失败] ..."}]
@@ -1332,6 +1442,16 @@ class PerceptionEngine(BasePerceptionEngine):
                         else:
                             self._pending_speech_rounds[did] = rounds
                     continue
+
+                # 状态容器回填：本窗真正下发给 omni 的规则里，命中哪些、哪些没命中。
+                # 没命中的规则从容器移除，下一次门禁拦截窗不再给它续命。
+                self._state_container.note_omni(
+                    did,
+                    rule_map.get(did, []),
+                    [r.rule_id for r in out.matched_rules],
+                    state_now,
+                    has_signal=bool(out.suggestions),
+                )
 
                 # caption 每窗如实下发（不去重——去重会让"规则命中窗 caption 被吞"日志
                 # 不直观）；仅描述非空时下发并刷新 _last_captions 基准（on_demand 路径读它当上下文）。

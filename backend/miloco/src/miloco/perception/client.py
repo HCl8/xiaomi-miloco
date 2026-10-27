@@ -451,6 +451,8 @@ class PerceptionEngineProxy:
             PerceptionConfig,
             SemanticGateConfig,
             SpecialPassConfig,
+            StateMemoryConfig,
+            track_count_config_from_dict,
         )
         from miloco.perception.engine.identity.config_loader import (
             load_identity_engine_config,
@@ -470,6 +472,10 @@ class PerceptionEngineProxy:
             **semantic_raw, special_pass=SpecialPassConfig(**special_raw)
         )
         dump_cfg = GateDumpConfig(**gate_cfg.pop("dump", {}))
+        track_count_cfg = track_count_config_from_dict(engine_cfg.get("track_count"))
+        state_memory_cfg = StateMemoryConfig(
+            **(engine_cfg.get("state_memory") or {})
+        )
 
         config = PerceptionConfig(
             input=InputConfig(**engine_cfg.get("input", {})),
@@ -477,6 +483,8 @@ class PerceptionEngineProxy:
             identity=IdentityConfig(**identity_kwargs),
             omni=OmniConfig(**omni_kwargs),
             identity_engine=identity_engine_cfg,
+            track_count=track_count_cfg,
+            state_memory=state_memory_cfg,
         )
 
         return PerceptionEngine(config=config)
@@ -924,6 +932,26 @@ class PerceptionEngineProxy:
             with event_artifacts_scope(artifacts):
                 return await self._on_demand_perceive_impl(batched_snapshot, query)
 
+    async def _dispatch_state_reminders(
+        self,
+        result: RealtimePerceptionResult,
+    ) -> None:
+        """全 room 被门禁拦住时，仍把 state_memory 的到点提醒派发给 agent。"""
+        suggestions = list(result.suggestions or [])
+        if not suggestions:
+            return
+        for s in suggestions:
+            _publish_perception_event(
+                "suggestion", s.event, {"action": s.action},
+            )
+        kept, dropped, threshold = _filter_suggestions_by_min_urgency(suggestions)
+        _log_dropped_suggestions(dropped, threshold, phase="state-reminder")
+        if kept:
+            await dispatch_event(
+                "suggestion", kept, build_suggestions_text,
+                intra_priority=suggestion_intra_priority(kept),
+            )
+
     async def handle_realtime_perception_result(
         self,
         result: RealtimePerceptionResult,
@@ -950,15 +978,20 @@ class PerceptionEngineProxy:
         时（直接调用本方法的单元测试 / 老调用方）行为与引入前一致：台账无链路、落库
         自己 mint id。
         """
-        if result.skipped:
-            return
-
         from miloco.manager import get_manager
+
+        svc = get_manager().rule_service
+
+        if result.skipped:
+            # 全 room 被门禁拦住时，result.suggestions 只可能是 state_memory 的到点
+            # 提醒（没有 omni 输出）。必须照常派发，否则「工作 30 分钟」这类任务的
+            # 提醒永远到不了 agent。
+            await self._dispatch_state_reminders(result)
+            return
 
         # handle matched rules via update_state (skip early-sent ones)
         # 去重粒度从 rule_id 改为 (rule_id, did):同 rule 在 cam_A early 命中后,cam_B
         # 终态又命中应当照常打 True(不同桶),不能被 early 误吃。
-        svc = get_manager().rule_service
         cycle_source_states_by_rule: dict[str, dict[str, bool]] = {}
         for did, rule_ids in result.device_rule_map.items():
             for rule_id in rule_ids:
@@ -973,7 +1006,6 @@ class PerceptionEngineProxy:
         if early_sent_rule_ids:
             for rule_id, did in early_sent_rule_ids:
                 cycle_source_states_by_rule.setdefault(rule_id, {})[did] = True
-
         # 触发状态就地累积：两条来源都拿本 cycle 的真值，不回读引擎记账表（记账表跨 cycle
         # 不清理，回读会把上一 cycle 旧结论当本周期的）。主循环命中的规则收 update_state 的
         # 返回值；早送路径的结论由 _on_early_matched_rules 在调用 update_state 时就写进
@@ -1062,10 +1094,9 @@ class PerceptionEngineProxy:
                         did,
                         False,
                         cycle_source_states=cycle_source_states_by_rule.get(rule_id),
-                        # 喂 False 这条路也带 id：duration 规则的达标 fire 由
-                        # _evaluate_duration 在每次 update_state 里评，窗口填满的那一刻
-                        # 可以正好落在确认离开的周期（见 _dispatch_event EXITED 处的说明），
-                        # 那次真派发同样要把本轮的事件 id 记进 rule state。
+                        # 感知只在 VLM 确认的过渡窗调 omni：这一帧 False 就是真过渡，
+                        # 不等第二帧。退出宽限由规则/任务的 exit_debounce_seconds 提供。
+                        skip_flicker=True,
                         trigger_event_id=cycle_event_id,
                     )
         finally:

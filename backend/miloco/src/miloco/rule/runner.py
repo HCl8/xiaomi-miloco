@@ -30,7 +30,6 @@ import asyncio
 import logging
 import time
 import uuid
-from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Mapping
@@ -271,9 +270,11 @@ class RuleRuntimeState:
     last_rule_state: bool = False
     exit_debounce_task: "asyncio.Task | None" = None
     exit_debounce_at: float | None = None
-    duration_window: "deque[int] | None" = None
-    last_duration_round: int | None = None
-    state_duration_fired: bool = False
+    # 会话目标定时器（``Rule.duration_seconds`` 重定义为「会话持续目标秒数」）：
+    # 进入会话后排一次，退出宽限期间暂停，真退出时取消；到点派 on_target。
+    state_target_task: "asyncio.Task | None" = None
+    state_target_due: float | None = None      # monotonic 截止时刻
+    state_target_remaining: float | None = None  # 暂停时保留的剩余秒数
     # 本轮进入边沿那条事件行的 id：进的时候定下, 退出的时候透传(见 _debounced_exit)。
     # 正常退出的那个感知周期不写事件, 父指针不能在退出那一刻现找, 只能这时存着。
     round_trigger_event_id: str | None = None
@@ -610,6 +611,9 @@ class RuleRunner:
             if not pending.done():
                 pending.cancel()
             self._rewind_abandoned_exit(state)
+            rule = self._rules.get(rule_id)
+            if rule is not None:
+                self._resume_state_target(rule)
         self._clear_pending_source_enter(rule_id)
 
     def _rewind_abandoned_exit(self, state: RuleRuntimeState) -> None:
@@ -681,26 +685,6 @@ class RuleRunner:
             for rid, st in self._state.items()
             if st.exit_debounce_at is not None
         }
-
-    @property
-    def _duration_window(self) -> dict[str, "deque[int]"]:
-        return {
-            rid: st.duration_window
-            for rid, st in self._state.items()
-            if st.duration_window is not None
-        }
-
-    @property
-    def _last_duration_round(self) -> dict[str, int]:
-        return {
-            rid: st.last_duration_round
-            for rid, st in self._state.items()
-            if st.last_duration_round is not None
-        }
-
-    @property
-    def _state_duration_fired(self) -> set[str]:
-        return {rid for rid, st in self._state.items() if st.state_duration_fired}
 
     @property
     def _action_cooldown_state(self) -> dict[tuple[str, str, str], float]:
@@ -777,8 +761,8 @@ class RuleRunner:
         排队中的退出抗抖算撑着: 退出边沿虽然发过了, on_exit 还没落地, 状态机那侧
         仍在 on。
 
-        带 duration 的 session 看 ``state_duration_fired``: 它才是「on_enter 派发
-        过」的标记, ``last_rule_state`` 为真只说明条件成立、时长还没攒够。
+        ``last_rule_state`` 为真即「进入已派发」——连续时长由 state target 定时器
+        单独维护，不再靠窗口采样判断是否进入过。
         """
         state = self._state.get(rule.id)
         if state is None:
@@ -788,8 +772,6 @@ class RuleRunner:
             and not state.exit_debounce_task.done()
         ):
             return True
-        if rule.duration_seconds:
-            return state.state_duration_fired
         return state.last_rule_state
 
     def _carry_entered_baseline(self, rule: Rule, round_event_id: str | None) -> None:
@@ -801,9 +783,6 @@ class RuleRunner:
         里 ``old == new`` 的早返, 退出边沿再也产不出来 —— 会话型 task 卡在 on,
         进入时下的设备指令永远收不回来。
 
-        带 duration 时还要一并置 ``state_duration_fired``: 退出边沿被
-        「没配对的 ENTERED」那道闸挡着, 不置位一样退不出去。
-
         本轮事件 id (``round_trigger_event_id``) 跟着一起带: 换条件是一次配置
         变更、不是一次会话重启 —— 状态机那边留在 on、也不重发 ENTERED, 这一次
         会话挂的是哪条事件行没有变, 退出支马上就会来读这份值。不跟着带, 编辑期
@@ -812,8 +791,12 @@ class RuleRunner:
         state = self._ensure_state(rule.id)
         state.last_rule_state = True
         state.round_trigger_event_id = round_event_id
-        if rule.duration_seconds:
-            state.state_duration_fired = True
+        if (
+            self._state_target_eligible(rule)
+            and state.state_target_task is None
+            and state.state_target_remaining is None
+        ):
+            self._arm_state_target(rule)
 
     def remove_rule(self, rule_id: str) -> None:
         self._rules.pop(rule_id, None)
@@ -846,6 +829,7 @@ class RuleRunner:
         state = self._state.pop(rule_id, None)
         if state is None:
             return
+        self._cancel_state_target_state(state)
         if state.exit_debounce_task is not None and not state.exit_debounce_task.done():
             state.exit_debounce_task.cancel()
 
@@ -959,36 +943,6 @@ class RuleRunner:
             src = self._ensure_source(rule_id, source_did)
             prev = src.last_bool
 
-            # out() 统一分流本周期触发结论：duration 规则的结论完全由 _evaluate_duration
-            # 决定（frame 路径对 duration 不 fire、只做状态维护），非 duration 规则用
-            # frame/diff 路径结论。结论作为 update_state 返回值当场交给调用方（感知 client
-            # 就地累积成住户日志的「触发状态」），引擎侧不留存跨 cycle 的展示状态。
-            dur_outcome: TriggerOutcome | None = None
-
-            def out(frame_outcome: TriggerOutcome) -> TriggerOutcome:
-                return dur_outcome if rule.duration_seconds else frame_outcome
-
-            # 丢帧。感知 client 会在同一 cycle 内传入已观测 source 的快照，避免
-            # 多 source 同步翻 False 时先来的 source 仍读到后来的 source 上一帧 True。
-            # 未在本 cycle 观测到的 source 继续沿用 self._state[rule_id].sources。
-            if rule.duration_seconds:
-                observed_states = dict(cycle_source_states or {})
-                observed_states.setdefault(source_did, current_bool)
-                rule_state = self._state[rule_id]
-                effective_state = any(observed_states.values()) or any(
-                    s.last_bool
-                    for did, s in rule_state.sources.items()
-                    if did not in observed_states
-                )
-                dur_outcome = await self._evaluate_duration(
-                    rule, effective_state, source_did, context, caption, device_name,
-                    trigger_event_id=trigger_event_id,
-                )
-                # out() 对 duration 规则一律取 dur_outcome，其非空由本块位置维持——静态类型
-                # 推不出来，失效后又会被 aggregate_outcomes 的 .get(o, -1) 兜底静默吞掉。
-                # 这里显式断言，让不变式失效时当场炸而不是渲染出一个错标签。
-                assert dur_outcome is not None
-
             # 帧级抗抖：source 上次 True 时，单帧 False 不立即翻转 — 视为 LLM 漏识，
             # 留一帧观察窗。下一帧仍 False 才确认 EXIT；翻回 True 则吸收为抖动。
             #
@@ -1003,7 +957,7 @@ class RuleRunner:
                             "rule %s source %s exit pending (1st false)",
                             safe_log(rule_id), safe_log(source_did),
                         )
-                        return out(TriggerOutcome.NOT_FIRED)
+                        return TriggerOutcome.NOT_FIRED
                     src.pending_exit = False
                 elif src.pending_exit:
                     src.pending_exit = False
@@ -1012,7 +966,7 @@ class RuleRunner:
                         safe_log(rule_id),
                         safe_log(source_did),
                     )
-                    return out(TriggerOutcome.STILL_IN)
+                    return TriggerOutcome.STILL_IN
             elif not skip_flicker and self._state[rule_id].exit_debounce_task is not None:
                 # 仅在 exit_debounce 阶段，对 False → True 加对称双帧抗抖：单帧 True
                 # 视为 LLM 单帧幻觉，留一帧观察。下一帧仍 True 才确认 ENTER 并 cancel
@@ -1026,7 +980,7 @@ class RuleRunner:
                             "(1st true)",
                             safe_log(rule_id), safe_log(source_did),
                         )
-                        return out(TriggerOutcome.NOT_FIRED)
+                        return TriggerOutcome.NOT_FIRED
                     src.pending_enter = False
                     logger.info(
                         "rule %s source %s enter confirmed (2 consecutive true) "
@@ -1040,7 +994,7 @@ class RuleRunner:
                         "exit_debounce",
                         safe_log(rule_id), safe_log(source_did),
                     )
-                    return out(TriggerOutcome.NOT_FIRED)
+                    return TriggerOutcome.NOT_FIRED
 
             src.last_bool = current_bool
 
@@ -1049,7 +1003,7 @@ class RuleRunner:
             if aggregated is None:
                 # 别的 source 处于未知：这一轮不参与判定。不 diff、不更新
                 # last_rule_state —— 按假算会产生一次凭空的退出边沿。
-                return out(TriggerOutcome.NOT_FIRED)
+                return TriggerOutcome.NOT_FIRED
             new_rule_state = aggregated
             old_rule_state = rule_state.last_rule_state
             rule_state.last_rule_state = new_rule_state
@@ -1060,7 +1014,7 @@ class RuleRunner:
                     RuleDirection.SESSION,
                 ) and await self._release_pending_enters(rule.task_id):
                     return TriggerOutcome.FIRED
-                return out(
+                return (
                     TriggerOutcome.STILL_IN if new_rule_state else TriggerOutcome.NOT_FIRED
                 )
 
@@ -1072,22 +1026,7 @@ class RuleRunner:
                 trigger_event_id=trigger_event_id,
             )
             h.add_output(1)
-            if event == RuleEvent.EXITED:
-                # EXITED 的结论以 _dispatch_event 的 NOT_FIRED 为准，不被 duration 的
-                # dur_outcome 覆盖——覆盖会返回语义相反的值：STATE + duration 已 fire 过
-                # on_enter 时 _evaluate_duration 早返 STILL_IN（「还在态内」），而此刻恰恰是
-                # 确认离开的那一周期。
-                # 唯一例外：本周期 _evaluate_duration **真派发过**。ratio<1（默认 0.6）时窗口
-                # 末尾的 0 被容忍后仍可达标，而窗口填满的那一刻可以正好落在确认离开的周期
-                # （如 maxlen=20/ratio=0.6：前 18 帧 True、后 2 帧 False → 18/20 达标 → 真
-                # _spawn_fire）。那次 fire 已经发出去了，此时报 NOT_FIRED 等于把一次真派发
-                # 说没了——方向比被覆盖成 STILL_IN 更糟。
-                # 今天两者都零后果（唯一产生 EXITED 的调用点丢弃返回值），但一旦有人开始
-                # 消费返回值就是真错。
-                if dur_outcome is TriggerOutcome.FIRED:
-                    return dur_outcome
-                return dispatch_outcome
-            return out(dispatch_outcome)
+            return dispatch_outcome
 
     # ---- Debug / manual trigger ----
 
@@ -1167,157 +1106,6 @@ class RuleRunner:
 
     # ---- EVENT duration sliding-window evaluator ----
 
-    async def _evaluate_duration(
-        self,
-        rule: Rule,
-        new_rule_state: bool,
-        source_did: str,
-        context: str,
-        caption: str = "",
-        device_name: str = "",
-        trigger_event_id: str | None = None,
-    ) -> TriggerOutcome:
-        """每个采样周期采样一次 OR 聚合状态；窗口 True 比例达阈值即 fire。
-
-        返回触发结论：达标 fire → ``FIRED``；已 fire 过（STATE）→ ``STILL_IN``；
-        累积中（窗口未满 / 比例未达 / 同 round 去重）→ ``COUNTING``。
-
-        - 同一采样周期内多 source 多次进入 → 通过 round_id 去重，只采一次。
-        - 采样断流（round_id 不连续）：用 0 补齐 gap 让老样本自然衰减；
-          gap 超过整窗则直接清空（避免无意义循环）。
-        - 窗口未填满（``len(win) < maxlen``）直接 return：必须累积满
-          ``duration_seconds`` 时长才进入 ratio 判定，避免 ratio<1 导致最快
-          ``duration_seconds * ratio`` 就触发（如 30min * 0.8 → 24min 触发）。
-        - 分母固定用 maxlen 而非 ``len(win)``：保留 ratio 间歇容忍语义，
-          窗口满后允许部分漏检。
-        - session 型且已 fire on_enter（``state.state_duration_fired`` 置位）
-          → 直接 return：STILL_IN 期间不重复 fire，等 _debounced_exit 真完成时
-          清标记重新累积。单方向的 rule 不用本拦截，fire 后清窗口走"周期 fire"
-          by-design。
-        """
-        state = self._ensure_state(rule.id)
-        if rule.resolved_direction is RuleDirection.SESSION and state.state_duration_fired:
-            return TriggerOutcome.STILL_IN
-
-        round_id = int(time.time() / self._sample_interval)
-        last_round_id = state.last_duration_round
-        if last_round_id == round_id:
-            return TriggerOutcome.COUNTING
-
-        maxlen = max(1, int(rule.duration_seconds / self._sample_interval))
-        win = state.duration_window
-        if win is None or win.maxlen != maxlen:
-            win = deque(maxlen=maxlen)
-            state.duration_window = win
-
-        if last_round_id is not None:
-            gap = round_id - last_round_id - 1
-            if gap >= maxlen:
-                win.clear()
-                logger.info(
-                    "rule %s (task=%s) duration window cleared due to long sample gap: "
-                    "%d rounds (>= maxlen %d)",
-                    rule.id, rule.task_id, gap, maxlen,
-                )
-            elif gap > 0:
-                win.extend([0] * gap)
-                logger.debug(
-                    "rule %s (task=%s) duration window filled %d zeros for sample gap",
-                    rule.id, rule.task_id, gap,
-                )
-
-        win.append(1 if new_rule_state else 0)
-        state.last_duration_round = round_id
-
-        if new_rule_state:
-            logger.info(
-                "DURATION sample: rule=%s task=%s cur=1 sum=%d/%d ratio=%.2f/%.2f filled=%d/%d",
-                rule.id, rule.task_id, sum(win), maxlen,
-                sum(win) / maxlen, rule.duration_ratio, len(win), maxlen,
-            )
-
-        if len(win) < maxlen:
-            return TriggerOutcome.COUNTING
-
-        if sum(win) / maxlen >= rule.duration_ratio:
-            # 边沿时刻取窗口里第一帧 true 的对齐时间。ratio<1 时比"窗口名义起点
-            # fire_ts - duration_seconds"更准确反映条件真正开始成立的时刻。落成哪个
-            # 键名由槽决定 (见 _edge_timestamp), 不在这里定。
-            win_list = list(win)
-            first_true_offset = next(i for i, v in enumerate(win_list) if v == 1)
-            first_true_round = (round_id - maxlen + 1) + first_true_offset
-            edge_at = ms_to_iso_local(
-                int(first_true_round * self._sample_interval * 1000)
-            )
-            logger.info(
-                "rule %s (task=%s, %s) duration met: edge_at=%s "
-                "(sum=%d/maxlen=%d, ratio>=%.2f)",
-                rule.id,
-                rule.task_id,
-                rule.resolved_direction.value,
-                edge_at,
-                sum(win),
-                maxlen,
-                rule.duration_ratio,
-            )
-            slot = _slot_for(rule, RuleEvent.ENTERED)
-            if slot is ActionSlot.ON_EXIT:
-                # exit 型的进入边沿就是"该退出了"。达标兜底必须排在状态机翻 off
-                # 之前 —— 翻完再喂会被"不在会话中"拦掉, 这一天的达标就丢了。与
-                # 瞬时翻转那条路同一份处理, 两条都是退出的入口。
-                await self._record_source.settle(rule.task_id)
-
-            if new_rule_state and rule.resolved_direction in (
-                RuleDirection.ENTER,
-                RuleDirection.SESSION,
-            ):
-                window_before_guard_refresh = win
-                await self._refresh_iot_guards(rule.task_id, rule.id)
-                if state.duration_window is not window_before_guard_refresh:
-                    return TriggerOutcome.STILL_IN
-
-            sources = self._sources_currently_true(rule.id) or [source_did]
-            payload = PendingEnterContext(
-                sources=sources,
-                context=context,
-                extra_metadata={
-                    "duration_seconds": rule.duration_seconds,
-                    **_edge_timestamp(slot, edge_at),
-                },
-                caption=caption,
-                device_name=device_name,
-                trigger_event_id=trigger_event_id,
-            )
-            if not self._state_machine_allows(rule, RuleEvent.ENTERED, payload):
-                # 在清窗口 / 标记 fired 之前问闸：被吞掉时这两样都不该动，否则
-                # 白丢一次累积。
-                return TriggerOutcome.STILL_IN
-
-            if rule.resolved_direction is not RuleDirection.SESSION:
-                # 单方向：清窗口 → 下次 update_state 重新累积（by-design 周期 fire）。
-                # state_duration_fired 只由 _debounced_exit 清, 而单方向的 rule 走
-                # 不到那条路 —— 标记了就永久拦死。
-                state.duration_window = None
-                state.last_duration_round = None
-            else:
-                # session：标记 fired 拦截 STILL_IN 重复 fire；窗口留着无害
-                # （fired 拦截了，后续 evaluate 不会用），_debounced_exit 真完成时一并清
-                state.state_duration_fired = True
-            self._spawn_fire(
-                rule,
-                RuleEvent.ENTERED,
-                sources,
-                context,
-                extra_metadata=payload.extra_metadata,
-                caption=caption, device_name=device_name,
-                trigger_event_id=trigger_event_id,
-            )
-            state.round_trigger_event_id = trigger_event_id
-            self._sync_record_source(rule, slot)
-            return TriggerOutcome.FIRED
-
-        return TriggerOutcome.COUNTING
-
     # ---- Event dispatch ----
 
     async def _dispatch_event(
@@ -1338,8 +1126,7 @@ class RuleRunner:
 
         Returns the resulting ``TriggerOutcome`` for the ENTERED path (``FIRED``
         only when it actually spawns a fire). EXITED / suppressed paths return
-        ``NOT_FIRED`` — for duration rules the caller ignores this and uses
-        ``_evaluate_duration``."""
+        ``NOT_FIRED``."""
         state = self._ensure_state(rule.id)
         if event is RuleEvent.ENTERED and rule.resolved_direction is RuleDirection.GUARD:
             released = await self._release_pending_enters(rule.task_id)
@@ -1381,13 +1168,9 @@ class RuleRunner:
             # 结论按 STILL_IN 上报（规则持续在态，只是吸收了一次伪退出）——与帧级
             # 抖动吸收路径（update_state 里 pending_exit 吸收）同语义、同标签。
             if absorbed_pending_exit:
+                # 宽限期内回到态内：连续时长定时器接着剩余时间走，不重置。
+                self._resume_state_target(rule)
                 return TriggerOutcome.STILL_IN
-
-            # duration_seconds 配置时：不在翻转那一刻 fire；fire 由
-            # _evaluate_duration 在窗口达比例时触发（边沿时刻走那条路径用滑窗里
-            # 第一帧 true 的对齐时间，本路径取的 wall-clock 不用）。
-            if rule.duration_seconds:
-                return TriggerOutcome.NOT_FIRED
 
             slot = _slot_for(rule, event)
             if slot is ActionSlot.ON_EXIT:
@@ -1447,6 +1230,9 @@ class RuleRunner:
             # 周期不写事件, 退出支要挂回同一个父只能靠这份记下来的值。
             state.round_trigger_event_id = trigger_event_id
             self._sync_record_source(rule, slot)
+            if rule.resolved_direction is RuleDirection.SESSION:
+                # 会话进入：连续时长定时器从 0 开始（重复触发直到退出）。
+                self._arm_state_target(rule)
             return TriggerOutcome.FIRED
 
         # EXITED
@@ -1455,12 +1241,8 @@ class RuleRunner:
             # slot_for_edge 对它们的 EXITED 返 None, 走下去也选不到槽。
             return TriggerOutcome.NOT_FIRED
 
-        # session + duration 但未 fire on_enter：进入态从未被确认 → 当这次 EXITED
-        # 没发生过。不 fire on_exit（没配对的 ENTERED），不启动 debounce，也不清
-        # 窗口——窗口靠后续 evaluate 持续 append 0 自然演化，符合 duration_ratio
-        # 的间歇容忍设计（用户中途短暂离开仍允许后续凑齐）。
-        if rule.duration_seconds and not state.state_duration_fired:
-            return TriggerOutcome.NOT_FIRED
+        # 退出宽限开始：连续时长定时器暂停；宽限内回来会 resume，真退出才 cancel。
+        self._pause_state_target(rule)
 
         # state mode: cancel any existing debounce before scheduling a new one
         old = state.exit_debounce_task
@@ -1523,6 +1305,7 @@ class RuleRunner:
                 rule.id, rule.name,
             )
             self._rewind_abandoned_exit(rs)
+            self._resume_state_target(rule)
             return
 
         # Cleanup after settle and its condition recheck so an in-flight re-entry or
@@ -1532,12 +1315,6 @@ class RuleRunner:
         # debounce 已真完成，rule 离开 exit_debounce 阶段；清掉所有 source 的
         # pending_enter，避免下一轮 debounce 开始时旧观察窗复用
         self._clear_pending_source_enter(rule.id)
-        # STATE + duration：真 fire on_exit 时清掉 fired 标记和窗口，让下次
-        # ENTERED 重新走完整"累积 → 达标确认"流程。
-        if rule.duration_seconds:
-            rs.state_duration_fired = False
-            rs.duration_window = None
-            rs.last_duration_round = None
         # record-bound duration rule：注入今日累计 / target metadata，让 fire-agent
         # 在 on-exit-desc 含「若今日累计已达目标则使用手机推送通知...」条件通知文案时，
         # 按真实数据拼装通知（accumulated >= target 才推；文案不写死时长）。
@@ -1562,7 +1339,10 @@ class RuleRunner:
                 }
 
         if not self._state_machine_allows(rule, RuleEvent.EXITED):
+            # 退出被别的条件挡住（STILL_HELD）→ 会话还在，定时器恢复。
+            self._resume_state_target(rule)
             return
+        self._cancel_state_target(rule)
         if context == _IOT_RECONCILE_CONTEXT and self._iot_source is not None:
             self._iot_source.record_compensated_exit()
         self._record_source.disarm(rule.task_id)
@@ -1635,13 +1415,6 @@ class RuleRunner:
                 or not isinstance(payload, PendingEnterContext)
             ):
                 continue
-            if rule.duration_seconds:
-                state = self._ensure_state(rule.id)
-                if rule.resolved_direction is RuleDirection.SESSION:
-                    state.state_duration_fired = True
-                else:
-                    state.duration_window = None
-                    state.last_duration_round = None
             self._spawn_fire(
                 rule,
                 RuleEvent.ENTERED,
@@ -1661,6 +1434,8 @@ class RuleRunner:
             # 配对遗留的旧 id —— 不是丢父, 是指错父, 比丢更难发现。
             self._ensure_state(rule.id).round_trigger_event_id = payload.trigger_event_id
             self._sync_record_source(rule, signal.slot)
+            if rule.resolved_direction is RuleDirection.SESSION:
+                self._arm_state_target(rule)
             fired = True
         return fired
 
@@ -1726,6 +1501,168 @@ class RuleRunner:
             self._record_source.arm(rule.task_id)
         elif slot is ActionSlot.ON_EXIT:
             self._record_source.disarm(rule.task_id)
+
+    # ---- 会话目标定时器（Rule.duration_seconds = 连续在状态目标秒数） ----
+    #
+    # 任务推进不再靠每窗 True/False 采样：只认状态边沿，连续时长由这里的定时器
+    # 维护。门禁拦截的静态窗不调 omni、不喂样本，定时器照走。
+
+    def _state_target_eligible(self, rule: Rule) -> bool:
+        return (
+            bool(rule.duration_seconds)
+            and rule.resolved_direction is RuleDirection.SESSION
+        )
+
+    def arm_state_targets(self, task_id: str) -> None:
+        """task 重新配置/启用后补排：会话在 on 但定时器没排（暂停过、装配晚到）。
+
+        与 ``RecordSource.arm`` 同一时机；已经排着或暂停保留着剩余时间的规则不动。
+        """
+        for rule in self._rules.values():
+            if rule.task_id != task_id or not self._state_target_eligible(rule):
+                continue
+            st = self._state.get(rule.id)
+            if (
+                st is not None
+                and st.last_rule_state
+                and st.state_target_task is None
+                and st.state_target_remaining is None
+            ):
+                self._arm_state_target(rule)
+
+    def _arm_state_target(self, rule: Rule) -> None:
+        """进入会话：从 0 起一个连续时长定时器；重复触发直到退出。"""
+        if not self._state_target_eligible(rule):
+            return
+        st = self._ensure_state(rule.id)
+        self._cancel_state_target_state(st)
+        st.state_target_remaining = float(rule.duration_seconds)
+        self._schedule_state_target(rule, st)
+        logger.info(
+            "STATE_TARGET_ARMED: rule=%s task=%s seconds=%s",
+            rule.id, rule.task_id, rule.duration_seconds,
+        )
+
+    def _schedule_state_target(self, rule: Rule, st: RuleRuntimeState) -> None:
+        remaining = st.state_target_remaining
+        if remaining is None:
+            return
+        st.state_target_remaining = None
+        st.state_target_due = time.monotonic() + max(0.0, remaining)
+        task = asyncio.create_task(
+            self._state_target_after(rule.id, max(0.0, remaining))
+        )
+        st.state_target_task = task
+        self._fire_tasks.add(task)
+        task.add_done_callback(self._fire_tasks.discard)
+
+    async def _state_target_after(self, rule_id: str, seconds: float) -> None:
+        try:
+            await asyncio.sleep(max(0.0, seconds))
+        except asyncio.CancelledError:
+            return
+        rule = self._rules.get(rule_id)
+        st = self._state.get(rule_id)
+        if rule is None or st is None:
+            return
+        # 旧定时器已被 pause / cancel / 重排替换 → 本次作废。
+        if st.state_target_task is not asyncio.current_task():
+            return
+        st.state_target_task = None
+        st.state_target_due = None
+        # 状态已经退出 / 正在退出宽限 / 规则被停用 → 本次不触发。
+        if (
+            not self._is_effectively_enabled(rule)
+            or not st.last_rule_state
+            or st.exit_debounce_task is not None
+        ):
+            return
+        sm = self._state_machine
+        if sm is not None and sm.owns(rule.task_id):
+            # 走状态机的 milestone 许可闸（dispatch=False：动作由下面的 _spawn_fire
+            # 走原路径执行），只为拿到「task 在 on」的判定与 last_decision。
+            outcome = sm.handle(
+                TaskSignal(
+                    rule.task_id,
+                    rule.id,
+                    SignalKind.ENTERED,
+                    ActionSlot.ON_TARGET,
+                    None,
+                ),
+                dispatch=False,
+            )
+            if outcome not in _FIRING_OUTCOMES:
+                return
+
+        logger.info(
+            "STATE_TARGET_FIRED: rule=%s task=%s seconds=%s",
+            rule.id, rule.task_id, rule.duration_seconds,
+        )
+        self._spawn_fire(
+            rule,
+            RuleEvent.TARGET_FIRED,
+            self._sources_currently_true(rule.id),
+            "state_target",
+            action_slot=ActionSlot.ON_TARGET,
+        )
+        # 会话仍在 → 排下一轮（“连续 N 秒提醒，不是只有一次”）。
+        if (
+            rule.id in self._state
+            and st.last_rule_state
+            and st.exit_debounce_task is None
+        ):
+            st.state_target_remaining = float(rule.duration_seconds or 0)
+            self._schedule_state_target(rule, st)
+
+    def _pause_state_target(self, rule: Rule) -> None:
+        """进入退出宽限：暂停计时并保留剩余时间。"""
+        if not self._state_target_eligible(rule):
+            return
+        st = self._state.get(rule.id)
+        if st is None:
+            return
+        remaining = st.state_target_remaining
+        if st.state_target_due is not None:
+            remaining = max(0.0, st.state_target_due - time.monotonic())
+        self._detach_state_target_task(st)
+        st.state_target_remaining = remaining
+        if remaining is not None:
+            logger.info(
+                "STATE_TARGET_PAUSED: rule=%s task=%s remaining=%.1f",
+                rule.id, rule.task_id, remaining,
+            )
+
+    def _resume_state_target(self, rule: Rule) -> None:
+        """宽限期内回到态内：按剩余时间继续，不重置。"""
+        if not self._state_target_eligible(rule):
+            return
+        st = self._state.get(rule.id)
+        if st is None or st.state_target_task is not None:
+            return
+        remaining = st.state_target_remaining
+        if remaining is None:
+            return
+        self._schedule_state_target(rule, st)
+        logger.info(
+            "STATE_TARGET_RESUMED: rule=%s task=%s remaining=%.1f",
+            rule.id, rule.task_id, remaining,
+        )
+
+    def _cancel_state_target(self, rule: Rule) -> None:
+        st = self._state.get(rule.id)
+        if st is not None:
+            self._cancel_state_target_state(st)
+
+    def _cancel_state_target_state(self, st: RuleRuntimeState) -> None:
+        self._detach_state_target_task(st)
+        st.state_target_remaining = None
+
+    def _detach_state_target_task(self, st: RuleRuntimeState) -> None:
+        task = st.state_target_task
+        st.state_target_task = None
+        st.state_target_due = None
+        if task is not None and not task.done():
+            task.cancel()
 
     def _state_machine_allows(
         self,
@@ -1878,12 +1815,8 @@ class RuleRunner:
             if pending is not None and not pending.done():
                 pending.cancel()
             rs.exit_debounce_at = None
-            # 2) STATE + duration：清 fired 标记和窗口，让 on_enter 重新走累积
-            #    （新一天计时窗口从零开始）
-            if rule.duration_seconds:
-                rs.state_duration_fired = False
-                rs.duration_window = None
-                rs.last_duration_round = None
+            # 2) 新一天连续时长从零开始：撤旧定时器，强发进入后重排。
+            self._cancel_state_target(rule)
             # 3) 强制 fire on_exit / on_enter：不注入 actual_exited_at /
             #    actual_started_at。rollover_one 已切段（旧 session 落账、新 record
             #    active_session_start_at = rollover 触发时刻），agent 不该再做
@@ -1902,6 +1835,7 @@ class RuleRunner:
             self._spawn_fire(
                 rule, RuleEvent.ENTERED, sources, "cross_day_rollover",
             )
+            self._arm_state_target(rule)
 
         # record 源不看 affected：归零是 record 的事，与此刻有没有 rule 在态内无关。
         # 不归零的话条件停在真，第二天达标产不出新边沿、通知永久消失。

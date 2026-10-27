@@ -367,11 +367,10 @@ class Rule(BaseModel):
         None,
         ge=1,
         description=(
-            "累计统计窗口（秒）。设置后窗口内 True 比例达 duration_ratio 才 fire。"
-            "None=立即 fire（现状）。EVENT mode：fire 后清窗口走周期 fire。"
-            "STATE mode：作为 ENTERED 前置确认门槛，达标 fire on_enter 一次，"
-            "STILL_IN 期间不重复 fire；EXITED 走 exit_debounce_seconds，"
-            "未达标就 EXITED 不 fire on_exit。"
+            "会话连续目标时长（秒），仅 direction=session 有效。会话 ENTERED 后"
+            "开始计时，每 N 秒触发一次 on_target；退出宽限（exit_debounce_seconds）"
+            "内回来继续计时，真退出则取消，下次进入从 0 重新计时。"
+            "不再按窗口采样推进任务。"
         ),
     )
     duration_ratio: float | None = Field(
@@ -379,10 +378,8 @@ class Rule(BaseModel):
         gt=0.0,
         le=1.0,
         description=(
-            "窗口内 True 比例阈值，仅 duration_seconds 设置时生效。"
-            "None 时 service 创建/更新规则时用 settings.rule.default_duration_ratio "
-            "回填（代码默认 0.6，可由 settings.yaml / config.json / env 覆盖）。"
-            "1.0=必须全程 True。"
+            "已废弃：旧 duration_seconds 滑窗采样阈值，保留字段仅为库兼容，"
+            "不参与任何判定。"
         ),
     )
 

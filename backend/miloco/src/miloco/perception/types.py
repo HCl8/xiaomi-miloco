@@ -365,6 +365,17 @@ class RealtimePerceptionResult(BaseModel):
             "错误推退。空 dict 表示 OmniError 兜底/无下发。"
         ),
     )
+    gate_blocked_dids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "本 batch 被门禁（视觉/语义）判定「无活动级变化」而跳过的相机。"
+            "状态容器只对这类相机续命；identity/omni 报错、空帧不算。"
+        ),
+    )
+    recheck_dids: list[str] = Field(
+        default_factory=list,
+        description="状态容器到点强制放行给 omni 复核的相机。",
+    )
     flow_diagnostics: PerceptionFlowCycleDiagnostics | None = Field(
         default=None,
         exclude=True,

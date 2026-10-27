@@ -42,7 +42,7 @@
 
 **场景 4 — temporary 规则**：Agent 帮用户创建"等快递到了通知我"的临时监控。规则 lifecycle 为 temporary，快递员进门事件被感知后，Agent 播报通知，再自动删除该规则，不留后台垃圾。
 
-**场景 5 — duration 滑窗规则**：用户创建规则"孩子在书房认真学习超过 45 分钟，提醒他休息"。配置 `duration_seconds` 和 `duration_ratio`，窗口内 True 比例达阈值才触发，防止 VLM 单帧误判触发误报。
+**场景 5 — 会话连续时长**：用户创建规则"孩子连续学习 45 分钟，提醒他休息"。用 `session` 规则 + `duration_seconds=2700` + `exit_debounce_seconds=60`：进入会话后起定时器，每 45 分钟触发一次 `on_target`；退出宽限内回来继续计时，真退出则取消、下次进入重新计时。不靠每窗采样。
 
 ### 能力边界
 
@@ -110,9 +110,9 @@
 
 分层的依据是**输出类型**，每层一种：条件项的三值 → 整条规则的布尔 → 边沿 → 副作用。好处是"我的规则怎么没反应"有确定答案——看哪一层把它吃了（`task get` 的 `last_decision`）。
 
-**帧级抗抖**：主要针对 True→False 的疑似漏识——单帧翻转不立即采信，需连续确认才认定状态改变，避免 VLM 单帧漏识/幻觉导致状态反复抖动。这一机制不同于退出防抖（后者是确认已退出后的延迟执行）。
+**帧级抗抖**：感知只在 VLM 确认的过渡窗调 omni，所以感知路径的 False 一帧即确认（`skip_flicker=True`）；退出宽限由 `exit_debounce_seconds` 在规则/任务层提供。iot / record 源同理。只有密集帧源仍保留单帧观察窗。
 
-**duration 滑动窗口**：触发方向都支持可选的 `duration_seconds` + `duration_ratio` 配置（`guard` 不支持）。启用后，RuleRunner 维护 per-rule 滑窗，记录窗口内各帧的 True/False 比例，达标才触发。单方向规则触发后清窗口，支持周期 fire；`session` 以达标作为进入的前置门槛，进行期间不重复 fire。`duration_ratio` 未显式设置时由配置段的默认值回填（见 `settings.yaml::rule` / `settings.py` 的 `RuleSettings`）。
+**会话连续时长（`duration_seconds`）**：仅 `direction=session`。RuleRunner 在会话 ENTERED 后起一个定时器，按「在状态内的净时长」计时：条件变 false 进入退出宽限时暂停，宽限内回来恢复剩余时间，真退出取消；到 N 秒派 `ON_TARGET`，会话仍在就继续排下一轮。它不读每窗 True/False 样本，门禁拦截的静态窗不调 omni 也不影响计时。`duration_ratio` 已废弃，仅为库兼容保留。
 
 **累计达标通知**：给 task 配 `on_target_desc`（`task set-actions`），前提是它挂了 duration 型 record 且设了 target_minutes。达标规则**不由用户建**——task 的达标动作、活跃的时长记账、记账上的阈值三样齐备时服务端自动生成一条 `direction=milestone` 的规则，任一样消失就删掉。它不出现在 `rule list`（`--show-milestone` 可看）和 `task get` 里，用户主动建会被拒。做成派生物是因为装配是分步的，中间态必然有一半不成立，而派生量没有中间态。
 

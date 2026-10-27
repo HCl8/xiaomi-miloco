@@ -303,10 +303,7 @@ class RuleSettings(BaseModel):
         default=0.6,
         gt=0.0,
         le=1.0,
-        description=(
-            "duration_seconds 窗口内 True 比例阈值的默认值；"
-            "规则创建时未显式指定 --duration-ratio 则使用此值"
-        ),
+        description="已废弃：旧 duration 滑窗比例默认值，保留字段仅为配置兼容",
     )
 
 

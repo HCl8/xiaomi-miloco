@@ -687,3 +687,67 @@ async def test_re_enabling_a_rule_does_not_carry_the_old_baseline(monkeypatch):
     await asyncio.sleep(0.05)
 
     assert fired == [("r-ses", RuleEvent.ENTERED)]
+
+
+# ── 会话目标定时器：连续在状态时长，不靠每窗采样 ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_state_target_fires_and_repeats_while_session_stays_on(monkeypatch):
+    """会话进入后 1 秒触发 on_target；会话还在就继续排下一轮。"""
+    runner, sm, _directions, _dispatched = await _session_task_turned_on(
+        monkeypatch, duration_seconds=1, exit_debounce_seconds=0
+    )
+    fired = _record_fires(monkeypatch)
+    state = runner._state["r-ses"]
+    assert state.state_target_task is not None, "会话进入后没有排目标定时器"
+
+    await asyncio.sleep(1.1)
+    assert ("r-ses", RuleEvent.TARGET_FIRED) in fired
+    assert sm.runtime_state("t1") is TaskRuntimeState.ON
+    assert state.state_target_task is not None, "会话仍在，应继续排下一轮"
+
+    await asyncio.sleep(1.1)
+    assert fired.count(("r-ses", RuleEvent.TARGET_FIRED)) >= 2
+
+
+@pytest.mark.asyncio
+async def test_state_target_pauses_in_exit_grace_and_resumes(monkeypatch):
+    """退出宽限期内回到态内：定时器暂停后按剩余时间继续，不重置。"""
+    runner, sm, _directions, _dispatched = await _session_task_turned_on(
+        monkeypatch, duration_seconds=5, exit_debounce_seconds=10
+    )
+    state = runner._state["r-ses"]
+    assert state.state_target_task is not None
+
+    await runner.update_state("r-ses", "cam1", False, "", skip_flicker=True)
+    assert state.state_target_task is None, "进入退出宽限后定时器应暂停"
+    assert state.state_target_remaining is not None
+    remaining = state.state_target_remaining
+    assert remaining <= 5
+
+    # 宽限内回到工作：ENTERED 取消 debounce，定时器按剩余时间恢复
+    await runner.update_state("r-ses", "cam1", True, "", skip_flicker=True)
+    assert state.state_target_task is not None, "回到态内后定时器应恢复"
+    assert state.state_target_remaining is None
+    assert sm.runtime_state("t1") is TaskRuntimeState.ON
+
+
+@pytest.mark.asyncio
+async def test_state_target_cancelled_on_real_exit(monkeypatch):
+    """真退出（宽限走完）后定时器取消；下次进入重新从 0 计时。"""
+    runner, sm, _directions, _dispatched = await _session_task_turned_on(
+        monkeypatch, duration_seconds=5, exit_debounce_seconds=0
+    )
+    state = runner._state["r-ses"]
+    assert state.state_target_task is not None
+
+    await runner.update_state("r-ses", "cam1", False, "", skip_flicker=True)
+    await asyncio.sleep(0.1)
+    assert sm.runtime_state("t1") is TaskRuntimeState.OFF
+    assert state.state_target_task is None
+    assert state.state_target_remaining is None
+
+    # 重新进入 → 新的目标定时器
+    await runner.update_state("r-ses", "cam1", True, "")
+    assert state.state_target_task is not None

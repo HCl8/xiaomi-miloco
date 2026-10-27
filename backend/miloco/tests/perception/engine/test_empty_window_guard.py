@@ -102,7 +102,8 @@ def _snapshot(
 
 
 class TestGateEmptyInput:
-    config = GateConfig()
+    # hold 默认已关闭；这组测试显式打开 hold 验证空输入闸。
+    config = GateConfig(hold_duration_sec=360.0)
 
     async def test_hold_does_not_open_window_without_any_input(self):
         """零帧 + 零音频 + hold 生效 → 不建 packet。

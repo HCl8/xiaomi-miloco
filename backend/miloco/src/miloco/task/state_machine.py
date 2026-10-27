@@ -496,9 +496,8 @@ class TaskStateMachine:
         # 是同一个值 —— rule 会被当成还在态内, 退出一次之后就再也进不来。
         #
         # §5.2「退出后不立即重进」因此**本次不实现**: 纯边沿驱动的进入 rule 靠 diff
-        # 天然不重进 (条件仍为真就没有翻转), 但配了 duration_seconds 的进入 rule
-        # 走的是周期重新累积那条路、不看 diff, 条件恒真时仍会自动重进。被删掉的基线
-        # 重置对后者同样无效 (它只挪值、不动窗口), 所以那是个已知缺口, 不是回归。
+        # 天然不重进 (条件仍为真就没有翻转)。duration_seconds 现在是会话连续目标
+        # 定时器，不再有「周期重新累积、条件恒真自动重进」那条路。
         return self._done(TransitionOutcome.EXITED, signal)
 
     def _exit_condition_already_true(

@@ -153,6 +153,7 @@ def dump_gate_window(
             "semantic_ms": timing.semantic_ms,
             "hold_pass": timing.hold_pass,
             "hold_opened_window": timing.hold_opened_window,
+            "hold_semantic_veto": timing.hold_semantic_veto,
             "audio_pass": timing.audio_pass,
             "audio_energy": timing.audio_energy,
             "clip_bytes": len(clip_bytes) if clip_bytes else 0,

@@ -241,7 +241,7 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
     ),
     "perception.engine.gate.semantic.mode": (
         str,
-        "shadow",
+        "enforce",
         "shadow=只算分写 traces.timing_detail、不改变路由；enforce=分数不过阈值就拦本窗，重启生效",
     ),
     "perception.engine.gate.semantic.base_url": (
@@ -256,13 +256,55 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
     ),
     "perception.engine.gate.semantic.min_score": (
         float,
-        0.14,
-        "P(有变化) 阈值；离线 201 窗上 0.14 ≈ 15/15 召回（负样本误报 9.1%），重启生效",
+        0.35,
+        "P(有变化) 阈值；200 窗人工标注下 0.35 客厅 R92.6%/P19.3%，重启生效",
     ),
     "perception.engine.gate.semantic.extra_min_score": (
         float,
-        0.14,
+        0.2,
         "特殊放行问题（规则/档案经 LLM 提炼）的阈值；任一过阈即放行，重启生效",
+    ),
+    "perception.engine.gate.semantic.include_camera_prompt": (
+        bool,
+        False,
+        "门禁 state 是否注入机位须知；默认否（机位须知仍给 omni/特殊项提炼），重启生效",
+    ),
+    "perception.engine.gate.semantic.hold_semantic_gate": (
+        bool,
+        True,
+        "hold 窗是否也过二级语义；过了才开窗/调 omni/落视频，语义否决则跳过，重启生效",
+    ),
+    "perception.engine.gate.semantic.physio_enabled": (
+        bool,
+        True,
+        "是否追加生理关怀补问（喝水/吃东西/打哈欠等）；过阈值时状态容器不跳 omni，重启生效",
+    ),
+    "perception.engine.gate.semantic.physio_instructions": (
+        str,
+        "相对参考帧，主体是否出现**生理关怀相关动作**：喝水/喝饮料、吃东西、打哈欠、"
+        "揉眼睛/明显疲劳、打瞌睡、捂肚子/身体不适、起身去卫生间？只判断身体/生理动作，工作动作不算。",
+        "生理关怀补问文本，重启生效",
+    ),
+    "perception.engine.gate.semantic.physio_min_score": (
+        float,
+        0.1,
+        "生理关怀补问阈值；0.1 在 416 窗上覆盖约 81% DeepSeek physio，重启生效",
+    ),
+    "perception.engine.gate.semantic.end_enabled": (
+        bool,
+        True,
+        "是否追加「消失/结束/离开」补问；补默认问题对事件结束/人离开的漏报，重启生效",
+    ),
+    "perception.engine.gate.semantic.end_instructions": (
+        str,
+        "相对参考帧，主体/主要对象是否消失、离开画面，或结束了参考帧里正在做的事？"
+        "（例如人离开/不见了、动作停止、物品放下、一件事结束）",
+        "补问的问题文本；默认问题与它任一过阈即放行，重启生效",
+    ),
+    "perception.engine.gate.semantic.end_min_score": (
+        float,
+        0.1,
+        "补问的阈值；200 窗上 0.1 可把玄关召回 72%→95%（精度 99%→95%），重启生效",
     ),
     "perception.engine.gate.semantic.frames": (
         int,
@@ -277,8 +319,9 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
     ),
     "perception.engine.gate.semantic.instructions": (
         str,
-        "画面中正在发生的事，跟参考帧相比有变化吗？"
-        "（只要事情变了就算有变化；同一件事持续、重复、轻微换姿势不算。）",
+        "相对参考帧，画面里**活动级的事件**变了吗？即主体或主要对象开始/结束/切换了一个活动，"
+        "或进出画面、位置明显改变、物品交互、异常出现。不是动作级的小变化；"
+        "同一活动持续、姿势/手脚/头部移动、打字、摸脸、托腮、转头、光线变化都不算。",
         "送给模型的判定问题；改这里即可换判据，重启生效",
     ),
     "perception.engine.gate.semantic.true_label": (
@@ -291,6 +334,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "没有变化",
         "判定问题的 false 选项文案，重启生效",
     ),
+    "perception.engine.gate.dump.include_hold": (
+        bool,
+        True,
+        "hold 窗过了二级语义后是否也落视频（仍需 dump.enabled=true），重启生效",
+    ),
     "perception.engine.gate.semantic.special_pass.enabled": (
         bool,
         True,
@@ -299,7 +347,7 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
     ),
     "perception.engine.gate.semantic.special_pass.max_items": (
         int,
-        4,
+        6,
         "每机位最多几条特殊放行问题（LLM 输出按重要性排序取前 N），重启生效",
     ),
     "perception.engine.gate.semantic.special_pass.refresh_after_hours": (
@@ -331,6 +379,22 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         str,
         "",
         "追加到特殊放行提炼提示词末尾的现场补充要求；改了会触发重提炼，重启生效",
+    ),
+    "perception.engine.state_memory.enabled": (
+        bool,
+        True,
+        "状态容器开关：门禁拦截时续命建议链/规则，并定时强制复核；重启生效",
+    ),
+    "perception.engine.state_memory.recheck_interval_sec": (
+        float,
+        300.0,
+        "状态还在时，最长多久不调 omni 就强制放一窗复核（秒）；重启生效",
+    ),
+    "perception.engine.track_count.enabled": (
+        bool,
+        False,
+        "Tracking 过线计数开关：进入/出去/经过直接写 task_record event，不走 rule 边沿去重；"
+        "逐机位 line/inside 在 config.json 或 settings.yaml 的 cameras 里配，重启生效",
     ),
     # 一级门禁窗口留存（过视觉门禁的窗口存 mp4 + meta，供离线分析）
     "perception.engine.gate.dump.enabled": (

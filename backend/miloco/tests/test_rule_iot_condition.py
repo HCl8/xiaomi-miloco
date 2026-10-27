@@ -692,19 +692,34 @@ async def test_duration_seconds_on_an_iot_rule_is_rejected(service):
 
 
 @pytest.mark.asyncio
-async def test_duration_seconds_on_an_omni_rule_is_still_allowed(service):
-    """与上一条方向相反：判据写成「一律拒」时这条会红。"""
+async def test_duration_seconds_on_a_session_rule_is_allowed(service):
+    """duration_seconds = 会话连续目标时长，仅 session 规则有效。"""
     rule = Rule(
         id="",
-        name="学习了两小时",
+        name="连续学习两小时",
         task_id="t1",
-        direction=RuleDirection.ENTER,
+        direction=RuleDirection.SESSION,
         condition=RuleCondition(perceive_device_ids=["cam-001"], query="孩子在书桌前"),
-        action_descriptions=["播报"],
+        on_enter_desc="提醒休息",
         duration_seconds=120,
     )
 
     assert await service.create_rule(rule)
+
+
+@pytest.mark.asyncio
+async def test_duration_seconds_on_an_enter_rule_is_rejected(service):
+    """单方向规则没有会话边界，定时器无处挂。"""
+    rule = Rule(
+        id="",
+        name="学习事件",
+        task_id="t1",
+        direction=RuleDirection.ENTER,
+        condition=RuleCondition(perceive_device_ids=["cam-001"], query="孩子在书桌前"),
+        duration_seconds=120,
+    )
+    with pytest.raises(ValidationException, match="duration_seconds"):
+        await service.create_rule(rule)
 
 
 @pytest.mark.asyncio

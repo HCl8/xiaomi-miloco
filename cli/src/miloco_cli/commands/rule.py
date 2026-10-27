@@ -365,9 +365,9 @@ def rule_iot_diagnostics(pretty):
     type=int,
     default=None,
     help=(
-        "条件需持续该时长才算成立（秒）。不填=立即 fire。"
-        "enter / exit：达标 fire 后清窗口周期 fire；"
-        "session：达标 fire on_enter 一次，STILL_IN 不重复，EXITED 走 exit_debounce"
+        "会话连续目标时长（秒），仅 direction=session 有效。"
+        "会话进入后每 N 秒触发一次 on_target；exit_debounce 内回来继续计时，"
+        "真退出取消、下次进入重新计时。不再按窗口采样。"
     ),
 )
 @click.option(
@@ -375,10 +375,7 @@ def rule_iot_diagnostics(pretty):
     "duration_ratio",
     type=float,
     default=None,
-    help=(
-        "窗口内 True 比例阈值（0,1]，仅 --duration-seconds 设置时有效；"
-        "不填用 backend 默认 0.8"
-    ),
+    help="已废弃：旧 duration 滑窗比例，保留参数仅为兼容",
 )
 @click.option("--pretty", is_flag=True)
 def rule_create(
@@ -450,6 +447,8 @@ def rule_create(
         if duration_seconds is not None:
             _exit_error("direction=guard must not set --duration-seconds")
     elif direction != "session":
+        if duration_seconds is not None:
+            _exit_error("--duration-seconds requires direction=session")
         # 单方向的 rule 只有一个边沿, 动作填在 --action / --action-desc 上;
         # 落 on_enter 还是 on_exit 由 direction 决定, 不用另一套 flag。
         if (
@@ -623,14 +622,14 @@ def rule_create(
     "duration_seconds",
     type=int,
     default=None,
-    help="条件需持续该时长才算成立（秒）。guard 不支持（其余方向的语义见 rule create help）",
+    help="会话连续目标时长（秒），仅 session 有效（见 rule create help）",
 )
 @click.option(
     "--duration-ratio",
     "duration_ratio",
     type=float,
     default=None,
-    help="窗口内 True 比例阈值（0,1]",
+    help="已废弃：旧 duration 滑窗比例，保留参数仅为兼容",
 )
 @click.option(
     "--clear",

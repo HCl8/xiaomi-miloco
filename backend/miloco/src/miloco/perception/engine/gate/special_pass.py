@@ -1,8 +1,12 @@
 """Gate Layer — LLM 提炼「特殊放行」判定项。
 
-默认问题只判「相对参考帧有没有变化」，判不出持续状态/缺席/身份相关/细微状态。
-这里用 omni 模型（text-only）读本机位规则 + 家庭档案，产出覆盖不到的动作，
-逐条交给 StartLux 做 yes/no；后台提炼、按机位缓存，失败只退回默认问题。
+常规活动（喝水/打哈欠/看手机/起身/离开/回到/坐下工作）由默认问题直接召回；
+这里用 omni 模型（text-only）读本机位规则 + 家庭档案，只提炼默认问题覆盖不到的
+**变化时刻**（身份/身体条件、细微局部、宠物异常、健康安全禁忌等），逐条交给
+StartLux 做 yes/no。
+提炼时把门禁的公共输入布局一并给出，保证写出的描述都是「相对参考帧」可判的；
+静态/持续状态不进特殊放行（否则同一状态会在每个窗都放行）。
+后台提炼、按机位缓存，失败只退回默认问题。
 """
 
 from __future__ import annotations
@@ -24,19 +28,27 @@ from miloco.utils.paths import miloco_home
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_VERSION = "v2"
+_PROMPT_VERSION = "v6"
 _CACHE_VERSION = 1
 
-_SYSTEM_PROMPT = (
-    "你是家庭感知系统的门禁配置助手。门禁已经有一个默认问题，判断「画面相对参考帧"
-    "有没有变化」。你的任务是结合这个机位的自定义任务和家庭档案，找出默认问题覆盖"
-    "不到、但必须特殊放行的画面条件，写成可以直接做 yes/no 判断的动作或状态描述。"
-    "只输出 JSON。"
+# 门禁公共输入布局的兜底文案；正常情况下由调用方把 config.state 渲染好后传入。
+_FALLBACK_INPUT_LAYOUT = (
+    "画面按时间先后排列：第 1 张是「参考帧」，即上一个窗口的最后一帧；"
+    "其余是「本窗口」的画面，每秒 1 张。"
 )
 
-_USER_TEMPLATE = """【机位】<<ROOM>>
-【机位须知】<<CAMERA_PROMPT>>
+_SYSTEM_PROMPT = (
+    "你是家庭感知系统的门禁提示词助手。门禁的输入是一组按时间排列的画面："
+    "第 1 张是参考帧（上一个窗口最后一帧），其余是本窗口画面。默认问题判断"
+    "「相对参考帧有没有变化」。你的任务是结合机位任务和家庭档案，找出默认问题"
+    "可能漏掉、但值得放行的**变化时刻**，写成相对参考帧可以直接做 yes/no 判断的"
+    "变化描述。不要写静态场景或持续状态。只输出 JSON。"
+)
+
+_USER_TEMPLATE = """【输入数据】<<INPUT_LAYOUT>>
 【默认问题】<<DEFAULT_QUESTION>>
+【机位】<<ROOM>>
+【机位须知】<<CAMERA_PROMPT>>
 
 【本机位生效的自定义任务】
 <<RULES>>
@@ -44,27 +56,40 @@ _USER_TEMPLATE = """【机位】<<ROOM>>
 【家庭档案】
 <<PROFILE>>
 
-判断口径：
-- 默认问题「能覆盖」的，不要输出：一次性的可见变化，例如有人进入/离开、有人摔倒、拿起/放下物品、明显换动作、有人经过。画面会变，默认问题会放行。
-- 默认问题「覆盖不到」的，才输出：
-  1. 持续状态/时长：同一姿势持续、久坐不起、门或水龙头长时间保持打开；
-  2. 缺席/空位：某个位置应该有人/物但不在、房间长时间无人；
-  3. 依赖具体身份或身体条件：要结合家庭档案才知道该关注的动作；
-  4. 细微局部状态：物件位置、设备指示灯、门开合、宠物抓咬家具等；
-  5. 档案里明确写出的健康/安全风险、禁忌或约定、要求关注/记录的动作、宠物异常或破坏行为。
+核心口径——只找「变化时刻」，不找「持续状态」：
+- 每条 action 都必须是相对第 1 张参考帧能判定的变化：新出现、刚发生、刚开始、刚结束、刚切换、刚拿起/放下、刚进入/离开、位置/状态刚改变。
+- 禁止输出静态或持续状态，例如"有人在用电脑/工作""有人拿着手机看""宝宝在爬行垫上""有人坐在沙发上"。这些状态可能在很多窗里都成立，会把门禁变成"只要状态在就放行"。
+- 规则/档案关心的是持续状态时，只提炼它开始/结束/切换的那一刻。
+
+常规活动默认问题已经明确覆盖，不要输出：
+- 喝水/吃东西、打哈欠、看手机、起身/站立、离开/回到画面、坐下开始工作、进门/摔倒等，
+  默认问题（活动类别变化）会召回；这些规则一律放 covered，不要写成特殊项。
+- 规则里说的是"有人/人"时，用"主体"指代；只有规则/档案明确要求关注其他人/宠物/背景时才用对应泛称。
+- 特殊项只留给默认问题覆盖不到的：依赖具体身份/身体条件、细微局部、宠物异常、健康/安全禁忌、档案约定等。
+- 没有明显转折的持续状态不要硬编转折；确实没有变化就放 covered。
+
+默认问题覆盖不到、但仍属于「变化」的也输出：
+1. 非主体的人/物发生的变化：只有规则/档案明确要求关注其他人/宠物/背景时才输出，否则不要写背景路人；
+2. 细微/局部变化：小物件刚被移动、门刚被打开、灯刚亮/灭、宠物刚开始抓咬；
+3. 依赖具体身份/身体条件的转折时刻：结合档案才知道要关注的变化（如老人刚从站立变为扶墙）；
+4. 档案写明的健康/安全风险、禁忌或要求关注的动作，取其发生/开始的瞬间。
+
+示例：
+- 好（变化）：「宝宝刚开始爬行」「老人刚从站立变为扶墙」「猫刚开始抓沙发」
+- 坏（静态）：「有人在工作/用电脑」「有人拿着手机」「宝宝在爬行垫上」「客厅里有人」
 
 硬性要求：
-- action 必须是画面可直接观察的动作/状态，用肯定句描述"要放行的画面"（如"厨房长时间无人"而不是"是否没人"）；8~40 个汉字；主体用档案/规则里的称呼，没有外观描述时用画面可判别的泛称（如"老人""小孩""猫"）；不写时间条件、概率、心理活动。
-- 默认问题能覆盖的规则不要输出，放进 covered 说明原因；档案依据不需要 covered。
+- action 用变化句式（刚…／开始…／从…变为…／新出现…／刚离开…），8~40 个汉字；主体用档案/规则里的称呼，没有外观描述时用画面可判别的泛称；不写时间条件、概率、心理活动。
+- 每条 action 都必须能与参考帧对比判断；只靠单帧静态内容就能成立的描述不合格。
+- 常规活动（喝水/打哈欠/看手机/起身/离开/回到/坐下工作）和大幅变化放 covered 说明原因；只有真正覆盖不到的变化才落到 items。
 - 同一条件（同一条规则或同一档案依据）只输出一条；最多 <<MAX_ITEMS>> 条，按重要性排序；没有就输出空数组。
 - source 必须写来源：规则来的填 rule:<rule_id>，档案来的填 profile。
-- 每条规则都必须落到 items（默认问题覆盖不到）或 covered（默认问题能覆盖）里，不要遗漏；本机位没有自定义任务时 covered 输出空数组。
-- 常规规则（例如"有人摔倒""有人进门""有人拿起杯子"）默认问题能覆盖，不要输出，在 covered 里说明。
+- 每条规则都必须落到 items（动作/细微变化）或 covered（大幅/持续状态）里，不要遗漏；本机位没有自定义任务时 covered 输出空数组。
 - 只输出确实能从规则或档案推出的内容，不要编造。
 <<EXTRA_BLOCK>>
 输出 JSON（不要 markdown 代码块、不要解释）：
 {"items":[{"action":"...","reason":"...","source":"rule:<rule_id> 或 profile"}],
- "covered":[{"rule_id":"...","reason":"默认问题能覆盖，原因..."}]}"""
+ "covered":[{"rule_id":"...","reason":"默认问题能覆盖，或只是持续状态..."}]}"""
 
 
 @dataclass
@@ -98,8 +123,14 @@ def prepare_camera(
     generic_instructions: str,
     config: SpecialPassConfig,
     omni_config: OmniConfig,
+    input_layout: str = "",
 ) -> list[SpecialPassItem]:
-    """返回该机位当前可用的特殊放行项；需要重跑时只起后台任务、不阻塞本窗。"""
+    """返回该机位当前可用的特殊放行项；需要重跑时只起后台任务、不阻塞本窗。
+
+    ``input_layout`` 是门禁的公共输入说明（参考帧 + 本窗口各帧），会随提炼提示词
+    一起给 LLM，确保它写出的是「相对参考帧」可判的变化；也进缓存 key，改了会重提炼。
+    """
+    input_layout = (input_layout or "").strip() or _FALLBACK_INPUT_LAYOUT
     if not config.enabled or config.max_items <= 0:
         return []
     try:
@@ -118,6 +149,7 @@ def prepare_camera(
             camera_prompt=camera_prompt,
             rules=rules,
             generic_instructions=generic_instructions,
+            input_layout=input_layout,
             model_name=live.model,
             max_items=config.max_items,
             max_action_chars=config.max_action_chars,
@@ -135,6 +167,7 @@ def prepare_camera(
                     camera_prompt=camera_prompt,
                     rules=rules,
                     generic_instructions=generic_instructions,
+                    input_layout=input_layout,
                     config=config,
                     omni_config=omni_config,
                 )
@@ -148,6 +181,7 @@ def prepare_camera(
             camera_prompt=camera_prompt,
             rules=rules,
             generic_instructions=generic_instructions,
+            input_layout=input_layout,
             config=config,
             omni_config=omni_config,
         )
@@ -268,6 +302,7 @@ async def _refresh(
     camera_prompt: str | None,
     rules: Sequence[RuleCondition],
     generic_instructions: str,
+    input_layout: str,
     config: SpecialPassConfig,
     omni_config: OmniConfig,
 ) -> None:
@@ -279,6 +314,7 @@ async def _refresh(
             camera_prompt=camera_prompt,
             rules=rules,
             generic_instructions=generic_instructions,
+            input_layout=input_layout,
             config=config,
             omni_config=omni_config,
         )
@@ -333,6 +369,7 @@ async def _extract(
     generic_instructions: str,
     config: SpecialPassConfig,
     omni_config: OmniConfig,
+    input_layout: str = "",
 ) -> tuple[list[SpecialPassItem], list[dict], str]:
     from miloco.perception.engine.omni.omni_client import (
         call_omni,
@@ -345,6 +382,10 @@ async def _extract(
         _USER_TEMPLATE.replace("<<ROOM>>", (room_name or "（未知）").strip())
         .replace("<<CAMERA_PROMPT>>", (camera_prompt or "（无）").strip())
         .replace("<<DEFAULT_QUESTION>>", generic_instructions.strip())
+        .replace(
+            "<<INPUT_LAYOUT>>",
+            (input_layout or "").strip() or _FALLBACK_INPUT_LAYOUT,
+        )
         .replace("<<RULES>>", _render_rules(rules))
         .replace("<<EXTRA_BLOCK>>", extra_block)
         .replace("<<PROFILE>>", profile.strip() or "（无家庭档案）")
@@ -503,6 +544,7 @@ def _camera_key(
     rules: Sequence[RuleCondition],
     generic_instructions: str,
     model_name: str,
+    input_layout: str = "",
     max_items: int,
     max_action_chars: int,
     extra_instructions: str,
@@ -514,6 +556,7 @@ def _camera_key(
         "room": room_name or "",
         "camera_prompt": camera_prompt or "",
         "default_question": generic_instructions,
+        "input_layout": input_layout,
         "max_items": max_items,
         "max_action_chars": max_action_chars,
         "extra_instructions": extra_instructions,

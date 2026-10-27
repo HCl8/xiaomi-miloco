@@ -40,6 +40,7 @@ from miloco.perception.engine.omni.omni_client import (
     OmniError,
     resolve_live_omni_config,
 )
+from miloco.perception.engine.track_count import run_track_count
 
 if TYPE_CHECKING:
     import numpy as np
@@ -407,6 +408,10 @@ async def run_pipeline(
                                           identity_engine=identity_engine,
                                           frame_index_offset=frame_index_offset)
     timing["identity_ms"] = _ms_since(t)
+    if config.track_count.enabled:
+        track_cfg = config.track_count.cameras.get(input_slice.device.did)
+        if track_cfg is not None:
+            await run_track_count(input_slice.device.did, identity_packet, track_cfg)
 
     # Omni —— 按 omni_call_mode 分流（fused 走身份合并主调用，否则走原 perception 主调用）
     room_name = input_slice.device.room_name or input_slice.device.did
@@ -494,6 +499,7 @@ async def run_batch_pipeline(
     gate_last_audio_pass_ts: "dict[str, float] | None" = None,
     gate_hold_active: "dict[str, bool] | None" = None,
     gate_hold_started_at: "dict[str, float] | None" = None,
+    force_omni_dids: "set[str] | None" = None,
     trace_id: str | None = None,
     device_trace_ids: dict[str, str] | None = None,
     collect_flow_diagnostics: bool = False,
@@ -531,6 +537,8 @@ async def run_batch_pipeline(
                               + events 表事件;``None`` 时不打日志。
         gate_hold_started_at: per-device hold 进入时刻(monotonic),退出/恢复时算
                               held_for_ms;与 ``gate_hold_active`` 配对使用。
+        force_omni_dids:      状态容器到点复核的 device 集合。这些设备本窗绕过
+                              视觉/语义门禁直接放行给 omni；有帧才生效。
     """
     batch_timing: dict[str, float] = {}
     t_total = time.monotonic()
@@ -561,6 +569,11 @@ async def run_batch_pipeline(
                     camera_prompt=sem_ctx.camera_prompt,
                     rules=sem_ctx.rule_conditions,
                     generic_instructions=semantic_cfg.instructions,
+                    # 公共输入布局（参考帧 + 本窗口各帧）也要进提炼提示词，
+                    # 让 LLM 只写「相对参考帧」可判的变化，而不是静态状态。
+                    input_layout=semantic_cfg.state.replace(
+                        "{n}", str(semantic_cfg.frames + 1)
+                    ),
                     config=semantic_cfg.special_pass,
                     omni_config=config.omni,
                 )
@@ -664,10 +677,17 @@ async def run_batch_pipeline(
                 prev_raw_frame=prev_raw_frame,
                 semantic_context=SemanticGateContext(
                     special_items=special_pass_by_did.get(did, ()),
-                    camera_prompt=context.camera_prompt,
+                    # 机位须知只给 omni/特殊项提炼；门禁默认不注入，避免活动清单
+                    # 把模型往「看到这些动作就放行」引（200 窗 A/B 客厅精度 +2.5pp）。
+                    camera_prompt=(
+                        context.camera_prompt
+                        if config.gate.semantic.include_camera_prompt
+                        else None
+                    ),
                     room_name=context.room_name or room_name,
                     current_time=context.current_time,
                 ),
+                force_pass=bool(force_omni_dids and did in force_omni_dids),
             )
         except asyncio.CancelledError:
             raise
@@ -704,7 +724,16 @@ async def run_batch_pipeline(
                 if ref is not None:
                     gate_prev_raw_frames[did] = ref
         # 一级门禁放行的窗口留存（供离线分析语义门禁）；编码放线程里，失败不影响感知。
-        if config.gate.dump.enabled and gate_timing.video_pass:
+        if config.gate.dump.enabled and (
+            gate_timing.video_pass
+            or gate_timing.recheck
+            or (
+                config.gate.dump.include_hold
+                and gate_timing.hold_opened_window
+                and gate_timing.semantic_applied
+                and gate_timing.semantic_pass
+            )
+        ):
             dump_frames = (
                 [f.data for f in snapshot.video.frames] if snapshot.video else []
             )
@@ -799,6 +828,7 @@ async def run_batch_pipeline(
         room_timing[f"gate_video_{did}_pass"] = int(gate_timing.video_pass)
         room_timing[f"gate_audio_{did}_pass"] = int(gate_timing.audio_pass)
         room_timing[f"gate_hold_{did}_pass"] = int(gate_timing.hold_opened_window)
+        room_timing[f"gate_recheck_{did}"] = int(gate_timing.recheck)
         if config.gate.semantic.enabled:
             # 非 "_" 前缀 → _merge_results 加 room 前缀 → 落 traces.timing_detail(JSON)，
             # 不复用 traces_device 固定列，免 DB 迁移。
@@ -808,6 +838,17 @@ async def run_batch_pipeline(
             room_timing[f"semantic_{did}_score"] = gate_timing.semantic_score
             room_timing[f"semantic_{did}_veto"] = int(gate_timing.semantic_veto)
             room_timing[f"semantic_{did}_error"] = gate_timing.semantic_error
+            room_timing[f"semantic_{did}_hold_veto"] = int(
+                gate_timing.hold_semantic_veto
+            )
+            room_timing[f"semantic_{did}_end_score"] = gate_timing.semantic_end_score
+            room_timing[f"semantic_{did}_end_pass"] = int(gate_timing.semantic_end_pass)
+            room_timing[f"semantic_{did}_physio_score"] = (
+                gate_timing.semantic_physio_score
+            )
+            room_timing[f"semantic_{did}_physio_pass"] = int(
+                gate_timing.semantic_physio_pass
+            )
             room_timing[f"semantic_{did}_pass_score"] = gate_timing.semantic_pass_score
             room_timing[f"semantic_{did}_pass_hits"] = gate_timing.semantic_pass_hits
             room_timing[f"semantic_{did}_pass_count"] = gate_timing.semantic_pass_count
@@ -833,6 +874,7 @@ async def run_batch_pipeline(
                 device_id=did,
                 input_slice=snapshot,
                 skipped=True,
+                gate_blocked=True,
                 flow_diagnostics=diagnostics,
             )
 
@@ -872,6 +914,10 @@ async def run_batch_pipeline(
         if diagnostics is not None:
             diagnostics.identity_frame_count = len(gate_packet.frames)
             diagnostics.identity_status = GraphStatus.OK
+        if config.track_count.enabled:
+            track_cfg = config.track_count.cameras.get(did)
+            if track_cfg is not None:
+                await run_track_count(did, identity_packet, track_cfg)
 
         # omni 阶段:把 per-device 元数据塞进 ContextVar,供 traces_device 等观测路径读取。
         device_ctx_token = set_device_context(DeviceContext(
@@ -1191,6 +1237,10 @@ async def run_query_pipeline(
                 identity_engine=identity_engine,
                 frame_index_offset=frame_index_offset,
                 )
+            if config.track_count.enabled:
+                track_cfg = config.track_count.cameras.get(did)
+                if track_cfg is not None:
+                    await run_track_count(did, identity_packet, track_cfg)
             # query 路径的 packet 只喂 build_query_prompt→omni, 同主路径口径下采到
             # omni_fps(否则 fps 提频后 on-demand 查询送 omni 的帧数翻倍、延迟上升)
             identity_packet = _downsample_for_omni(

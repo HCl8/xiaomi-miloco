@@ -38,6 +38,7 @@ async def run_gate(
     last_audio_pass_ts: float | None = None,
     prev_raw_frame: NDArray[np.uint8] | None = None,
     semantic_context: SemanticGateContext | None = None,
+    force_pass: bool = False,
 ) -> tuple[
     GatePacket | None,
     GateTiming,
@@ -61,6 +62,9 @@ async def run_gate(
     （自定义任务 + 家庭档案经 LLM 提炼），sidecar 一次请求里逐条判 yes/no,任一命中即放行。
     语义结果在 ``mode=enforce`` 且未过阈值时把 ``visual_effective`` 置假,``mode=shadow``
     只记分不改变路由。
+
+    ``force_pass`` 是状态容器的定时复核：有帧就绕过视觉/语义门禁直接放行给 omni，
+    用于确认「一直在工作」这类门禁永远判为「无变化」的持续状态。
     """
     t = time.monotonic()
     visual = evaluate_visual(
@@ -71,10 +75,14 @@ async def run_gate(
     last_checked = visual.last_checked
     video_ms = (time.monotonic() - t) * 1000
 
+    # 状态容器到点复核：绕过视觉/语义门禁直接给 omni（有帧才放）。复核的目的
+    # 就是让 omni 重新看当前状态，本地门禁不能把它拦掉。
+    forced = force_pass and bool(input_slice.frames)
+
     # 二级语义门禁：只在视觉放行时判（视觉没放行的窗本来就不会调 omni）。
     # 失败/熔断时 applied=False，visual_effective 保持原样 = fail-open。
     semantic = SemanticEvalResult()
-    if config.semantic.enabled and visual_changed and input_slice.frames:
+    if config.semantic.enabled and visual_changed and input_slice.frames and not forced:
         semantic = await evaluate_semantic(
             input_slice.frames, prev_raw_frame, config.semantic, semantic_context
         )
@@ -84,16 +92,7 @@ async def run_gate(
         and config.semantic.mode == "enforce"
         and not semantic.passed
     )
-    visual_effective = visual_changed and not semantic_veto
-
-    # 命中项写成 "下标:动作" 便于在 traces.timing_detail 里直接看到是哪个特殊放行项。
-    semantic_pass_hits = ""
-    if semantic_context is not None and semantic.pass_hits:
-        semantic_pass_hits = ",".join(
-            f"{i}:{semantic_context.special_items[i].action[:30]}"
-            for i in semantic.pass_hits
-            if i < len(semantic_context.special_items)
-        )[:300]
+    visual_effective = forced or (visual_changed and not semantic_veto)
 
     t = time.monotonic()
     audio_active, audio_energy = evaluate_audio(input_slice.audio_clip, config)
@@ -118,12 +117,41 @@ async def run_gate(
         and config.hold_duration_sec > 0
         and (now - last_visual_pass_ts) <= config.hold_duration_sec
     )
+    # 无帧时 hold 不放行:零帧包会一路走到 omni 却拼不出 video 块,模型只能照 schema 编场景。
+    hold_candidate = hold_active and bool(input_slice.frames)
+
+    # hold 窗也要过一遍二级语义：视觉没变化时上面的 semantic 没跑，这里补判。
+    # 被语义否决的 hold 不再开窗（不调 omni、不落视频），只留下 hold_pass 原始标记。
+    if (
+        config.semantic.enabled
+        and config.semantic.hold_semantic_gate
+        and hold_candidate
+        and not visual_changed
+        and input_slice.frames
+    ):
+        semantic = await evaluate_semantic(
+            input_slice.frames, prev_raw_frame, config.semantic, semantic_context
+        )
+    hold_semantic_veto = (
+        config.semantic.enabled
+        and config.semantic.hold_semantic_gate
+        and hold_candidate
+        and semantic.applied
+        and not semantic.passed
+    )
+    hold_opens_window = hold_candidate and not hold_semantic_veto
 
     new_last_visual_pass_ts = now if visual_effective else last_visual_pass_ts
     new_last_audio_pass_ts = now if audio_active else last_audio_pass_ts
 
-    # 无帧时 hold 不放行:零帧包会一路走到 omni 却拼不出 video 块,模型只能照 schema 编场景。
-    hold_opens_window = hold_active and bool(input_slice.frames)
+    # 命中项写成 "下标:动作" 便于在 traces.timing_detail 里直接看到是哪个特殊放行项。
+    semantic_pass_hits = ""
+    if semantic_context is not None and semantic.pass_hits:
+        semantic_pass_hits = ",".join(
+            f"{i}:{semantic_context.special_items[i].action[:30]}"
+            for i in semantic.pass_hits
+            if i < len(semantic_context.special_items)
+        )[:300]
 
     timing = GateTiming(
         video_ms=video_ms, audio_ms=audio_ms,
@@ -133,6 +161,7 @@ async def run_gate(
         vad_ms=vad_ms, speech_prob=speech_prob,
         hold_pass=hold_active,
         hold_opened_window=hold_opens_window,
+        hold_semantic_veto=hold_semantic_veto,
         video_intra_score=visual.intra_max,
         video_cross_score=visual.cross_max,
         checked_frame_count=visual.checked_frame_count,
@@ -147,6 +176,7 @@ async def run_gate(
         semantic_pass_hits=semantic_pass_hits,
         semantic_pass_count=semantic.pass_count,
         semantic_question_count=semantic.question_count,
+        recheck=forced,
     )
 
     if not any_pass and not hold_opens_window:
@@ -163,6 +193,7 @@ async def run_gate(
             audio_energy_level=audio_energy,
             speech_active=speech_active,
             hold=hold_opens_window,
+            recheck=forced,
         ),
         frames=input_slice.frames,
         audio_clip=input_slice.audio_clip,

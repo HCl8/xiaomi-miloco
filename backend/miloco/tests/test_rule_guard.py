@@ -89,8 +89,8 @@ def test_guard_without_actions_passes():
 
 
 def test_guard_rejects_duration_seconds():
-    """前提读的是条件层的当前值, 滑窗只影响 fire 路径 —— 配了静默无效。"""
-    with pytest.raises(ValidationException, match="前提规则"):
+    """duration_seconds 只表示会话连续目标时长；前提规则没有会话。"""
+    with pytest.raises(ValidationException, match="duration_seconds"):
         _validate_rule_consistency(_guard(duration_seconds=600))
 
 

@@ -12,11 +12,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from miloco.perception.client import PerceptionEngineProxy
-from miloco.perception.types import MatchedRule, RealtimePerceptionResult
+from miloco.perception.types import MatchedRule, RealtimePerceptionResult, Suggestion
 from miloco.rule.schema import TriggerOutcome
 
 
@@ -294,3 +294,51 @@ async def test_disabled_rule_during_cycle_skipped(proxy):
         "rule_Y 已 disable,false 广播应跳过"
     )
     assert len(calls) == 1
+
+
+# =============================================================================
+# 状态容器：门禁拦截窗的续命 / 到点提醒派发
+# =============================================================================
+
+
+async def test_skipped_dispatches_state_reminder(proxy):
+    """全 room 被拦时，state_memory 的到点提醒仍要派发给 agent。"""
+    result = RealtimePerceptionResult(
+        skipped=True,
+        suggestions=[
+            Suggestion(event="在工作", action="提醒休息", urgency="high")
+        ],
+    )
+    capture, _calls = _capture_calls()
+    mgr = _fake_mgr([], capture)
+
+    with (
+        patch("miloco.manager.get_manager", return_value=mgr),
+        patch(
+            "miloco.perception.client.dispatch_event",
+            new=AsyncMock(return_value=True),
+        ) as dispatch,
+    ):
+        await proxy.handle_realtime_perception_result(result, artifacts=None)
+
+    assert dispatch.await_count == 1
+    dispatched = dispatch.await_args.args[1]
+    assert dispatched[0].event == "在工作"
+
+
+async def test_unmatched_rule_feeds_false_with_skip_flicker(proxy):
+    """VLM 过渡窗的 False 一帧确认：不等第二帧，退出宽限由任务层提供。"""
+    result = RealtimePerceptionResult(
+        skipped=False,
+        device_rule_map={"cam_A": ["rule_X"]},
+    )
+    calls: list[tuple] = []
+
+    async def capture(rule_id, source_did, current_bool, context="", **kw):
+        calls.append((rule_id, source_did, current_bool, kw.get("skip_flicker")))
+
+    mgr = _fake_mgr(["rule_X"], capture)
+    with patch("miloco.manager.get_manager", return_value=mgr):
+        await proxy.handle_realtime_perception_result(result, artifacts=None)
+
+    assert calls == [("rule_X", "cam_A", False, True)]

@@ -42,6 +42,8 @@ class GateTrigger:
     # 滞回拉起且本窗有帧。给 _is_audio_only 选路用:hold=True 不降级到 audio-only。
     # 三处 hold 取值的对照见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
     hold: bool = False
+    # 状态容器到点强制放行的复核窗（不看视觉/语义门禁，直接给 omni 复核状态）。
+    recheck: bool = False
 
 
 @dataclass
@@ -79,6 +81,8 @@ class GateTiming:
     # 原始滞回判定,只看时间不看有没有帧。给 pipeline 的 HOLD_START / HOLD_EXPIRED /
     # HOLD_RECOVERED 状态机用 —— 置假会让零帧窗口凭空触发一次 HOLD_EXPIRED。
     hold_pass: bool = False
+    # hold 窗被二级语义否决（hold_pass 但不开窗；不调 omni、不落视频）。
+    hold_semantic_veto: bool = False
     # 滞回真把本窗开出来了(hold_pass 且本窗有帧)。落 traces_device.gate_hold_pass 那一列。
     # 该列的等价关系与适用范围见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
     hold_opened_window: bool = False
@@ -98,10 +102,17 @@ class GateTiming:
     semantic_error: str = ""
     # 特殊放行问题（规则 / 档案经 LLM 提炼）：最高分、命中项下标、问了几条、总题数。
     # 默认问题分数仍在 semantic_score，这两组分开记，便于离线分别看阈值。
+    semantic_end_score: float = 0.0
+    semantic_end_pass: bool = False
+    semantic_physio_score: float = 0.0
+    semantic_physio_pass: bool = False
     semantic_pass_score: float = 0.0
     semantic_pass_hits: str = ""
     semantic_pass_count: int = 0
     semantic_question_count: int = 0
+
+    # 状态容器到点强制复核：本窗绕过视觉/语义门禁直接给 omni。
+    recheck: bool = False
 
     @property
     def total_ms(self) -> float:
@@ -368,6 +379,7 @@ class OmniContext:
 
 
 
+
 # Omni output types — reuse shared Pydantic models
 from miloco.perception.types import (  # noqa: E402
     OnDemandPerceptionResult,
@@ -417,6 +429,9 @@ class DevicePipelineResult:
     identity_packet: IdentityPacket | None = None
     omni_output: OmniOutput | None = None
     skipped: bool = False
+    # 门禁（视觉/语义）判定本窗无活动级变化而跳过。与 identity/omni 报错、
+    # 空帧等其它 skipped 原因区分：只有这一类允许状态容器续命。
+    gate_blocked: bool = False
     flow_diagnostics: PerDeviceFlowDiagnostics | None = None
 
 
