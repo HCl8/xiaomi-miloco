@@ -751,3 +751,33 @@ async def test_state_target_cancelled_on_real_exit(monkeypatch):
     # 重新进入 → 新的目标定时器
     await runner.update_state("r-ses", "cam1", True, "")
     assert state.state_target_task is not None
+
+
+@pytest.mark.asyncio
+async def test_session_target_states_snapshot(monkeypatch):
+    """看板拿到的 remaining 必须和真正到点提醒读的是同一份内存计时。"""
+    rule = _rule(
+        "r1",
+        "t1",
+        mode=RuleMode.STATE,
+        direction=RuleDirection.SESSION,
+        duration_seconds=1800,
+        on_enter_desc="开始",
+    )
+    runner = _runner([rule], monkeypatch)
+    runner._arm_state_target(rule)
+
+    snap = runner.session_target_states()
+    assert len(snap) == 1
+    row = snap[0]
+    assert row["task_id"] == "t1"
+    assert row["duration_seconds"] == 1800
+    assert row["armed"] is True
+    assert row["running"] is True
+    assert 0 < row["remaining_seconds"] <= 1800
+
+    runner._pause_state_target(rule)
+    paused = runner.session_target_states()[0]
+    assert paused["armed"] is True
+    assert paused["running"] is False
+    assert 0 < paused["remaining_seconds"] <= 1800

@@ -239,6 +239,24 @@ async def trigger_rule(
 # ---- Single rule operations ----
 
 
+@router.get(
+    "/session-targets",
+    summary="Get session target timer states",
+    response_model=NormalResponse,
+)
+async def get_session_targets(current_user: str = Depends(verify_token)):
+    """会话目标定时器（duration_seconds）的实时状态，看板用。
+
+    与到点提醒读的是同一份内存计时：running 时 remaining 是真的剩余秒数；
+    退出宽限内 paused、remaining 保留；不在会话时 armed=false。
+    """
+    return NormalResponse(
+        code=0,
+        message="ok",
+        data={"targets": manager.rule_service.session_target_states()},
+    )
+
+
 @router.get("/{rule_id}", summary="Get Rule", response_model=NormalResponse)
 async def get_rule(rule_id: str, current_user: str = Depends(verify_token)):
     """Get a single rule by ID"""
