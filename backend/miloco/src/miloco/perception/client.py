@@ -561,6 +561,7 @@ class PerceptionEngineProxy:
         trace_id: str | None = None,
         device_trace_ids: dict[str, str] | None = None,
         collect_flow_diagnostics: bool = False,
+        prepared=None,
     ) -> tuple[
         RealtimePerceptionResult | None,
         set[str],
@@ -708,6 +709,7 @@ class PerceptionEngineProxy:
                 trace_id=trace_id,
                 device_trace_ids=device_trace_ids,
                 collect_flow_diagnostics=collect_flow_diagnostics,
+                prepared=prepared,
             )
         except OmniError as e:
             # 兜底分支:主路径 run_batch_pipeline 已在 _run_device 内逐相机吞掉 OmniError
@@ -776,12 +778,64 @@ class PerceptionEngineProxy:
 
     # ---- Public interface (dispatches to inference thread) ----
 
+    async def _fetch_omni_rules(self) -> tuple[list[dict], list[str]]:
+        """当前生效的 omni 规则 + 因完成被跳过的 task。门禁/omni 两阶段共用。"""
+        from miloco.manager import get_manager
+        from miloco.rule.schema import OMNI_SOURCE_TYPE, RuleDirection
+
+        all_rules = await get_manager().rule_service.get_effectively_enabled_rules()
+        guard_needed_task_ids = {
+            rule.task_id
+            for rule in all_rules
+            if rule.task_id
+            and rule.resolved_direction in (RuleDirection.ENTER, RuleDirection.SESSION)
+            and rule.resolved_source_type != OMNI_SOURCE_TYPE
+        }
+        rules = [rule.model_dump() for rule in omni_rules_only(all_rules)]
+        return _filter_completed_event_rules(rules, guard_needed_task_ids)
+
+    def request_force_recheck(self, did: str, ttl_sec: float = 60.0) -> None:
+        """规则层「退出确认」：让引擎下一个周期强制放一窗该机位给 omni。"""
+        engine = self.perception_engine
+        if engine is None:
+            return
+        engine.request_force_recheck(did, ttl_sec)
+
+    async def gate_batch(self, batch: PerceptionBatch):
+        """门禁阶段（主 loop）：collect 后立刻跑一级 + 二级，结果写内存环。
+
+        不提交到 inference worker —— 否则门禁会排在慢 omni 后面。只碰门禁状态与
+        ``_prepare_batch`` 的短临界区；omni 阶段拿到 ``prepared.gated`` 后不再重跑。
+        """
+        # 不能拿 _engine_lock：realtime_perceive 会在整段 omni 调用期间持有它，
+        # 门禁就会排在慢 omni 后面（实测 gate 被拖到 5.7s，采集缓冲随之溢出丢窗）。
+        # 这里只捕获当前引擎引用；teardown 即使同时发生，旧引擎对象仍然可完成本窗。
+        async with get_monitor().track_async(NodeName.ENGINE, "gate") as _eng_h:
+            engine = self.perception_engine
+            if not self.ready or engine is None:
+                _eng_h.skip_rolling()
+                return None
+            rules, _ = await self._fetch_omni_rules()
+            t = time.monotonic()
+            batched_snapshot = batch.to_batched_snapshot()
+            convert_ms = _ms_since(t)
+            if batched_snapshot is None:
+                _eng_h.skip_rolling()
+                return None
+            if batch.end_timestamp and batch.start_timestamp:
+                _eng_h.add_window_ms(batch.end_timestamp - batch.start_timestamp)
+            prepared = await engine.gate_batch(batched_snapshot, rules)
+            if prepared is not None:
+                prepared.convert_ms = convert_ms
+            return prepared
+
     async def realtime_perceive(
         self, batch: PerceptionBatch,
         artifacts: OmniEventArtifacts | None = None,
         trace_id: str | None = None,
         device_trace_ids: dict[str, str] | None = None,
         collect_flow_diagnostics: bool = False,
+        prepared=None,
     ) -> tuple[
         RealtimePerceptionResult | None,
         set[str],
@@ -805,32 +859,21 @@ class PerceptionEngineProxy:
                 _eng_h.skip_rolling()
                 return None, set(), {}, set(), None
 
-            from miloco.manager import get_manager
-
-            all_rules = await get_manager().rule_service.get_effectively_enabled_rules()
-            from miloco.rule.schema import OMNI_SOURCE_TYPE, RuleDirection
-
-            guard_needed_task_ids = {
-                rule.task_id
-                for rule in all_rules
-                if rule.task_id
-                and rule.resolved_direction
-                in (RuleDirection.ENTER, RuleDirection.SESSION)
-                and rule.resolved_source_type != OMNI_SOURCE_TYPE
-            }
-            rules = [rule.model_dump() for rule in omni_rules_only(all_rules)]
-            rules, skipped_task_ids = _filter_completed_event_rules(
-                rules, guard_needed_task_ids
-            )
+            rules, skipped_task_ids = await self._fetch_omni_rules()
 
             device_count = sum(1 for d in batch.devices.values() if d.has_data)
 
             # Convert PyAV frames → numpy ON THE MAIN THREAD so the inference
             # thread never touches PyAV objects created by the decoder thread.
             # This avoids cross-thread FFmpeg access that causes EAGAIN / libx264 errors.
-            t = time.monotonic()
-            batched_snapshot = batch.to_batched_snapshot()
-            convert_ms = _ms_since(t)
+            # 门禁阶段已经转换过就直接复用（同一批 numpy 帧，两阶段看到的一致）。
+            if prepared is not None:
+                batched_snapshot = prepared.batch
+                convert_ms = prepared.convert_ms
+            else:
+                t = time.monotonic()
+                batched_snapshot = batch.to_batched_snapshot()
+                convert_ms = _ms_since(t)
 
             if batched_snapshot is None:
                 _eng_h.skip_rolling()
@@ -863,6 +906,7 @@ class PerceptionEngineProxy:
                             trace_id,
                             device_trace_ids,
                             collect_flow_diagnostics,
+                            prepared,
                         ),
                         artifacts=artifacts,
                     )
@@ -1082,7 +1126,13 @@ class PerceptionEngineProxy:
                 matched_pairs |= early_sent_rule_ids.keys()
 
             enabled_set = set(svc.get_enabled_rule_ids())
+            # 被门禁拦下的相机本窗根本没调 omni：device_rule_map 里虽然列着它的规则
+            # （map 先于 gate 构建），但规则没有被评估过。喂 False 会让「无变化」的
+            # 拦截窗推动规则退出——连续工作/会话目标定时器因此每被拦一窗就重置一次。
+            blocked_dids = set(result.gate_blocked_dids or ())
             for did, rule_ids in result.device_rule_map.items():
+                if did in blocked_dids:
+                    continue
                 for rule_id in rule_ids:
                     if (rule_id, did) in matched_pairs:
                         continue

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -140,6 +142,18 @@ def _crop_denied_dids() -> set[str]:
     except Exception as e:  # noqa: BLE001
         logger.warning("crop deny list lookup failed, keeping crop enabled: %s", e)
         return set()
+
+
+@dataclass
+class PreparedBatch:
+    """门禁阶段准备好的批次：contexts/规则映射/复核集 + 门禁结果，omni 阶段复用。"""
+
+    batch: BatchedSnapshot
+    contexts: dict
+    device_rule_map: dict
+    recheck_dids: list
+    gated: dict | None = None
+    convert_ms: float = 0.0
 
 
 class PerceptionEngine(BasePerceptionEngine):
@@ -354,6 +368,17 @@ class PerceptionEngine(BasePerceptionEngine):
         # HOLD_EXPIRED / HOLD_RECOVERED 日志 + events 表事件(参考 rule_runner)。
         self._gate_hold_active: dict[str, bool] = {}                # key: device_id
         self._gate_hold_started_at: dict[str, float] = {}           # key: device_id (monotonic)
+        # 上一窗命中的特殊放行项（下标）：连续命中视为持续状态，不再据此放行。
+        self._gate_special_prev_hits: dict[str, frozenset[int]] = {}  # key: device_id
+
+        # 门禁阶段（主线程/主 loop）与 omni 阶段（推理线程）并发跑，共享状态用这把
+        # 锁串行：_prepare_batch 与 _merge_results / 状态提醒互斥。不跨 await 持有。
+        self._state_lock = threading.RLock()
+
+        # 「退出确认」请求：规则层判到退出候选时喊一嗓子，下一个有该机位数据的周期
+        # 强制把它放给 omni 再判一次（绕过一级/二级拦截）。did → 过期时刻(monotonic)。
+        self._force_recheck: dict[str, float] = {}
+        self._force_recheck_lock = threading.Lock()
 
         # tier_c 闲时定期清(见 .wsh_cc/TierC定期清-落地设计.md):周期协程挂 main_loop。
         # frame_provider 由持有 collector 的层注入(processor),供 live 检测取帧。
@@ -950,6 +975,7 @@ class PerceptionEngine(BasePerceptionEngine):
         self._gate_last_audio_pass_ts.clear()
         self._gate_hold_active.clear()
         self._gate_hold_started_at.clear()
+        self._gate_special_prev_hits.clear()
         self._state_container.reset()
 
     def apply_omni_fps(self, omni_fps: int) -> None:
@@ -1105,68 +1131,10 @@ class PerceptionEngine(BasePerceptionEngine):
             )
         batch.snapshots[:] = kept
 
-    async def realtime_perceive(
-        self,
-        batch: BatchedSnapshot,
-        rules: list[dict] | None = None,
-        on_early_speeches: Callable[[list[Speech]], Awaitable[None]] | None = None,
-        on_early_matched_rules: Callable[[list[MatchedRule]], Awaitable[None]] | None = None,
-        on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
-        trace_id: str | None = None,
-        device_trace_ids: dict[str, str] | None = None,
-        collect_flow_diagnostics: bool = False,
-    ) -> RealtimePerceptionResult | None:
-        """Run full engine batch pipeline with rule evaluation."""
-        from miloco.perception.engine.pipeline import run_batch_pipeline
+
+    def _build_contexts(self, batch, rules):
+        """按设备构建 OmniContext + rule 映射（门禁/omni 两阶段共用）。"""
         from miloco.perception.engine.types import OmniContext, RuleCondition
-
-        rules = rules or []
-
-        if batch.empty:
-            return None
-
-        # 未开启拾音的相机在此整批剥音频（opt-in 第一道防线）；必须先于 contexts 构建
-        # （pending_speech 注入）与 audio-tail 拼接，见 _strip_unauthorized_voice_audio。
-        self._strip_unauthorized_voice_audio(batch)
-
-        # 剥完音频后复检：靠音频通过上面那道 batch.empty 的空帧窗口在此被剔除。
-        self._drop_empty_snapshots(batch)
-        if batch.empty:
-            # 返 skipped 结果而非 None：processor 拿到 None 会直接 return，走不到 cycle
-            # trace 发布，零帧窗口在 dashboard 上连行都不留、出现频率不可观测——而定位
-            # 这个 bug 本身就是靠数日志里的窗口数做出来的。与「全部 device 没过 gate」
-            # 同款收尾（那条路径本就产出 skipped=True + 一行 trace），口径保持一致。
-            # trace 里的 per-device 记录取自 processor 侧的 PerceptionBatch，不受这里
-            # 剔除 BatchedSnapshot.snapshots 影响。
-            return RealtimePerceptionResult(skipped=True)
-
-        # 状态提醒只需要房间/设备名；不做画面基线/帧差。
-        for room_name, snapshots in batch.by_room().items():
-            for snapshot in snapshots:
-                did = snapshot.device.did
-                self._current_rooms[did] = room_name
-                self._current_device_names[did] = (
-                    getattr(snapshot.device, "name", "") or did
-                )
-
-        # 进入新一轮前先按 TTL 淘汰过期事件链
-        now = time.monotonic()
-        for did in list(self._sugg_table.keys()):
-            self._evict_expired_links(did, now)
-
-        # 3.2 上报：到点补一次提醒；不做画面基线/帧差。
-        state_reminders: list[Suggestion] = self._collect_state_reminders(now)
-
-        # 状态容器到点复核：只对本轮真的有数据的相机放行，避免对离线相机空放。
-        batch_dids = {s.device.did for s in batch.snapshots}
-        recheck_dids = [
-            did for did in self._state_container.recheck_due(now)
-            if did in batch_dids
-        ]
-        for did in recheck_dids:
-            self._state_container.mark_recheck_issued(did, now)
-        if recheck_dids:
-            logger.info("[state-container] recheck dids=%s", recheck_dids)
 
         # Build per-device contexts with filtered rules（rules 按 device 维度精确筛选——
         # rule.condition.perceive_device_ids 命中该 device 才下发；空列表表示全部感知
@@ -1216,6 +1184,10 @@ class PerceptionEngine(BasePerceptionEngine):
                     per_camera_crop_enabled=did not in crop_denied,
                 )
 
+        return contexts, device_rule_map
+
+    def _apply_audio_tail(self, batch) -> None:
+        """把上一窗尾音拼到本窗（每设备独立），每个批次只做一次。"""
         # Prepend audio tail from previous window (overlap to reduce boundary truncation)
         # Per-device tail（不是 per-room）—— 修复旧版同 room 多 device 反复覆写同一 key
         # 只保留 last device tail 的隐性 bug
@@ -1238,6 +1210,171 @@ class PerceptionEngine(BasePerceptionEngine):
                         frames=[AudioFrame(data=merged, timestamp=ts)],
                         sample_rate=snapshot.sample_rate,
                     )
+
+
+    def request_force_recheck(self, did: str, ttl_sec: float = 60.0) -> None:
+        """规则层请求：下一窗强制放行这台相机给 omni 复核（退出确认用）。
+
+        只登记意图，不在这里取帧——强制发生在下一个真有该机位数据的周期，避免为了
+        复核空转采集。TTL 内没等到数据就作废，不会无限期攒着。
+        """
+        if not did:
+            return
+        with self._force_recheck_lock:
+            self._force_recheck[did] = time.monotonic() + ttl_sec
+        logger.info("[exit-recheck] requested did=%s ttl=%.0fs", did, ttl_sec)
+
+    def _prepare_batch(self, batch: BatchedSnapshot, rules: list[dict]) -> "PreparedBatch | None":
+        """门禁前的批次准备：剥音频/剔空窗、状态容器复核、上下文、尾音。
+
+        与 omni 阶段（推理线程）共享少量状态，但**不能阻塞门禁循环**：
+        共享段的锁用非阻塞方式拿，拿不到就跳过本窗的复核/淘汰（下发窗补），
+        绝不让门禁排在 omni 的 merge/embedding 后面 —— 那会让采集缓冲溢出丢窗。
+        """
+        # 未开启拾音的相机在此整批剥音频（opt-in 第一道防线）；必须先于 contexts 构建
+        # （pending_speech 注入）与 audio-tail 拼接。
+        self._strip_unauthorized_voice_audio(batch)
+
+        # 剥完音频后复检：靠音频通过上面那道 batch.empty 的空帧窗口在此被剔除。
+        self._drop_empty_snapshots(batch)
+        if batch.empty:
+            return None
+
+        now = time.monotonic()
+        recheck_dids: list[str] = []
+        acquired = self._state_lock.acquire(blocking=False)
+        try:
+            if acquired:
+                # 状态提醒只需要房间/设备名；不做画面基线/帧差。
+                for room_name, snapshots in batch.by_room().items():
+                    for snapshot in snapshots:
+                        did = snapshot.device.did
+                        self._current_rooms[did] = room_name
+                        self._current_device_names[did] = (
+                            getattr(snapshot.device, "name", "") or did
+                        )
+
+                # 进入新一轮前先按 TTL 淘汰过期事件链
+                for did in list(self._sugg_table.keys()):
+                    self._evict_expired_links(did, now)
+
+                # 状态容器到点复核：只对本轮真的有数据的相机放行，避免对离线相机空放。
+                batch_dids = {s.device.did for s in batch.snapshots}
+                recheck_dids = [
+                    did for did in self._state_container.recheck_due(now)
+                    if did in batch_dids
+                ]
+                for did in recheck_dids:
+                    self._state_container.mark_recheck_issued(did, now)
+                if recheck_dids:
+                    logger.info("[state-container] recheck dids=%s", recheck_dids)
+
+                # 退出确认：规则层点名要复核的机位，本窗有数据就强制放一窗给 omni。
+                if self._force_recheck:
+                    with self._force_recheck_lock:
+                        requested = dict(self._force_recheck)
+                    for did, expires_at in requested.items():
+                        if expires_at < now:
+                            with self._force_recheck_lock:
+                                self._force_recheck.pop(did, None)
+                            continue
+                        if did in batch_dids and did not in recheck_dids:
+                            recheck_dids.append(did)
+                            with self._force_recheck_lock:
+                                self._force_recheck.pop(did, None)
+                            logger.info("[exit-recheck] forced window did=%s", did)
+            else:
+                # 并发窗口：本窗不做提醒/复核记账，下窗补。只记一条 debug，避免刷屏。
+                logger.debug("[gate] state lock busy, skip recheck/evict this window")
+        finally:
+            if acquired:
+                self._state_lock.release()
+
+        contexts, device_rule_map = self._build_contexts(batch, rules)
+        self._apply_audio_tail(batch)
+        return PreparedBatch(
+            batch=batch,
+            contexts=contexts,
+            device_rule_map=device_rule_map,
+            recheck_dids=recheck_dids,
+        )
+
+    async def gate_batch(
+        self, batch: BatchedSnapshot, rules: list[dict]
+    ) -> "PreparedBatch | None":
+        """门禁阶段：一级 + 二级先跑，结果立刻写进看板内存环。
+
+        omni 阶段拿到 ``prepared.gated`` 后直接复用，不重跑门禁；没过门禁的
+        设备在 omni 阶段直接返回，不占 omni。
+        """
+        prepared = self._prepare_batch(batch, rules or [])
+        if prepared is None:
+            return None
+
+        from miloco.perception.engine.pipeline import GatedDevice, run_batch_pipeline
+
+        result = await run_batch_pipeline(
+            prepared.batch,
+            prepared.contexts,
+            self._config,
+            get_tracking_service=None,
+            get_identity_engine=None,
+            frame_index_offset=self._global_frame_index,
+            gate_prev_frames=self._gate_prev_frames,
+            gate_prev_raw_frames=self._gate_prev_raw_frames,
+            gate_last_visual_pass_ts=self._gate_last_visual_pass_ts,
+            gate_last_audio_pass_ts=self._gate_last_audio_pass_ts,
+            gate_hold_active=self._gate_hold_active,
+            gate_hold_started_at=self._gate_hold_started_at,
+            force_omni_dids=set(prepared.recheck_dids),
+            gate_special_prev_hits=self._gate_special_prev_hits,
+            phase="gate",
+        )
+        gated: dict[str, GatedDevice] = {}
+        for room_name, room_result in result.rooms.items():
+            for did, dr in room_result.device_results.items():
+                if dr.gate_timing is None or dr.gate_snapshot is None:
+                    continue
+                gated[did] = GatedDevice(
+                    did=did,
+                    room_name=room_name,
+                    snapshot=dr.gate_snapshot,
+                    packet=dr.gate_packet,
+                    timing=dr.gate_timing,
+                )
+        prepared.gated = gated
+        return prepared
+
+    async def realtime_perceive(
+        self,
+        batch: BatchedSnapshot,
+        rules: list[dict] | None = None,
+        on_early_speeches: Callable[[list[Speech]], Awaitable[None]] | None = None,
+        on_early_matched_rules: Callable[[list[MatchedRule]], Awaitable[None]] | None = None,
+        on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
+        trace_id: str | None = None,
+        device_trace_ids: dict[str, str] | None = None,
+        collect_flow_diagnostics: bool = False,
+        prepared: "PreparedBatch | None" = None,
+    ) -> RealtimePerceptionResult | None:
+        """Run full engine batch pipeline with rule evaluation."""
+        from miloco.perception.engine.pipeline import run_batch_pipeline
+
+        rules = rules or []
+
+        if prepared is None:
+            prepared = self._prepare_batch(batch, rules)
+            if prepared is None:
+                return RealtimePerceptionResult(skipped=True)
+        batch = prepared.batch
+        contexts = prepared.contexts
+        device_rule_map = prepared.device_rule_map
+        recheck_dids = prepared.recheck_dids
+
+        now = time.monotonic()
+        with self._state_lock:
+            # 3.2 上报：到点补一次提醒；不做画面基线/帧差。
+            state_reminders: list[Suggestion] = self._collect_state_reminders(now)
 
         # Run batch pipeline（通过 factory 回调懒加载 per-device tracking_service /
         # identity_engine，让 fused 模式下回灌路径打通）
@@ -1262,6 +1399,8 @@ class PerceptionEngine(BasePerceptionEngine):
                 gate_hold_active=self._gate_hold_active,
                 gate_hold_started_at=self._gate_hold_started_at,
                 force_omni_dids=set(recheck_dids),
+                gate_special_prev_hits=self._gate_special_prev_hits,
+                pregated=prepared.gated,
                 trace_id=trace_id,
                 device_trace_ids=device_trace_ids,
                 collect_flow_diagnostics=collect_flow_diagnostics,
@@ -1276,12 +1415,14 @@ class PerceptionEngine(BasePerceptionEngine):
         self._global_frame_index += self._config.input.fps * self._config.input.period_sec
 
         # Merge all rooms into a single RealtimePerceptionResult
-        merged = self._merge_results(
-            result,
-            contexts,
-            device_rule_map=device_rule_map,
-            now=now,
-        )
+        # 与门禁阶段的 _prepare_batch 共享状态，串行化。
+        with self._state_lock:
+            merged = self._merge_results(
+                result,
+                contexts,
+                device_rule_map=device_rule_map,
+                now=now,
+            )
         merged.recheck_dids = list(recheck_dids)
         # 状态记忆到点的提醒与 omni 本轮新链一起交给 client → agent；心跳本身不重复报。
         if state_reminders:

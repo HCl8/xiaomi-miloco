@@ -94,6 +94,31 @@ async def test_exited_only_dispatched_pairs(proxy):
     assert len(calls) == 1
 
 
+async def test_gate_blocked_device_does_not_push_false(proxy):
+    """门禁拦下的相机本窗没调 omni：规则没被评估，不能喂 False。
+
+    device_rule_map 先于 gate 构建，拦下的相机也在表里；喂 False 会让「无变化」的
+    拦截窗推动 session 规则退出，连续工作/会话目标定时器就永远到不了 30 分钟。
+    """
+    result = RealtimePerceptionResult(
+        skipped=False,
+        matched_rules=[],
+        device_rule_map={"cam_A": ["rule_X"], "cam_B": ["rule_Y"]},
+        gate_blocked_dids=["cam_B"],
+    )
+    capture, calls = _capture_calls()
+    with patch(
+        "miloco.manager.get_manager",
+        return_value=_fake_mgr(["rule_X", "rule_Y"], capture),
+    ):
+        await proxy.handle_realtime_perception_result(result, artifacts=None)
+
+    assert ("rule_X", "cam_A", False, "") in calls
+    assert not any(c[1] == "cam_B" for c in calls), (
+        "门禁拦下的相机不应被喂 False"
+    )
+
+
 async def test_exited_skips_matched_pair(proxy):
     """rule_X 下发给 A 和 B,A 命中 → 只 A 走 True,B 走 False。"""
     result = RealtimePerceptionResult(

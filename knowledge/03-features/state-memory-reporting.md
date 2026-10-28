@@ -99,3 +99,29 @@ omni 在过渡窗返回结果
   `skip_flicker=True`；skipped 路径派发到点提醒。
 - `tests/test_task_state_machine_wiring.py`：会话目标定时器的启动/暂停/恢复/
   取消/重复触发。
+
+## 处理链路：门禁先行 + omni 消费循环
+
+采集按 4s 切窗。窗口从缓冲区取出后拆成两个阶段，**门禁不再排在 omni 后面**：
+
+```text
+gate 阶段（主 loop，processor.process_realtime）
+  collect_batch → 一级 + 二级门禁（engine.gate_batch）
+      ├─ 门禁结果立刻写看板内存环（不等 omni，pending 标记）
+      ├─ 状态容器到点复核在这里判定（force_pass）
+      └─ 上下文 / 规则映射 / 尾音在这里一次性准备好
+  → 整窗入 omni 队列（maxsize=2，满时丢最旧一窗，看板仍有门禁结果）
+
+omni 阶段（独立消费循环，_omni_consumer_loop）
+  identity → omni（复用 gate 阶段的 packet/timing/snapshot，不重跑门禁）
+      ├─ 没过门禁的设备直接返回：不调 omni、不建 identity
+      └─ omni 结论回填内存环（pending → called）
+```
+
+- 门禁/omni 两阶段共享引擎状态（pending_speech、suggestion 链、状态容器），
+  `_state_lock` 只保护 `_prepare_batch` 与 `_merge_results`/状态提醒两个短临界区，
+  不跨 await 持有。
+- traces 仍按窗发布：gate timing 由 omni 阶段用 `_write_gate_timing` 补写，
+  跑分与拦截统计口径不变。
+- 采集缓冲（`collect.max_windows` / `full_action`）保持默认 `3 / clear`，不做调参；
+  丢窗是否减少取决于门禁阶段能否持续快于窗口产出。

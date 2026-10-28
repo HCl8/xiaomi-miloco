@@ -13,6 +13,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from miloco.config import get_settings
@@ -192,8 +193,24 @@ def _aggregate_stage_ms(timing: dict) -> tuple[float, float, float]:
     return gate_ms, identity_ms, omni_ms
 
 
+@dataclass
+class _GatedBatch:
+    """门禁阶段产出、等待 omni 的一窗。"""
+
+    batch: PerceptionBatch
+    prepared: object
+    trace_id: str
+    device_trace_ids: dict[str, str]
+    cycle_start_unix_ms: int
+    collect_ms: float
+
+
 class PipelineProcessor:
     """Data flow pipeline: collect_batch → omni inference → log → postprocess."""
+
+    def request_force_recheck(self, did: str, ttl_sec: float = 60.0) -> None:
+        """把「下一窗强制放行」的请求转给引擎（规则层退出确认）。"""
+        self._perception_engine_proxy.request_force_recheck(did, ttl_sec)
 
     def __init__(
         self,
@@ -216,6 +233,11 @@ class PipelineProcessor:
 
         # tier_c 闲时定期清:把 collector 的"按 did 取最近一帧"接到引擎(gate 关停时 live 检测取帧)。
         self._perception_engine_proxy.set_tierc_frame_provider(self._collector.peek_latest_frame)
+
+        # 门禁阶段与 omni 阶段解耦：门禁（主 loop）判完就入队，omni 由独立消费循环
+        # 顺序处理；队列满时丢最旧一窗（看板仍有该窗的门禁结果）。
+        self._omni_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+        self._omni_task: asyncio.Task | None = None
 
         settings = get_settings()
         self._perf_enabled: bool = settings.perf.enabled
@@ -366,6 +388,7 @@ class PipelineProcessor:
         """
         get_monitor().set_lifecycle(NodeName.PROCESSOR, Lifecycle.STOPPED)
         self.clear_flow_snapshots()
+        await self.stop_omni_consumer()
         await self._perception_engine_proxy.close()
 
     async def stop_to_unconfigured(self) -> None:
@@ -429,48 +452,105 @@ class PipelineProcessor:
                     # unsubscribe_sse 或 GC 清理即可。
                     continue
 
-    async def process_realtime(self) -> RealtimePerceptionResult | None | bool:
-        """Realtime perception pipeline.
+    async def process_realtime(self) -> bool | None:
+        """门禁阶段：collect → 一级 + 二级 → 结果入 omni 队列。
 
-        1. Batch-collect all active devices via collector.collect_batch()
-        2. Single batch inference via perception_engine_proxy.realtime_perceive()
-        3. Store fused result to DB (with auto-dedup)
-        4. Call postprocess hooks
-
-        Returns:
-            PerceptionLogEntry — successfully processed and logged.
-            False — data was consumed but inference skipped/empty (caller
-                    should continue draining remaining windows).
-            None — no data available to process (buffer empty).
+        不再在这里等 omni：门禁判完就返回，omni 由 ``_omni_consumer_loop`` 顺序消费。
+        没过门禁的窗由 omni 阶段直接跳过（pregated），不占 omni。
         """
-        async with get_monitor().track_async(NodeName.PROCESSOR, "realtime") as _proc_h:
-            return await self._process_realtime_inner(_proc_h)
-
-    async def _process_realtime_inner(self, _proc_h=None) -> RealtimePerceptionResult | None | bool:
-        t_cycle = time.monotonic()
-
-        # 1. Drain all active devices into a batch (consuming from buffers)
-        t = time.monotonic()
-        batch = self._collector.collect_batch(drain=True)
-        collect_ms = _ms_since(t)
-
-        if batch.empty:
-            # drain 循环退出的常态:每个 _tick 至少 1 次 empty 收尾。
-            # skip() 让本次 track 不进 fps/p95/RTF 等滚动指标,否则空轮询会把
-            # fps 推到与 _tick 频率挂钩、p95_latency 拉到 collect_batch 耗时量级,
-            # 完全掩盖真实推理速率与延迟。
-            if _proc_h is not None:
+        async with get_monitor().track_async(NodeName.PROCESSOR, "gate") as _proc_h:
+            t = time.monotonic()
+            batch = self._collector.collect_batch(drain=True)
+            collect_ms = _ms_since(t)
+            if batch.empty:
                 _proc_h.skip_rolling()
-            return None  # no ready windows — caller should stop
+                return None
+            t_gate = time.monotonic()
+            prepared = await self._perception_engine_proxy.gate_batch(batch)
+            gate_ms = (time.monotonic() - t_gate) * 1000
+            if collect_ms > 200 or gate_ms > 3000:
+                logger.info(
+                    "[gate-phase] slow collect=%.0fms gate=%.0fms dids=%s",
+                    collect_ms, gate_ms, list(batch.devices),
+                )
+            if prepared is None:
+                _proc_h.skip_rolling()
+                return False
+            item = _GatedBatch(
+                batch=batch,
+                prepared=prepared,
+                trace_id=str(uuid.uuid4()),
+                device_trace_ids={did: str(uuid.uuid4()) for did in batch.devices},
+                cycle_start_unix_ms=int(time.time() * 1000),
+                collect_ms=collect_ms,
+            )
+            self._enqueue_omni(item)
+            return True
 
+    def _enqueue_omni(self, item: "_GatedBatch") -> None:
+        try:
+            self._omni_queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        # 队列满：丢最旧的一窗。门禁结果已经在环里，展示不受影响；只是这窗不跑 omni。
+        try:
+            dropped = self._omni_queue.get_nowait()
+            self._omni_queue.task_done()
+            logger.warning(
+                "[processor] omni 队列满，丢弃最旧窗 trace=%s", dropped.trace_id
+            )
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            self._omni_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            logger.warning("[processor] omni 队列仍满，丢弃新窗 trace=%s", item.trace_id)
+
+    async def _omni_consumer_loop(self) -> None:
+        while True:
+            item = await self._omni_queue.get()
+            try:
+                async with get_monitor().track_async(NodeName.PROCESSOR, "omni") as h:
+                    t_omni = time.monotonic()
+                    await self._run_omni_phase(item, h)
+                    ms = (time.monotonic() - t_omni) * 1000
+                    if ms > 3000:
+                        logger.info(
+                            "[omni-phase] slow %.0fms trace=%s", ms, item.trace_id
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("[processor] omni 阶段异常 | trace=%s", item.trace_id)
+            finally:
+                self._omni_queue.task_done()
+
+    def start_omni_consumer(self) -> None:
+        if self._omni_task is None or self._omni_task.done():
+            self._omni_task = asyncio.create_task(self._omni_consumer_loop())
+
+    async def stop_omni_consumer(self) -> None:
+        task, self._omni_task = self._omni_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run_omni_phase(
+        self, item: "_GatedBatch", _proc_h=None
+    ) -> RealtimePerceptionResult | None | bool:
+        t_cycle = time.monotonic()
+        batch = item.batch
+        collect_ms = item.collect_ms
         self._last_batch = batch
 
-        # 给整个 cycle 绑定 trace_id,cycle 内所有 publish_event / push_omni_trace 自动关联
-        trace_id = str(uuid.uuid4())
-        device_trace_ids = {
-            device_id: str(uuid.uuid4()) for device_id in batch.devices
-        }
-        cycle_start_unix_ms = int(time.time() * 1000)
+        # trace_id 在门禁阶段就定下（同一窗两阶段共用）。
+        trace_id = item.trace_id
+        device_trace_ids = item.device_trace_ids
+        cycle_start_unix_ms = item.cycle_start_unix_ms
         trace_token = set_trace_id(trace_id)
 
         try:
@@ -507,6 +587,7 @@ class PipelineProcessor:
                     trace_id=trace_id,
                     device_trace_ids=device_trace_ids,
                     collect_flow_diagnostics=self._flow_store is not None,
+                    prepared=item.prepared,
                 )
             except Exception as e:
                 logger.error("[processor] 实时感知失败 | %s", e, exc_info=True)

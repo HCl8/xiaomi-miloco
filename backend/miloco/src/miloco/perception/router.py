@@ -255,6 +255,25 @@ async def submit_on_demand_feedback(log_id: str, body: OnDemandFeedbackBody):
 
 
 @router.get(
+    "/live-windows",
+    summary="Recent perception windows (frames + verdicts, in-memory only)",
+    dependencies=[Depends(verify_token)],
+)
+async def get_live_windows(limit: int = Query(5, ge=1, le=5)):
+    """看板「实时画面」：最近几窗的帧（base64 jpeg）与判定结果。
+
+    只读进程内的环形缓冲，不读数据库、不落盘；进程重启后为空。
+    """
+    from miloco.perception import live_ring
+
+    return NormalResponse(
+        code=0,
+        message="ok",
+        data={"cameras": live_ring.snapshot(limit)},
+    )
+
+
+@router.get(
     "/devices",
     summary="List perception-capable devices",
     dependencies=[Depends(verify_token)],

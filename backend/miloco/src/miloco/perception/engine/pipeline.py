@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +52,7 @@ from miloco.perception.engine.types import (
     BatchPipelineResult,
     DevicePipelineResult,
     GatePacket,
+    GateTiming,
     GateTrigger,
     IdentityPacket,
     InputSlice,
@@ -102,6 +103,112 @@ def _tracking_models(
     return detector, reid
 
 logger = logging.getLogger(__name__)
+
+
+def _live_record_gate(snapshot, did, room_name, timing, blocked) -> None:
+    """门禁一判完就把窗口写进看板的内存环 —— 不等 identity/omni，也不落盘。
+
+    这一步的作用是让「实时画面」只取决于门禁：二级判完立刻能看到放行/拦截，
+    omni 跑 10 秒也不会把这一窗挡在队列里。
+    """
+    try:
+        from miloco.perception import live_ring
+
+        live_ring.record_window(
+            ts_ms=int(snapshot.end_timestamp or 0),
+            did=did,
+            room=room_name,
+            device=snapshot.device.name or did,
+            blocked=blocked,
+            gate={
+                "pass": bool(timing.video_pass),
+                "score": timing.video_score,
+                "hold": bool(timing.hold_opened_window),
+                "recheck": bool(timing.recheck),
+                "audio_pass": bool(timing.audio_pass),
+                "audio_energy": timing.audio_energy,
+            },
+            semantic={
+                "applied": bool(timing.semantic_applied),
+                "pass": bool(timing.semantic_pass),
+                "veto": bool(timing.semantic_veto),
+                "score": timing.semantic_score,
+                "e_pass": bool(timing.semantic_e_pass),
+                "end_score": timing.semantic_end_score,
+                "end_pass": bool(timing.semantic_end_pass),
+                "physio_score": timing.semantic_physio_score,
+                "physio_pass": bool(timing.semantic_physio_pass),
+                "pass_score": timing.semantic_pass_score,
+                # [[action, score, hit], ...]：看板逐条展示，能看出是哪条放行的。
+                "special": [list(x) for x in timing.semantic_special_scores],
+                "ms": timing.semantic_ms,
+                "questions": timing.semantic_question_count,
+            },
+            omni={
+                "called": False,
+                "pending": not blocked,
+                "ms": None,
+                "caption": "",
+                "rules": [],
+            },
+            frames=[f.data for f in snapshot.video.frames] if snapshot.video else [],
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("record live window failed")
+
+
+@dataclass
+class GatedDevice:
+    """gate 阶段产物：omni 阶段直接复用，不再重跑门禁。"""
+
+    did: str
+    room_name: str
+    snapshot: DeviceSnapshot
+    packet: GatePacket | None
+    timing: GateTiming
+
+
+def _write_gate_timing(room_timing, did, timing, config) -> None:
+    """门禁 timing 落进 room_timing（traces 口径）。gate / omni 两阶段共用。"""
+    room_timing[f"gate_{did}_ms"] = timing.total_ms
+    room_timing[f"gate_video_{did}_ms"] = timing.video_ms
+    room_timing[f"gate_audio_{did}_ms"] = timing.audio_ms
+    room_timing[f"gate_vad_{did}_ms"] = timing.vad_ms
+    room_timing[f"gate_video_{did}_pass"] = int(timing.video_pass)
+    room_timing[f"gate_audio_{did}_pass"] = int(timing.audio_pass)
+    room_timing[f"gate_hold_{did}_pass"] = int(timing.hold_opened_window)
+    room_timing[f"gate_recheck_{did}"] = int(timing.recheck)
+    if config.gate.semantic.enabled:
+        room_timing[f"semantic_{did}_ms"] = timing.semantic_ms
+        room_timing[f"semantic_{did}_applied"] = int(timing.semantic_applied)
+        room_timing[f"semantic_{did}_pass"] = int(timing.semantic_pass)
+        room_timing[f"semantic_{did}_score"] = timing.semantic_score
+        room_timing[f"semantic_{did}_veto"] = int(timing.semantic_veto)
+        room_timing[f"semantic_{did}_error"] = timing.semantic_error
+        room_timing[f"semantic_{did}_hold_veto"] = int(timing.hold_semantic_veto)
+        room_timing[f"semantic_{did}_end_score"] = timing.semantic_end_score
+        room_timing[f"semantic_{did}_end_pass"] = int(timing.semantic_end_pass)
+        room_timing[f"semantic_{did}_physio_score"] = timing.semantic_physio_score
+        room_timing[f"semantic_{did}_physio_pass"] = int(timing.semantic_physio_pass)
+        room_timing[f"semantic_{did}_pass_score"] = timing.semantic_pass_score
+        room_timing[f"semantic_{did}_pass_hits"] = timing.semantic_pass_hits
+        room_timing[f"semantic_{did}_pass_count"] = timing.semantic_pass_count
+        room_timing[f"semantic_{did}_questions"] = timing.semantic_question_count
+    room_timing[f"_gate_video_score_{did}"] = timing.video_score
+    room_timing[f"_gate_audio_energy_{did}"] = timing.audio_energy
+    room_timing[f"gate_speech_prob_{did}"] = timing.speech_prob
+    room_timing[f"gate_video_intra_score_{did}"] = timing.video_intra_score
+    room_timing[f"gate_video_cross_score_{did}"] = timing.video_cross_score
+
+
+def _live_update_omni(did, ts_ms, omni: dict) -> None:
+    """omni 阶段结束（成功/失败）回填同一窗的结论。"""
+    try:
+        from miloco.perception import live_ring
+
+        live_ring.update_omni(did, int(ts_ms or 0), omni)
+    except Exception:  # noqa: BLE001
+        logger.exception("update live window failed")
 
 
 def _resolve_visual_input_mode(default: str) -> str:
@@ -500,6 +607,9 @@ async def run_batch_pipeline(
     gate_hold_active: "dict[str, bool] | None" = None,
     gate_hold_started_at: "dict[str, float] | None" = None,
     force_omni_dids: "set[str] | None" = None,
+    gate_special_prev_hits: "dict[str, frozenset[int]] | None" = None,
+    phase: str = "full",
+    pregated: "dict[str, GatedDevice] | None" = None,
     trace_id: str | None = None,
     device_trace_ids: dict[str, str] | None = None,
     collect_flow_diagnostics: bool = False,
@@ -557,7 +667,8 @@ async def run_batch_pipeline(
     # 首次或档案/规则变更时，这一两窗只有默认问题。
     special_pass_by_did: dict[str, tuple[SpecialPassItem, ...]] = {}
     semantic_cfg = config.gate.semantic
-    if semantic_cfg.enabled and semantic_cfg.special_pass.enabled:
+    # omni 阶段（pregated）不再跑门禁，特殊放行项用不上，跳过这次 LLM 提炼。
+    if semantic_cfg.enabled and semantic_cfg.special_pass.enabled and pregated is None:
         for snapshot in batch.snapshots:
             sem_ctx = contexts.get(snapshot.device.did)
             if sem_ctx is None:
@@ -619,8 +730,13 @@ async def run_batch_pipeline(
             else None
         )
 
-        # Downsample to target fps at pipeline entry
-        snapshot = downsample_snapshot(snapshot, config.input.fps)
+        # Downsample to target fps at pipeline entry。gate 阶段已下采样过就直接复用，
+        # 两阶段看到的是同一批帧。
+        gated = pregated.get(did) if pregated is not None else None
+        if gated is not None:
+            snapshot = gated.snapshot
+        else:
+            snapshot = downsample_snapshot(snapshot, config.input.fps)
         if diagnostics is not None:
             diagnostics.pipeline_output_frame_count = len(snapshot.frames)
             diagnostics.pipeline_fps = (
@@ -655,215 +771,198 @@ async def run_batch_pipeline(
         # processor._publish_trace 从 timing 读出复用,避免双钥匙。
         room_timing[f"_device_trace_id_{did}"] = device_trace_id
 
-        prev_frame = gate_prev_frames.get(did) if gate_prev_frames is not None else None
-        prev_raw_frame = (
-            gate_prev_raw_frames.get(did)
-            if gate_prev_raw_frames is not None else None
-        )
-        last_v = (
-            gate_last_visual_pass_ts.get(did)
-            if gate_last_visual_pass_ts is not None else None
-        )
-        last_a = (
-            gate_last_audio_pass_ts.get(did)
-            if gate_last_audio_pass_ts is not None else None
-        )
-        try:
-            gate_packet, gate_timing, last_checked, new_last_v, new_last_a = await run_gate(
-                snapshot, config.gate, config.input.fps,
-                prev_frame=prev_frame,
-                last_visual_pass_ts=last_v,
-                last_audio_pass_ts=last_a,
-                prev_raw_frame=prev_raw_frame,
-                semantic_context=SemanticGateContext(
-                    special_items=special_pass_by_did.get(did, ()),
-                    # 机位须知只给 omni/特殊项提炼；门禁默认不注入，避免活动清单
-                    # 把模型往「看到这些动作就放行」引（200 窗 A/B 客厅精度 +2.5pp）。
-                    camera_prompt=(
-                        context.camera_prompt
-                        if config.gate.semantic.include_camera_prompt
-                        else None
-                    ),
-                    room_name=context.room_name or room_name,
-                    current_time=context.current_time,
-                ),
-                force_pass=bool(force_omni_dids and did in force_omni_dids),
+        if gated is None:
+            prev_frame = gate_prev_frames.get(did) if gate_prev_frames is not None else None
+            prev_raw_frame = (
+                gate_prev_raw_frames.get(did)
+                if gate_prev_raw_frames is not None else None
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if diagnostics is None:
-                raise
-            diagnostics.status = GraphStatus.ERROR
-            diagnostics.gate_status = GraphStatus.ERROR
-            diagnostics.identity_status = GraphStatus.SKIPPED
-            diagnostics.omni_status = GraphStatus.SKIPPED
-            _mark_omni_stages_skipped(diagnostics)
-            diagnostics.error_stage = "gate"
-            diagnostics.error_code = type(exc).__name__
-            logger.error(
-                "[device](room=%s device=%s) gate failed",
-                room_name,
-                did,
-                exc_info=True,
+            last_v = (
+                gate_last_visual_pass_ts.get(did)
+                if gate_last_visual_pass_ts is not None else None
             )
-            return DevicePipelineResult(
-                device_id=did,
-                input_slice=snapshot,
-                skipped=True,
-                flow_diagnostics=diagnostics,
+            last_a = (
+                gate_last_audio_pass_ts.get(did)
+                if gate_last_audio_pass_ts is not None else None
             )
-        # 语义参考帧始终推进到"本窗最后一帧"（与 448 灰度基准同一语义：最近实际
-        # 比较过的画面），不论本窗是否放行。只在开启语义门禁时存，省一路全分辨率拷贝。
-        if gate_prev_raw_frames is not None and config.gate.semantic.enabled:
-            video_frames = snapshot.video.frames if snapshot.video else []
-            if video_frames:
-                ref = prepare_reference_frame(
-                    video_frames[-1].data, config.gate.semantic.image_short_edge
-                )
-                if ref is not None:
-                    gate_prev_raw_frames[did] = ref
-        # 一级门禁放行的窗口留存（供离线分析语义门禁）；编码放线程里，失败不影响感知。
-        if config.gate.dump.enabled and (
-            gate_timing.video_pass
-            or gate_timing.recheck
-            or (
-                config.gate.dump.include_hold
-                and gate_timing.hold_opened_window
-                and gate_timing.semantic_applied
-                and gate_timing.semantic_pass
-            )
-        ):
-            dump_frames = (
-                [f.data for f in snapshot.video.frames] if snapshot.video else []
-            )
-            if dump_frames:
-                await asyncio.to_thread(
-                    dump_gate_window,
-                    did=did,
-                    room_name=room_name,
-                    start_ms=snapshot.start_timestamp,
-                    end_ms=snapshot.end_timestamp,
-                    frames=dump_frames,
+            try:
+                gate_packet, gate_timing, last_checked, new_last_v, new_last_a = await run_gate(
+                    snapshot, config.gate, config.input.fps,
+                    prev_frame=prev_frame,
+                    last_visual_pass_ts=last_v,
+                    last_audio_pass_ts=last_a,
                     prev_raw_frame=prev_raw_frame,
-                    audio_clip=snapshot.audio_clip,
-                    sample_rate=snapshot.sample_rate,
-                    fps=config.input.fps,
-                    timing=gate_timing,
-                    config=config.gate.dump,
+                    semantic_context=SemanticGateContext(
+                        special_items=special_pass_by_did.get(did, ()),
+                        sustained_items=tuple(
+                            sorted(
+                                gate_special_prev_hits.get(did, frozenset())
+                                if gate_special_prev_hits is not None
+                                else frozenset()
+                            )
+                        ),
+                        # 机位须知只给 omni/特殊项提炼；门禁默认不注入，避免活动清单
+                        # 把模型往「看到这些动作就放行」引（200 窗 A/B 客厅精度 +2.5pp）。
+                        camera_prompt=(
+                            context.camera_prompt
+                            if config.gate.semantic.include_camera_prompt
+                            else None
+                        ),
+                        room_name=context.room_name or room_name,
+                        current_time=context.current_time,
+                    ),
+                    force_pass=bool(force_omni_dids and did in force_omni_dids),
                 )
-        if diagnostics is not None:
-            diagnostics.gate_checked_frame_count = gate_timing.checked_frame_count
-            if last_checked is not None and last_checked.ndim >= 2:
-                diagnostics.gate_output_height = int(last_checked.shape[0])
-                diagnostics.gate_output_width = int(last_checked.shape[1])
-            diagnostics.gate_status = (
-                GraphStatus.OK if gate_packet is not None else GraphStatus.SKIPPED
-            )
-        # 跨窗 gate 状态各 device 用 per-did key、读写均在同步段、键不相交 → 并发 gather 下安全(同 room_timing)。
-        # 无论 gate 是否通过都更新基准——始终是"最近实际比较过的画面"。
-        if gate_prev_frames is not None and last_checked is not None:
-            gate_prev_frames[did] = last_checked
-        # 两 ts 仅在 run_gate 返回新值(非 None)时写回;清理由 reset_session 负责
-        if gate_last_visual_pass_ts is not None and new_last_v is not None:
-            gate_last_visual_pass_ts[did] = new_last_v
-        if gate_last_audio_pass_ts is not None and new_last_a is not None:
-            gate_last_audio_pass_ts[did] = new_last_a
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if diagnostics is None:
+                    raise
+                diagnostics.status = GraphStatus.ERROR
+                diagnostics.gate_status = GraphStatus.ERROR
+                diagnostics.identity_status = GraphStatus.SKIPPED
+                diagnostics.omni_status = GraphStatus.SKIPPED
+                _mark_omni_stages_skipped(diagnostics)
+                diagnostics.error_stage = "gate"
+                diagnostics.error_code = type(exc).__name__
+                logger.error(
+                    "[device](room=%s device=%s) gate failed",
+                    room_name,
+                    did,
+                    exc_info=True,
+                )
+                return DevicePipelineResult(
+                    device_id=did,
+                    input_slice=snapshot,
+                    skipped=True,
+                    flow_diagnostics=diagnostics,
+                )
+            # 记下本窗原始命中，下一窗据此抑制「持续状态」重复放行。
+            if gate_special_prev_hits is not None:
+                gate_special_prev_hits[did] = frozenset(gate_timing.semantic_raw_hits)
 
-        # gate hold 状态转换 → 日志 + events 表
-        if gate_hold_active is not None and gate_hold_started_at is not None:
-            prev_hold = gate_hold_active.get(did, False)
-            cur_hold = gate_timing.hold_pass
-            cur_visual_pass = gate_timing.video_pass
-            now_mono = time.monotonic()
-            if cur_hold and not prev_hold:
-                # HOLD_START: visual 从通过转入滞回期
-                gate_hold_started_at[did] = now_mono
-                logger.info(
-                    "HOLD_START: device=%s room=%s hold_duration_sec=%.1f",
-                    did, room_name, config.gate.hold_duration_sec,
+            # 语义参考帧始终推进到"本窗最后一帧"（与 448 灰度基准同一语义：最近实际
+            # 比较过的画面），不论本窗是否放行。只在开启语义门禁时存，省一路全分辨率拷贝。
+            if gate_prev_raw_frames is not None and config.gate.semantic.enabled:
+                video_frames = snapshot.video.frames if snapshot.video else []
+                if video_frames:
+                    ref = prepare_reference_frame(
+                        video_frames[-1].data, config.gate.semantic.image_short_edge
+                    )
+                    if ref is not None:
+                        gate_prev_raw_frames[did] = ref
+            # 一级门禁放行的窗口留存（供离线分析语义门禁）；编码放线程里，失败不影响感知。
+            if config.gate.dump.enabled and (
+                gate_timing.video_pass
+                or gate_timing.recheck
+                or (
+                    config.gate.dump.include_hold
+                    and gate_timing.hold_opened_window
+                    and gate_timing.semantic_applied
+                    and gate_timing.semantic_pass
                 )
-                _publish_gate_event(
-                    "gate_hold_start", did,
-                    {
-                        "room": room_name,
-                        "hold_duration_sec": config.gate.hold_duration_sec,
-                    },
+            ):
+                dump_frames = (
+                    [f.data for f in snapshot.video.frames] if snapshot.video else []
                 )
-            elif prev_hold and not cur_hold:
-                started_at = gate_hold_started_at.pop(did, None)
-                held_for_ms = (
-                    int((now_mono - started_at) * 1000) if started_at is not None else None
+                if dump_frames:
+                    await asyncio.to_thread(
+                        dump_gate_window,
+                        did=did,
+                        room_name=room_name,
+                        start_ms=snapshot.start_timestamp,
+                        end_ms=snapshot.end_timestamp,
+                        frames=dump_frames,
+                        prev_raw_frame=prev_raw_frame,
+                        audio_clip=snapshot.audio_clip,
+                        sample_rate=snapshot.sample_rate,
+                        fps=config.input.fps,
+                        timing=gate_timing,
+                        config=config.gate.dump,
+                    )
+            if diagnostics is not None:
+                diagnostics.gate_checked_frame_count = gate_timing.checked_frame_count
+                if last_checked is not None and last_checked.ndim >= 2:
+                    diagnostics.gate_output_height = int(last_checked.shape[0])
+                    diagnostics.gate_output_width = int(last_checked.shape[1])
+                diagnostics.gate_status = (
+                    GraphStatus.OK if gate_packet is not None else GraphStatus.SKIPPED
                 )
-                if cur_visual_pass:
-                    # HOLD_RECOVERED: hold 期内 visual 真恢复
+            # 跨窗 gate 状态各 device 用 per-did key、读写均在同步段、键不相交 → 并发 gather 下安全(同 room_timing)。
+            # 无论 gate 是否通过都更新基准——始终是"最近实际比较过的画面"。
+            if gate_prev_frames is not None and last_checked is not None:
+                gate_prev_frames[did] = last_checked
+            # 两 ts 仅在 run_gate 返回新值(非 None)时写回;清理由 reset_session 负责
+            if gate_last_visual_pass_ts is not None and new_last_v is not None:
+                gate_last_visual_pass_ts[did] = new_last_v
+            if gate_last_audio_pass_ts is not None and new_last_a is not None:
+                gate_last_audio_pass_ts[did] = new_last_a
+
+            # gate hold 状态转换 → 日志 + events 表
+            if gate_hold_active is not None and gate_hold_started_at is not None:
+                prev_hold = gate_hold_active.get(did, False)
+                cur_hold = gate_timing.hold_pass
+                cur_visual_pass = gate_timing.video_pass
+                now_mono = time.monotonic()
+                if cur_hold and not prev_hold:
+                    # HOLD_START: visual 从通过转入滞回期
+                    gate_hold_started_at[did] = now_mono
                     logger.info(
-                        "HOLD_RECOVERED: device=%s room=%s held_for_ms=%s visual_score=%.3f",
-                        did, room_name, held_for_ms, gate_timing.video_score,
+                        "HOLD_START: device=%s room=%s hold_duration_sec=%.1f",
+                        did, room_name, config.gate.hold_duration_sec,
                     )
                     _publish_gate_event(
-                        "gate_hold_recovered", did,
+                        "gate_hold_start", did,
                         {
                             "room": room_name,
-                            "held_for_ms": held_for_ms,
-                            "visual_score": gate_timing.video_score,
+                            "hold_duration_sec": config.gate.hold_duration_sec,
                         },
                     )
-                else:
-                    # HOLD_EXPIRED: hold 到期、放弃 video
-                    logger.info(
-                        "HOLD_EXPIRED: device=%s room=%s held_for_ms=%s",
-                        did, room_name, held_for_ms,
+                elif prev_hold and not cur_hold:
+                    started_at = gate_hold_started_at.pop(did, None)
+                    held_for_ms = (
+                        int((now_mono - started_at) * 1000) if started_at is not None else None
                     )
-                    _publish_gate_event(
-                        "gate_hold_expired", did,
-                        {"room": room_name, "held_for_ms": held_for_ms},
-                    )
-            gate_hold_active[did] = cur_hold
+                    if cur_visual_pass:
+                        # HOLD_RECOVERED: hold 期内 visual 真恢复
+                        logger.info(
+                            "HOLD_RECOVERED: device=%s room=%s held_for_ms=%s visual_score=%.3f",
+                            did, room_name, held_for_ms, gate_timing.video_score,
+                        )
+                        _publish_gate_event(
+                            "gate_hold_recovered", did,
+                            {
+                                "room": room_name,
+                                "held_for_ms": held_for_ms,
+                                "visual_score": gate_timing.video_score,
+                            },
+                        )
+                    else:
+                        # HOLD_EXPIRED: hold 到期、放弃 video
+                        logger.info(
+                            "HOLD_EXPIRED: device=%s room=%s held_for_ms=%s",
+                            did, room_name, held_for_ms,
+                        )
+                        _publish_gate_event(
+                            "gate_hold_expired", did,
+                            {"room": room_name, "held_for_ms": held_for_ms},
+                        )
+                gate_hold_active[did] = cur_hold
 
-        room_timing[f"gate_{did}_ms"] = gate_timing.total_ms
-        room_timing[f"gate_video_{did}_ms"] = gate_timing.video_ms
-        room_timing[f"gate_audio_{did}_ms"] = gate_timing.audio_ms
-        room_timing[f"gate_vad_{did}_ms"] = gate_timing.vad_ms
-        room_timing[f"gate_video_{did}_pass"] = int(gate_timing.video_pass)
-        room_timing[f"gate_audio_{did}_pass"] = int(gate_timing.audio_pass)
-        room_timing[f"gate_hold_{did}_pass"] = int(gate_timing.hold_opened_window)
-        room_timing[f"gate_recheck_{did}"] = int(gate_timing.recheck)
-        if config.gate.semantic.enabled:
-            # 非 "_" 前缀 → _merge_results 加 room 前缀 → 落 traces.timing_detail(JSON)，
-            # 不复用 traces_device 固定列，免 DB 迁移。
-            room_timing[f"semantic_{did}_ms"] = gate_timing.semantic_ms
-            room_timing[f"semantic_{did}_applied"] = int(gate_timing.semantic_applied)
-            room_timing[f"semantic_{did}_pass"] = int(gate_timing.semantic_pass)
-            room_timing[f"semantic_{did}_score"] = gate_timing.semantic_score
-            room_timing[f"semantic_{did}_veto"] = int(gate_timing.semantic_veto)
-            room_timing[f"semantic_{did}_error"] = gate_timing.semantic_error
-            room_timing[f"semantic_{did}_hold_veto"] = int(
-                gate_timing.hold_semantic_veto
-            )
-            room_timing[f"semantic_{did}_end_score"] = gate_timing.semantic_end_score
-            room_timing[f"semantic_{did}_end_pass"] = int(gate_timing.semantic_end_pass)
-            room_timing[f"semantic_{did}_physio_score"] = (
-                gate_timing.semantic_physio_score
-            )
-            room_timing[f"semantic_{did}_physio_pass"] = int(
-                gate_timing.semantic_physio_pass
-            )
-            room_timing[f"semantic_{did}_pass_score"] = gate_timing.semantic_pass_score
-            room_timing[f"semantic_{did}_pass_hits"] = gate_timing.semantic_pass_hits
-            room_timing[f"semantic_{did}_pass_count"] = gate_timing.semantic_pass_count
-            room_timing[f"semantic_{did}_questions"] = gate_timing.semantic_question_count
-        # "_" 前缀留给 traces_device 有专属列的打分:_merge_results 不加 "{room}/" 前缀,
-        # 由 processor._publish_trace 逐 key 显式读。带前缀又没人读的 key 会被
-        # timing_detail 的前缀过滤丢掉,写进去等于扔掉。
-        # on-demand bypass / 系统异常 fallback 路径不走这里,score 字段保持 NULL。
-        room_timing[f"_gate_video_score_{did}"] = gate_timing.video_score
-        room_timing[f"_gate_audio_energy_{did}"] = gate_timing.audio_energy
-        # 其余打分经 _merge_results 加 "{room}/" 前缀进 timing_detail JSON。
-        room_timing[f"gate_speech_prob_{did}"] = gate_timing.speech_prob
-        room_timing[f"gate_video_intra_score_{did}"] = gate_timing.video_intra_score
-        room_timing[f"gate_video_cross_score_{did}"] = gate_timing.video_cross_score
+            _write_gate_timing(room_timing, did, gate_timing, config)
 
+            # 看板实时画面：门禁（一级+二级）判完立刻落内存环，先把结果标记出来；
+            # identity/omni 之后回填。展示不再等 omni 出队列。
+            _live_record_gate(snapshot, did, room_name, gate_timing, gate_packet is None)
+
+        else:
+            gate_packet = gated.packet
+            gate_timing = gated.timing
+            _write_gate_timing(room_timing, did, gate_timing, config)
+            if diagnostics is not None:
+                diagnostics.gate_status = (
+                    GraphStatus.OK if gate_packet is not None else GraphStatus.SKIPPED
+                )
         if gate_packet is None:
             if diagnostics is not None:
                 diagnostics.status = GraphStatus.SKIPPED
@@ -875,6 +974,18 @@ async def run_batch_pipeline(
                 input_slice=snapshot,
                 skipped=True,
                 gate_blocked=True,
+                flow_diagnostics=diagnostics,
+                gate_timing=gate_timing,
+                gate_snapshot=snapshot,
+            )
+
+        if phase == "gate":
+            return DevicePipelineResult(
+                device_id=did,
+                input_slice=snapshot,
+                gate_packet=gate_packet,
+                gate_timing=gate_timing,
+                gate_snapshot=snapshot,
                 flow_diagnostics=diagnostics,
             )
 
@@ -902,6 +1013,12 @@ async def run_batch_pipeline(
                 room_name,
                 did,
                 exc_info=True,
+            )
+            _live_update_omni(
+                did,
+                snapshot.end_timestamp,
+                {"called": False, "pending": False, "ms": None,
+                 "caption": "", "rules": [], "error": "identity"},
             )
             return DevicePipelineResult(
                 device_id=did,
@@ -1009,6 +1126,13 @@ async def run_batch_pipeline(
                 "[omni](room=%s device=%s) 感知API调用失败，错误码=%s(skipped) | %s",
                 room_name, f"{device_name}({did})", omni_err.code, omni_err,
             )
+            _live_update_omni(
+                did,
+                snapshot.end_timestamp,
+                {"called": False, "pending": False,
+                 "ms": room_timing.get(f"omni_{did}_ms"),
+                 "caption": "", "rules": [], "error": omni_err.code},
+            )
             return DevicePipelineResult(
                 device_id=did, input_slice=snapshot,
                 gate_packet=gate_packet, identity_packet=identity_packet,
@@ -1027,6 +1151,13 @@ async def run_batch_pipeline(
             logger.error(
                 "[device](room=%s device=%s) 单相机处理异常(skipped) | %s",
                 room_name, f"{device_name}({did})", e, exc_info=True,
+            )
+            _live_update_omni(
+                did,
+                snapshot.end_timestamp,
+                {"called": False, "pending": False,
+                 "ms": room_timing.get(f"omni_{did}_ms"),
+                 "caption": "", "rules": [], "error": type(e).__name__},
             )
             return DevicePipelineResult(
                 device_id=did, input_slice=snapshot,
@@ -1068,6 +1199,21 @@ async def run_batch_pipeline(
                 if sg_cb is not None:
                     await sg_cb(list(omni_output.suggestions))
                     omni_output.suggestions = reported
+
+        # omni 结束：把结论回填到门禁时写下的那条实时画面。
+        _live_update_omni(
+            did,
+            snapshot.end_timestamp,
+            {
+                "called": True,
+                "pending": False,
+                "ms": room_timing.get(f"omni_{did}_ms"),
+                "caption": "；".join(
+                    c.description for c in omni_output.caption if c.description
+                )[:500],
+                "rules": [r.rule_name for r in omni_output.matched_rules][:12],
+            },
+        )
 
         return DevicePipelineResult(
             device_id=did,

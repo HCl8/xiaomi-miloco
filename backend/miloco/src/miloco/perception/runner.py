@@ -112,6 +112,9 @@ class PerceptionRunner:
         # run in the dedicated thread, not on the main event loop.
         self._pipeline.set_inference_worker(self._inference_worker)
 
+        # 门禁阶段与 omni 阶段解耦：消费循环与感知循环同时起，omni 在后台顺序跑。
+        self._pipeline.start_omni_consumer()
+
         # Initial device sync before first tick
         await self._sync_devices()
 
@@ -142,6 +145,8 @@ class PerceptionRunner:
 
         self._perception_task = None
         self._sync_devices_task = None
+
+        await self._pipeline.stop_omni_consumer()
 
         # 清理 in-flight probe task,防同进程再启 runner 时 _probe_in_flight 残留导致
         # 自愈通道永久卡死。registry 是独立 module,不进 runner↔processor 循环链。

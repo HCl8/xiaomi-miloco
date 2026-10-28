@@ -14,7 +14,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
-from miloco.perception.processor import PipelineProcessor
+from miloco.perception.processor import PipelineProcessor, _GatedBatch
 from miloco.perception.schema import (
     DecodedVideoFrame,
     DeviceData,
@@ -58,7 +58,15 @@ async def test_processor_forwards_cycle_event_id_to_persist_side():
     )
     proc._perception_engine_proxy.handle_realtime_perception_result = AsyncMock()
 
-    await proc._process_realtime_inner()
+    item = _GatedBatch(
+        batch=_batch_with_one_device(),
+        prepared=None,
+        trace_id="t-1",
+        device_trace_ids={"cam_A": "dt-1"},
+        cycle_start_unix_ms=0,
+        collect_ms=0.0,
+    )
+    await proc._run_omni_phase(item)
 
     kwargs = proc._perception_engine_proxy.handle_realtime_perception_result.await_args.kwargs
     assert kwargs["cycle_event_id"] == "ev-proc-1"
@@ -76,6 +84,6 @@ async def test_processor_empty_batch_never_calls_persist_side():
     proc._perception_engine_proxy.realtime_perceive = AsyncMock()
     proc._perception_engine_proxy.handle_realtime_perception_result = AsyncMock()
 
-    assert await proc._process_realtime_inner() is None
+    assert await proc.process_realtime() is None
     proc._perception_engine_proxy.realtime_perceive.assert_not_awaited()
     proc._perception_engine_proxy.handle_realtime_perception_result.assert_not_awaited()

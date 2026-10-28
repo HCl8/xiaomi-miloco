@@ -433,6 +433,10 @@ class DevicePipelineResult:
     # 空帧等其它 skipped 原因区分：只有这一类允许状态容器续命。
     gate_blocked: bool = False
     flow_diagnostics: PerDeviceFlowDiagnostics | None = None
+    # 门禁分阶段执行时带出的结果：gate 阶段填这两项（timing + 下采样后的 snapshot），
+    # omni 阶段用 pregated 复用，不再重跑门禁。
+    gate_timing: "GateTiming | None" = None
+    gate_snapshot: DeviceSnapshot | None = None
 
 
 @dataclass
