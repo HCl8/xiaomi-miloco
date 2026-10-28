@@ -424,7 +424,12 @@ class PerceptionLatency:
             "timestamp": self.timestamp,
         }
         if self.timing_detail:
-            d["timing_detail"] = {k: round(v, 1) for k, v in self.timing_detail.items()}
+            # 字符串项（如 semantic_*_pass_hits / _error 记的是原始命中列表）不能 round，
+            # 否则 /api/perception/engine/status 每轮 500。
+            d["timing_detail"] = {
+                k: (round(v, 1) if isinstance(v, (int, float)) else v)
+                for k, v in self.timing_detail.items()
+            }
         return d
 
 
