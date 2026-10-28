@@ -189,6 +189,39 @@ async def test_enforce_veto_drops_window(monkeypatch):
     assert timing.semantic_veto is True
 
 
+async def test_timing_carries_end_and_physio_scores(monkeypatch):
+    """补问分数/结论必须进 GateTiming，否则 traces/看板永远是 0。"""
+
+    async def _allow(*a, **kw):
+        return SemanticEvalResult(
+            applied=True,
+            passed=True,
+            score=0.01,
+            end_score=0.6,
+            end_passed=True,
+            physio_score=0.7,
+            physio_passed=True,
+        )
+
+    monkeypatch.setattr(gate_mod, "evaluate_semantic", _allow)
+    cfg = GateConfig(
+        semantic=SemanticGateConfig(
+            enabled=True, mode="enforce", end_enabled=True, physio_enabled=True
+        )
+    )
+    packet, timing, *_ = await run_gate(
+        _slice_with_change(),
+        cfg,
+        prev_frame=_baseline(),
+        prev_raw_frame=_solid(100),
+    )
+    assert packet is not None
+    assert timing.semantic_end_score == pytest.approx(0.6)
+    assert timing.semantic_end_pass is True
+    assert timing.semantic_physio_score == pytest.approx(0.7)
+    assert timing.semantic_physio_pass is True
+
+
 async def test_enforce_fail_open_keeps_window(monkeypatch):
     async def _fail(*a, **kw):
         return SemanticEvalResult(applied=False, passed=True, error="ConnectError")

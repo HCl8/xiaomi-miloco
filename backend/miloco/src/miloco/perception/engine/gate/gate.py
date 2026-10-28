@@ -176,6 +176,12 @@ async def run_gate(
         semantic_pass_hits=semantic_pass_hits,
         semantic_pass_count=semantic.pass_count,
         semantic_question_count=semantic.question_count,
+        # 补问的分数/结论要进 timing，否则 traces/dump/看板永远显示 0
+        # （路由用的是 semantic.passed，本身已经包含 end/physio 的 OR）。
+        semantic_end_score=semantic.end_score,
+        semantic_end_pass=semantic.end_passed,
+        semantic_physio_score=semantic.physio_score,
+        semantic_physio_pass=semantic.physio_passed,
         recheck=forced,
     )
 
