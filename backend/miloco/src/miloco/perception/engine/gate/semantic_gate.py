@@ -35,6 +35,9 @@ _END_KEY = "event_end"
 _PHYSIO_KEY = "event_physio"
 _PASS_KEY_PREFIX = "pass:"
 _DECISION_PATH = "/v1/systemone"
+_DEFAULT_SUBJECT_HINT = (
+    "只看画面中离镜头最近、占画面面积最大的那一个人（下称主体）。其他人不算数。"
+)
 _PASS_INSTRUCTIONS_SUFFIX = (
     "（只判断这个变化；描述里点名了主体/某人/宠物时，只看对应对象；"
     "这组连续画面里任意两张画面之间出现了这个变化就选是，整组都没有出现才选否。）"
@@ -170,10 +173,13 @@ def _render_context_block(context: SemanticGateContext | None) -> str:
     parts: list[str] = []
     if context.room_name:
         parts.append(f"【机位】{context.room_name}")
-    # 主体口径跟机位走：只看离镜头最近、占画面最大的那个人。
-    parts.append(
-        "只看画面中离镜头最近、占画面面积最大的那一个人（下称主体）。其他人不算数。"
-    )
+    # 主体口径跟机位走：只看离镜头最近、占画面最大的那个人。宠物/婴儿/多人机位
+    # 这条会顶掉真正的判据，配置里把 subject_hint 置空即可关掉。
+    subject_hint = getattr(context, "subject_hint", None)
+    if subject_hint is None:
+        subject_hint = _DEFAULT_SUBJECT_HINT
+    if subject_hint:
+        parts.append(subject_hint.strip())
     if context.camera_prompt:
         parts.append(f"【机位须知】{context.camera_prompt.strip()}")
     return "\n".join(parts)

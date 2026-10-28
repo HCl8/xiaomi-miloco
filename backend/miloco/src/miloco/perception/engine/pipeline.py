@@ -793,6 +793,9 @@ async def run_batch_pipeline(
                     last_audio_pass_ts=last_a,
                     prev_raw_frame=prev_raw_frame,
                     semantic_context=SemanticGateContext(
+                        subject_hint=getattr(
+                            getattr(config.gate, "semantic", None), "subject_hint", None
+                        ),
                         special_items=special_pass_by_did.get(did, ()),
                         sustained_items=tuple(
                             sorted(

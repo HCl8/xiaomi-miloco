@@ -326,6 +326,10 @@ class PerceptionEngine(BasePerceptionEngine):
         # Per-device 事件链表：device_id -> {eid: {"event","action","urgency","last_ts","embedding"}}
         # urgency 单调不降级（only-up），故单字段即可，不再区分 current/max
         self._sugg_table: dict[str, dict[int, dict]] = {}           # key: device_id
+        # _sugg_table 跨线程读写：门禁阶段（主 loop）淘汰/TTL 续命，omni 与流式早出
+        # 回调（推理线程）在写。不加锁会出现「迭代中途被改」的 RuntimeError，或者
+        # 新链写进已被整表替换掉的旧 dict（下一窗重开一条链 → 重复提醒）。
+        self._sugg_guard_lock = threading.Lock()
         # 上报状态记忆只做「报一次 + 到点提醒」；房间/设备名只用于提醒元信息。
         self._current_rooms: dict[str, str] = {}
         self._current_device_names: dict[str, str] = {}
@@ -387,6 +391,9 @@ class PerceptionEngine(BasePerceptionEngine):
         self._tierc_last_clear_date: dict[str, str] = {}            # key: device_id → "YYYY-MM-DD"
         # 累计帧序号（重审周期判定用）
         self._global_frame_index = 0
+        # 门禁线程读、omni 线程 +=：int 自增不是原子的，丢一次会让 identity 的
+        # recheck 周期永久偏移。读写都走这把锁（临界区只有一次赋值）。
+        self._frame_index_lock = threading.Lock()
 
     def _scope_label_for(self, device_id: str, room_name: str) -> str:
         """计算（并记忆）一个 device 在所在 room 内的 scope_label，格式 ``"<room>-dev<idx>"``。
@@ -769,6 +776,15 @@ class PerceptionEngine(BasePerceptionEngine):
     # Suggestion 事件链表 / cooldown 管理
     # ------------------------------------------------------------------
 
+    @property
+    def _sugg_lock(self) -> "threading.Lock":
+        """_sugg_table 的互斥锁。惰性创建：测试里有用 __new__ 直接造对象的路径。"""
+        lock = getattr(self, "_sugg_guard_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._sugg_guard_lock = lock
+        return lock
+
     def assign_id_and_update_link(self, room: str, sugg: Suggestion, now: float) -> bool:
         """给 suggestion 分配事件链 id 并维护 _sugg_table。
 
@@ -779,6 +795,10 @@ class PerceptionEngine(BasePerceptionEngine):
         if sugg.id is not None:
             return False  # impossible
 
+        with self._sugg_lock:
+            return self._assign_id_and_update_link_locked(room, sugg, now)
+
+    def _assign_id_and_update_link_locked(self, room: str, sugg: Suggestion, now: float) -> bool:
         table = self._sugg_table.setdefault(room, {})
         urgency = sugg.urgency if sugg.urgency in URGENCY_RANK else "medium"
         sugg.urgency = urgency
@@ -892,7 +912,8 @@ class PerceptionEngine(BasePerceptionEngine):
         只 touch 最近两个复核周期内还有真实 omni 心跳的链——被新事件替换掉的旧链
         不会被无限续命。
         """
-        table = self._sugg_table.get(did)
+        with self._sugg_lock:
+            table = dict(self._sugg_table.get(did) or {})
         if not table:
             return
         horizon = self._state_container.recheck_interval_sec * 2
@@ -904,15 +925,16 @@ class PerceptionEngine(BasePerceptionEngine):
 
     def _evict_expired_links(self, room: str, now: float) -> None:
         """淘汰超过 urgency cooldown 没再被心跳/状态容器续命的事件链。"""
-        table = self._sugg_table.get(room)
-        if not table:
-            return
-        self._sugg_table[room] = {
-            eid: v
-            for eid, v in table.items()
-            if (now - v["last_ts"])
-            < COOLDOWN_SEC.get(v["urgency"], COOLDOWN_SEC["medium"])
-        }
+        with self._sugg_lock:
+            table = self._sugg_table.get(room)
+            if not table:
+                return
+            self._sugg_table[room] = {
+                eid: v
+                for eid, v in table.items()
+                if (now - v["last_ts"])
+                < COOLDOWN_SEC.get(v["urgency"], COOLDOWN_SEC["medium"])
+            }
 
     def _collect_state_reminders(self, now: float) -> list[Suggestion]:
         """收集到点的状态提醒；不做任何帧差/状态变更判断。"""
@@ -920,7 +942,9 @@ class PerceptionEngine(BasePerceptionEngine):
         if sm is not None and not getattr(sm, "enabled", True):
             return []
         reminders: list[Suggestion] = []
-        for did, table in list(self._sugg_table.items()):
+        with self._sugg_lock:
+            snapshot_items = [(did, dict(t)) for did, t in self._sugg_table.items()]
+        for did, table in snapshot_items:
             for eid, entry in list(table.items()):
                 tick = tick_state(
                     entry,
@@ -1312,6 +1336,7 @@ class PerceptionEngine(BasePerceptionEngine):
             return None
 
         from miloco.perception.engine.pipeline import GatedDevice, run_batch_pipeline
+        from miloco.perception.engine.types import GateTiming
 
         result = await run_batch_pipeline(
             prepared.batch,
@@ -1342,6 +1367,32 @@ class PerceptionEngine(BasePerceptionEngine):
                     packet=dr.gate_packet,
                     timing=dr.gate_timing,
                 )
+
+        # 门禁阶段抛异常的设备不会出现在 device_results 里。留空的话 omni 阶段会看到
+        # `gated is None` 而**在推理线程重跑一遍门禁**，同一 did 的跨窗门禁状态被两个
+        # 线程读改写。这里补一条「本窗门禁失败」的占位：omni 阶段直接跳过，不重跑。
+        missing = [
+            s for s in getattr(prepared.batch, "snapshots", ())
+            if getattr(getattr(s, "device", None), "did", None) not in gated
+        ]
+        for snapshot in missing:
+            did = snapshot.device.did
+            room_name = next(
+                (r for r, rr in result.rooms.items() if did in getattr(rr, "device_results", {})),
+                "",
+            )
+            if did in getattr(result, "skipped_dids", ()):  # pragma: no cover - 预留
+                continue
+            logger.warning("[gate-phase] 设备门禁失败，本窗跳过（不重跑） did=%s", did)
+            gated[did] = GatedDevice(
+                did=did,
+                room_name=room_name,
+                snapshot=getattr(snapshot, "snapshot", snapshot),
+                packet=None,
+                timing=GateTiming(
+                    video_ms=0.0, audio_ms=0.0, video_pass=False, audio_pass=False
+                ),
+            )
         prepared.gated = gated
         return prepared
 
@@ -1412,7 +1463,10 @@ class PerceptionEngine(BasePerceptionEngine):
         # 推进全局帧序号——驱动 IdentityEngine recheck 周期与 dead-track GC
         # 增量按 downsample 后单窗口帧数估算（fps × period_sec），与 run_identity
         # 内部 ``frame_index_offset + len(gate_packet.frames)`` 语义对齐
-        self._global_frame_index += self._config.input.fps * self._config.input.period_sec
+        with self._frame_index_lock:
+            self._global_frame_index += (
+                self._config.input.fps * self._config.input.period_sec
+            )
 
         # Merge all rooms into a single RealtimePerceptionResult
         # 与门禁阶段的 _prepare_batch 共享状态，串行化。
@@ -1491,7 +1545,10 @@ class PerceptionEngine(BasePerceptionEngine):
             return OnDemandPerceptionResult(answer="")
 
         # 与 realtime_perceive 保持一致地推进全局帧序号
-        self._global_frame_index += self._config.input.fps * self._config.input.period_sec
+        with self._frame_index_lock:
+            self._global_frame_index += (
+                self._config.input.fps * self._config.input.period_sec
+            )
 
         # Merge all room answers
         answers = [r.answer for r in results.values() if r.answer]

@@ -121,11 +121,25 @@ def _auto_title(action: str) -> str:
     return text[:8] or action[:8]
 
 
+def _physical_did(did: str) -> str:
+    """合成通道 did → 物理 did（``cam1:ch0`` → ``cam1``）。"""
+    return did.rsplit(":ch", 1)[0] if ":ch" in did else did
+
+
 def _forced_items(config: SpecialPassConfig, did: str = "") -> list[SpecialPassItem]:
-    """配置里写死的特殊放行项；不依赖 LLM，顺序在提炼项之前。"""
+    """配置里写死的特殊放行项；不依赖 LLM，顺序在提炼项之前。
+
+    按机位配置同时按合成通道 did 和物理 did 查：配置里写的是相机 did，而感知侧
+    传进来可能是 ``did:ch0``，只查一种会让整机位的强制项静默失效。
+    """
     out: list[SpecialPassItem] = []
+    by_cam = config.force_items_by_camera or {}
+    per_cam: list = []
+    for key in {did, _physical_did(did)}:
+        if key:
+            per_cam.extend(by_cam.get(key, ()))
     raw_items = list(config.force_items or ())
-    raw_items += list((config.force_items_by_camera or {}).get(did, ()))
+    raw_items += per_cam
     for raw in raw_items:
         text = (raw or "").strip()
         if not text:
@@ -275,6 +289,7 @@ def _load_cache(config: SpecialPassConfig) -> None:
                 items=[
                     SpecialPassItem(
                         action=str(x["action"]),
+                        title=str(x.get("title") or ""),
                         reason=str(x.get("reason") or ""),
                         source=str(x.get("source") or ""),
                     )
@@ -300,7 +315,12 @@ def _write_cache(config: SpecialPassConfig) -> None:
                 "generated_at": entry.generated_at,
                 "model": entry.model,
                 "items": [
-                    {"action": i.action, "reason": i.reason, "source": i.source}
+                    {
+                        "action": i.action,
+                        "title": i.title,
+                        "reason": i.reason,
+                        "source": i.source,
+                    }
                     for i in entry.items
                 ],
                 "covered": entry.covered,

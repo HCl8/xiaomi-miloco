@@ -538,14 +538,43 @@ async def test_sustained_special_hit_is_not_reopened(monkeypatch):
     )
     assert packet is not None
     assert timing.semantic_pass is True
-    assert timing.semantic_raw_hits == (0,)
+    assert timing.semantic_raw_hits == ("刚拿起手机看屏幕",)
 
     packet2, timing2, *_ = await run_gate(
         _slice_with_change(), cfg,
         prev_frame=_baseline(), prev_raw_frame=_solid(100),
         semantic_context=SemanticGateContext(
-            special_items=(item,), sustained_items=(0,)
+            special_items=(item,), sustained_items=("刚拿起手机看屏幕",)
         ),
     )
     assert packet2 is None
     assert timing2.semantic_veto is True
+
+
+@pytest.mark.asyncio
+async def test_sustained_hit_survives_item_reorder(monkeypatch):
+    """特殊项顺序变了（加了一条强制项/缓存刷新），持续命中仍要按下标之外的身份命中。"""
+
+    async def _pass(*a, **kw):
+        # 本窗列表把 B 排到了第 0 位：命中 (0) 就是 B
+        return SemanticEvalResult(
+            applied=True, passed=True, score=0.01,
+            pass_score=0.9, pass_scores=(0.9,), pass_hits=(0,),
+            pass_count=1, question_count=4,
+        )
+
+    monkeypatch.setattr(gate_mod, "evaluate_semantic", _pass)
+    cfg = GateConfig(semantic=SemanticGateConfig(enabled=True, mode="enforce"))
+    a = SpecialPassItem(action="拿起水杯喝水")
+    b = SpecialPassItem(action="刚拿起手机看屏幕")
+
+    packet, timing, *_ = await run_gate(
+        _slice_with_change(), cfg,
+        prev_frame=_baseline(), prev_raw_frame=_solid(100),
+        # 上一窗命中的是 B；本窗 B 排到第 0 位
+        semantic_context=SemanticGateContext(
+            special_items=(b, a), sustained_items=("刚拿起手机看屏幕",)
+        ),
+    )
+    assert timing.semantic_raw_hits == ("刚拿起手机看屏幕",)
+    assert packet is None, "持续状态不该再放行"

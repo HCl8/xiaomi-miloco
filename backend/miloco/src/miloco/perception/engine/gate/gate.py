@@ -86,12 +86,23 @@ async def run_gate(
         semantic = await evaluate_semantic(
             input_slice.frames, prev_raw_frame, config.semantic, semantic_context
         )
+    # 特殊项的身份用 action 字符串而不是列表下标：force_items / LLM 提炼项的顺序
+    # 变了（加一条、缓存刷新），下标就指到别的规则上，会错压或漏压。
+    _special = tuple(
+        getattr(semantic_context, "special_items", ()) or ()
+    ) if semantic_context is not None else ()
+
+    def _key(i: int) -> str:
+        item = _special[i] if 0 <= i < len(_special) else None
+        action = (getattr(item, "action", "") or "").strip() if item else ""
+        return action or f"#{i}"
+
     def _effective_semantic(sem):
         """连续命中抑制：上一窗已经命中的特殊项视为持续状态，本窗不再据此放行。"""
         sustained = (
             set(semantic_context.sustained_items) if semantic_context is not None else set()
         )
-        hits = tuple(i for i in sem.pass_hits if i not in sustained)
+        hits = tuple(i for i in sem.pass_hits if _key(i) not in sustained)
         base = (
             sem.score >= config.semantic.min_score
             or sem.end_passed
@@ -219,7 +230,7 @@ async def run_gate(
         semantic_physio_score=semantic.physio_score,
         semantic_physio_pass=semantic.physio_passed,
         semantic_special_scores=semantic_special_scores,
-        semantic_raw_hits=tuple(sorted(semantic.pass_hits)),
+        semantic_raw_hits=tuple(sorted(_key(i) for i in semantic.pass_hits)),
         recheck=forced,
     )
 

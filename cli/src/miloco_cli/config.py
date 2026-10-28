@@ -385,6 +385,17 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         60,
         "单条特殊放行动作描述的长度上限（字符），重启生效",
     ),
+    "perception.engine.gate.semantic.special_pass.force_items": (
+        list,
+        [],
+        "无条件追加到每个机位的特殊放行项（不走 LLM 提炼，配置改了下窗生效）；"
+        "写「标题=描述」，只写描述时标题自动截取",
+    ),
+    "perception.engine.gate.semantic.special_pass.force_items_by_camera": (
+        dict,
+        {},
+        "按机位追加的特殊放行项，JSON 对象：{\"did\": [\"标题=描述\"]}；配置改了下窗生效",
+    ),
     "perception.engine.gate.semantic.special_pass.extra_instructions": (
         str,
         "",
@@ -674,6 +685,26 @@ def _coerce(path: str, raw: str) -> Any:
             return float(raw)
         except ValueError as exc:
             raise ValueError(f"{path} 需要浮点数，收到 {raw!r}") from exc
+    if pytype is dict:
+        # {"did": ["标题=描述", ...]} 这种按机位配置，用 JSON 对象透传。
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} 的 JSON 对象解析失败：{raw!r}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{path} 需要对象，收到 {raw!r}")
+        out: dict[str, list[str]] = {}
+        for key, value in parsed.items():
+            if isinstance(value, str):
+                out[str(key)] = [value]
+            elif isinstance(value, list):
+                out[str(key)] = [str(x) for x in value]
+            else:
+                raise ValueError(f"{path} 的值需要数组，收到 {value!r}")
+        return out
     if pytype is list:
         # CLI 只能递字符串，故约定逗号分隔；同时容忍 JSON 数组，方便脚本直接透传。
         # 留空 = 清空该项（回到"仅靠自动发现"语义），不是写入 [""]。

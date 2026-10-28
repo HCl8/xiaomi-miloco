@@ -115,7 +115,7 @@ class GateTiming:
     # 每条特殊放行问题的 (title, score, 是否有效命中)；给看板展示「是哪条放行的」。
     semantic_special_scores: tuple = ()
     # 本窗原始命中下标（含被持续状态抑制的），供下一窗做连续命中抑制。
-    semantic_raw_hits: tuple = ()
+    semantic_raw_hits: tuple = ()   # 本窗原始命中的特殊项 action（含被抑制的）
 
     # 状态容器到点强制复核：本窗绕过视觉/语义门禁直接给 omni。
     recheck: bool = False
@@ -362,8 +362,12 @@ class SemanticGateContext:
     camera_prompt: str | None = None
     room_name: str | None = None
     current_time: str | None = None
-    # 上一窗已经命中的特殊项下标：连续命中说明是持续状态，本窗不再据此放行。
-    sustained_items: tuple[int, ...] = ()
+    # 上一窗已经命中的特殊项（按 action 字符串，不是列表下标）：连续命中说明是
+    # 持续状态，本窗不再据此放行。用字符串是为了扛住清单顺序变化。
+    sustained_items: tuple[str, ...] = ()
+    # 主体口径提示：None=用默认句（只看离镜头最近、占画面最大的那个人），""=不注入。
+    # 宠物/婴儿/多人机位把它置空。
+    subject_hint: str | None = None
 
 
 @dataclass
