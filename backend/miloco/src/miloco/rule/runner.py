@@ -1306,8 +1306,9 @@ class RuleRunner:
             # slot_for_edge 对它们的 EXITED 返 None, 走下去也选不到槽。
             return TriggerOutcome.NOT_FIRED
 
-        # 退出宽限开始：连续时长定时器暂停；宽限内回来会 resume，真退出才 cancel。
-        self._pause_state_target(rule)
+        # 退出宽限开始：**不暂停**计时。宽限只是「可能走了」的观察期，人还在的概率
+        # 远大于真走（实测单窗否定 ~15%，一次误判就让计时停 20-50s，一天下来丢掉的
+        # 比真走的还多）。宽限到期真退出时 _cancel_state_target 会整段丢掉，不亏。
         # state mode: cancel any existing debounce before scheduling a new one
         old = state.exit_debounce_task
         if old is not None and not old.done():

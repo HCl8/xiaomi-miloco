@@ -712,8 +712,11 @@ async def test_state_target_fires_and_repeats_while_session_stays_on(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_state_target_pauses_in_exit_grace_and_resumes(monkeypatch):
-    """退出宽限期内回到态内：定时器暂停后按剩余时间继续，不重置。"""
+async def test_state_target_keeps_running_through_exit_grace(monkeypatch):
+    """退出宽限只是「可能走了」：计时照走，别让一次误判停掉 20-50 秒。
+
+    真离开时宽限到期，_cancel_state_target 会把整段丢掉，不会把离开的时间算进去。
+    """
     runner, sm, _directions, _dispatched = await _session_task_turned_on(
         monkeypatch, duration_seconds=5, exit_debounce_seconds=10
     )
@@ -721,15 +724,12 @@ async def test_state_target_pauses_in_exit_grace_and_resumes(monkeypatch):
     assert state.state_target_task is not None
 
     await runner.update_state("r-ses", "cam1", False, "", skip_flicker=True)
-    assert state.state_target_task is None, "进入退出宽限后定时器应暂停"
-    assert state.state_target_remaining is not None
-    remaining = state.state_target_remaining
-    assert remaining <= 5
+    assert state.state_target_task is not None, "宽限内计时不该停"
+    assert state.state_target_paused is False
 
-    # 宽限内回到工作：ENTERED 取消 debounce，定时器按剩余时间恢复
+    # 宽限内回到工作：ENTERED 取消 debounce，计时一直是同一份
     await runner.update_state("r-ses", "cam1", True, "", skip_flicker=True)
-    assert state.state_target_task is not None, "回到态内后定时器应恢复"
-    assert state.state_target_remaining is None
+    assert state.state_target_task is not None
     assert sm.runtime_state("t1") is TaskRuntimeState.ON
 
 
