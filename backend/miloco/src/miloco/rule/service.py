@@ -694,6 +694,14 @@ class RuleService:
             task_record_service = TaskRecordService()
         self._task_record_service = task_record_service
 
+    def set_recheck_requester(self, fn) -> None:
+        """接上感知层「下一窗强制放行」的入口（退出确认用）。"""
+        self._runner.set_recheck_requester(fn)
+
+    def session_target_states(self) -> list[dict]:
+        """会话目标定时器状态 —— 直接读 runner 内存，和到点提醒同一份计时。"""
+        return self._runner.session_target_states()
+
     def _target_record_task_id(self, rule: Rule) -> str | None:
         """这条 rule 的达标看哪个 task 的 record —— 看不出达标就返 None。
 
@@ -1862,6 +1870,7 @@ class RuleService:
         cycle_source_states: dict[str, bool] | None = None,
         trigger_event_id: str | None = None,
         skip_flicker: bool = False,
+        confirm_single: bool = False,
     ) -> TriggerOutcome:
         """Per-frame, per-source state report from the perception engine.
 
@@ -1880,6 +1889,7 @@ class RuleService:
             cycle_source_states=cycle_source_states,
             trigger_event_id=trigger_event_id,
             skip_flicker=skip_flicker,
+            confirm_single=confirm_single,
         )
 
     # ---- Logs ----

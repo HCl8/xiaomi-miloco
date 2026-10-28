@@ -351,6 +351,13 @@ class Manager:
                 self._miot_proxy, self._kv_repo
             )
 
+        # 退出确认接线：规则判到退出候选时，让感知层强制放一窗再判一次。
+        # 排在感知模块之后 —— 那之前 _perception_service 还不存在。
+        if self._perception_service is not None:
+            self._rule_service.set_recheck_requester(
+                self._perception_service.request_force_recheck
+            )
+
         self._task_service = TaskService(rule_service=self._rule_service)
 
         self._initialized = True

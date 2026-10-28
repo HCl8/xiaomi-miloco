@@ -351,8 +351,11 @@ async def test_skipped_dispatches_state_reminder(proxy):
     assert dispatched[0].event == "在工作"
 
 
-async def test_unmatched_rule_feeds_false_with_skip_flicker(proxy):
-    """VLM 过渡窗的 False 一帧确认：不等第二帧，退出宽限由任务层提供。"""
+async def test_unmatched_rule_feeds_false_without_skip_flicker(proxy):
+    """False 走两帧确认：omni 单窗误判（低头/喝水）实测 ~15%，一帧就断会话受不了。
+
+    退出宽限仍由任务层的 exit_debounce_seconds 收尾，两者叠加。
+    """
     result = RealtimePerceptionResult(
         skipped=False,
         device_rule_map={"cam_A": ["rule_X"]},
@@ -366,4 +369,4 @@ async def test_unmatched_rule_feeds_false_with_skip_flicker(proxy):
     with patch("miloco.manager.get_manager", return_value=mgr):
         await proxy.handle_realtime_perception_result(result, artifacts=None)
 
-    assert calls == [("rule_X", "cam_A", False, True)]
+    assert calls == [("rule_X", "cam_A", False, False)]

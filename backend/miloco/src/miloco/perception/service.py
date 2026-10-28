@@ -51,6 +51,14 @@ class PerceptionService:
         # 启停/删模型交错时出现 executor 未重挂、孤儿 task 等状态错乱。
         self._lifecycle_lock = asyncio.Lock()
 
+    def request_force_recheck(self, did: str, ttl_sec: float = 60.0) -> None:
+        """规则层退出确认：下一个有该机位数据的周期强制放一窗给 omni。
+
+        绕过一级/二级门禁拦截 —— 否则「判到退出」的那一刻恰好被门禁拦掉，就永远
+        拿不到复核结果，只能在宽限结束时按旧的 False 断会话。
+        """
+        self._pipeline.request_force_recheck(did, ttl_sec)
+
     # ---- Realtime engine lifecycle ----
 
     async def start_engine(self) -> None:

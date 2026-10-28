@@ -1098,6 +1098,9 @@ class PerceptionEngineProxy:
                 main_loop_pending.add(matched_rule.rule_id)
                 outcome = await svc.update_state(
                     matched_rule.rule_id, did, True, matched_rule.reason,
+                    # 强制复核窗是「退出确认」专门要来的，它的 True 一次就够 ——
+                    # 不能再等第二帧（静态场景下第二帧可能根本不来，会话照样断）。
+                    confirm_single=did in (result.recheck_dids or ()),
                     trigger_room=matched_rule.room_name,
                     trigger_dids=matched_rule.source_device_ids,
                     caption=caption_for_dids(result.caption, matched_rule.source_device_ids),
@@ -1144,9 +1147,10 @@ class PerceptionEngineProxy:
                         did,
                         False,
                         cycle_source_states=cycle_source_states_by_rule.get(rule_id),
-                        # 感知只在 VLM 确认的过渡窗调 omni：这一帧 False 就是真过渡，
-                        # 不等第二帧。退出宽限由规则/任务的 exit_debounce_seconds 提供。
-                        skip_flicker=True,
+                        # 单帧 False 只记「退出候选」，连续两帧 False 才推退出：omni 对
+                        # 单窗的误判（低头/喝水/看别处）实测约 15%，一次就断会话的话
+                        # 连续工作永远攒不满。退出宽限仍由 exit_debounce_seconds 收尾。
+                        skip_flicker=False,
                         trigger_event_id=cycle_event_id,
                     )
         finally:
