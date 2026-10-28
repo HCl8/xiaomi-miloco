@@ -325,3 +325,76 @@ def test_cache_round_trip(tmp_path):
     assert entry.key == "k"
     assert entry.items[0].action == "老人捂胸口"
     assert entry.covered[0]["rule_id"] == "r1"
+
+
+# =============================================================================
+# 配置写死的特殊放行项（force_items）
+# =============================================================================
+
+
+def test_forced_items_survive_without_rules_or_profile(monkeypatch):
+    """没有规则/档案、LLM 提炼无事可做时，配置项仍然生效。"""
+    monkeypatch.setattr(sp, "_profile_text", lambda: "")
+    cfg = SpecialPassConfig(
+        enabled=True,
+        force_items=["主体刚拿起手机低头看屏幕"],
+    )
+    items = sp.prepare_camera(
+        did="cam_a",
+        room_name="客厅",
+        camera_prompt=None,
+        rules=[],
+        generic_instructions="",
+        config=cfg,
+        omni_config=OmniConfig(),
+    )
+    assert [i.action for i in items] == ["主体刚拿起手机低头看屏幕"]
+
+
+def test_forced_items_merge_before_extracted_and_respect_max(monkeypatch):
+    forced = sp._forced_items(
+        SpecialPassConfig(force_items=["A", "B"], max_items=2, max_action_chars=60)
+    )
+    merged = sp._merge_forced(
+        [SpecialPassItem(action="C"), SpecialPassItem(action="A")],
+        forced,
+        SpecialPassConfig(max_items=2),
+    )
+    assert [i.action for i in merged] == ["A", "B"]
+
+
+def test_forced_items_support_title_and_action():
+    items = sp._forced_items(
+        SpecialPassConfig(
+            force_items=["电脑→手机=刚拿起手机看屏幕"], max_action_chars=60
+        )
+    )
+    assert items[0].title == "电脑→手机"
+    assert items[0].action == "刚拿起手机看屏幕"
+
+
+def test_parsed_item_title_defaults_to_short_phrase():
+    items, _ = sp._parse_output(
+        '{"items":[{"action":"老人刚从站立变为扶墙","reason":"档案","source":"profile"}]}',
+        SpecialPassConfig(),
+    )
+    assert items[0].title
+    assert len(items[0].title) <= 8
+
+
+def test_forced_items_can_be_scoped_per_camera(monkeypatch):
+    monkeypatch.setattr(sp, "_profile_text", lambda: "")
+    cfg = SpecialPassConfig(
+        enabled=True,
+        force_items_by_camera={"cam_a": ["仅A=动作A"], "cam_b": ["仅B=动作B"]},
+    )
+    a = sp.prepare_camera(
+        did="cam_a", room_name="客厅", camera_prompt=None, rules=[],
+        generic_instructions="", config=cfg, omni_config=OmniConfig(),
+    )
+    c = sp.prepare_camera(
+        did="cam_c", room_name="玄关", camera_prompt=None, rules=[],
+        generic_instructions="", config=cfg, omni_config=OmniConfig(),
+    )
+    assert [i.title for i in a] == ["仅A"]
+    assert c == []

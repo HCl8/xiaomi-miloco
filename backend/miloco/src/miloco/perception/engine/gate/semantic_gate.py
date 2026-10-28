@@ -37,7 +37,7 @@ _PASS_KEY_PREFIX = "pass:"
 _DECISION_PATH = "/v1/systemone"
 _PASS_INSTRUCTIONS_SUFFIX = (
     "（只判断这个变化；描述里点名了主体/某人/宠物时，只看对应对象；"
-    "相对第 1 张参考帧没有出现这个变化就选否。）"
+    "这组连续画面里任意两张画面之间出现了这个变化就选是，整组都没有出现才选否。）"
 )
 
 # 后端单事件循环：按 base_url 缓存客户端/并发闸/熔断状态即可。
@@ -62,6 +62,8 @@ class SemanticEvalResult:
     physio_passed: bool = False
     # 特殊放行问题（规则/档案经 LLM 提炼）：最高分、命中下标、问了几条、总题数。
     pass_score: float = 0.0
+    # 每条特殊放行问题各自的分数（与 special_items 下标对齐，没答的记 0）。
+    pass_scores: tuple[float, ...] = ()
     pass_hits: tuple[int, ...] = ()
     pass_count: int = 0
     question_count: int = 0
@@ -162,24 +164,18 @@ def _record_success(base_url: str) -> None:
 
 
 def _render_context_block(context: SemanticGateContext | None) -> str:
-    """机位/时间/机位须知。家庭档案原文不在这里——它只喂给 LLM 提炼特殊放行项。"""
+    """机位 / 主体口径 / 机位须知。家庭档案原文不在这里——它只喂给 LLM 提炼特殊放行项。"""
     if context is None:
         return ""
     parts: list[str] = []
-    head: list[str] = []
     if context.room_name:
-        head.append(f"【机位】{context.room_name}")
-    if context.current_time:
-        head.append(f"当前时间：{context.current_time}")
-    if head:
-        parts.append("；".join(head))
+        parts.append(f"【机位】{context.room_name}")
+    # 主体口径跟机位走：只看离镜头最近、占画面最大的那个人。
+    parts.append(
+        "只看画面中离镜头最近、占画面面积最大的那一个人（下称主体）。其他人不算数。"
+    )
     if context.camera_prompt:
         parts.append(f"【机位须知】{context.camera_prompt.strip()}")
-    if context.special_items:
-        parts.append(
-            "（特殊放行问题同样以第 1 张为参考帧；只判相对参考帧的变化；"
-            "描述里点名了对象时只看该对象。）"
-        )
     return "\n".join(parts)
 
 
@@ -196,8 +192,7 @@ def _special_questions(
         questions[f"{_PASS_KEY_PREFIX}{i}"] = {
             "type": "noul",
             "instructions": (
-                "第 1 张是参考帧，第 2 张起是本窗口。"
-                f"相对参考帧，本窗口里是否出现了以下变化：{action}？"
+                f"这组连续画面里（每秒 1 张），是否出现了以下变化：{action}？"
                 f"{_PASS_INSTRUCTIONS_SUFFIX}"
             ),
             "criteria": {"true": "出现了这个变化", "false": "没有出现这个变化"},
@@ -297,14 +292,14 @@ async def evaluate_semantic(
         physio_passed = (
             config.physio_enabled and physio_score >= config.physio_min_score
         )
-        pass_scores: list[float] = []
+        item_scores = [0.0] * len(special_items)
         pass_hits: list[int] = []
         for i in range(len(special_items)):
             answer = answers.get(f"{_PASS_KEY_PREFIX}{i}")
             if not isinstance(answer, dict) or "noul" not in answer:
                 continue
             value = float(answer["noul"])
-            pass_scores.append(value)
+            item_scores[i] = value
             if value >= config.extra_min_score:
                 pass_hits.append(i)
     except Exception as e:  # noqa: BLE001 — 门禁失败不能中断感知
@@ -333,7 +328,8 @@ async def evaluate_semantic(
         end_passed=end_passed,
         physio_score=physio_score,
         physio_passed=physio_passed,
-        pass_score=max(pass_scores) if pass_scores else 0.0,
+        pass_score=max(item_scores) if item_scores else 0.0,
+        pass_scores=tuple(item_scores),
         pass_hits=tuple(pass_hits),
         pass_count=len(special_items),
         question_count=question_count,

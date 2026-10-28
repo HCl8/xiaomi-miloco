@@ -4,7 +4,7 @@
 这里用 omni 模型（text-only）读本机位规则 + 家庭档案，只提炼默认问题覆盖不到的
 **变化时刻**（身份/身体条件、细微局部、宠物异常、健康安全禁忌等），逐条交给
 StartLux 做 yes/no。
-提炼时把门禁的公共输入布局一并给出，保证写出的描述都是「相对参考帧」可判的；
+提炼时把门禁的公共输入布局一并给出，保证写出的描述都是「连续画面之间」可判的；
 静态/持续状态不进特殊放行（否则同一状态会在每个窗都放行）。
 后台提炼、按机位缓存，失败只退回默认问题。
 """
@@ -28,21 +28,19 @@ from miloco.utils.paths import miloco_home
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_VERSION = "v6"
+_PROMPT_VERSION = "v8"
 _CACHE_VERSION = 1
 
 # 门禁公共输入布局的兜底文案；正常情况下由调用方把 config.state 渲染好后传入。
 _FALLBACK_INPUT_LAYOUT = (
-    "画面按时间先后排列：第 1 张是「参考帧」，即上一个窗口的最后一帧；"
-    "其余是「本窗口」的画面，每秒 1 张。"
+    "画面按时间先后排列，是一组连续画面（每秒 1 张）；任意两张画面之间的变化都算。"
 )
 
 _SYSTEM_PROMPT = (
-    "你是家庭感知系统的门禁提示词助手。门禁的输入是一组按时间排列的画面："
-    "第 1 张是参考帧（上一个窗口最后一帧），其余是本窗口画面。默认问题判断"
-    "「相对参考帧有没有变化」。你的任务是结合机位任务和家庭档案，找出默认问题"
-    "可能漏掉、但值得放行的**变化时刻**，写成相对参考帧可以直接做 yes/no 判断的"
-    "变化描述。不要写静态场景或持续状态。只输出 JSON。"
+    "你是家庭感知系统的门禁提示词助手。门禁的输入是一组连续的监控画面（每秒 1 张），"
+    "默认问题判断这组画面里有没有发生变化。你的任务是结合机位任务和家庭档案，找出"
+    "默认问题可能漏掉、但值得放行的**变化时刻**，写成可以直接做 yes/no 判断的"
+    "变化描述（任意两张画面之间出现即可）。不要写静态场景或持续状态。只输出 JSON。"
 )
 
 _USER_TEMPLATE = """【输入数据】<<INPUT_LAYOUT>>
@@ -57,7 +55,7 @@ _USER_TEMPLATE = """【输入数据】<<INPUT_LAYOUT>>
 <<PROFILE>>
 
 核心口径——只找「变化时刻」，不找「持续状态」：
-- 每条 action 都必须是相对第 1 张参考帧能判定的变化：新出现、刚发生、刚开始、刚结束、刚切换、刚拿起/放下、刚进入/离开、位置/状态刚改变。
+- 每条 action 都必须是这组连续画面里能判定的变化（任意两张画面之间出现即可）：新出现、刚发生、刚开始、刚结束、刚切换、刚拿起/放下、刚进入/离开、位置/状态刚改变。
 - 禁止输出静态或持续状态，例如"有人在用电脑/工作""有人拿着手机看""宝宝在爬行垫上""有人坐在沙发上"。这些状态可能在很多窗里都成立，会把门禁变成"只要状态在就放行"。
 - 规则/档案关心的是持续状态时，只提炼它开始/结束/切换的那一刻。
 
@@ -80,7 +78,9 @@ _USER_TEMPLATE = """【输入数据】<<INPUT_LAYOUT>>
 
 硬性要求：
 - action 用变化句式（刚…／开始…／从…变为…／新出现…／刚离开…），8~40 个汉字；主体用档案/规则里的称呼，没有外观描述时用画面可判别的泛称；不写时间条件、概率、心理活动。
-- 每条 action 都必须能与参考帧对比判断；只靠单帧静态内容就能成立的描述不合格。
+- 每条 action 都必须能在这组连续画面之间判断（任意两张画面之间的变化）；只靠单帧静态内容就能成立的描述不合格。
+- 每条 item 必须带 title：给看板展示用的短标题，不超过 8 个汉字，概括这条变化
+  （例如「老人扶墙」「宝宝爬行」「宠物抓沙发」「拿起手机」），不要复述整句。
 - 常规活动（喝水/打哈欠/看手机/起身/离开/回到/坐下工作）和大幅变化放 covered 说明原因；只有真正覆盖不到的变化才落到 items。
 - 同一条件（同一条规则或同一档案依据）只输出一条；最多 <<MAX_ITEMS>> 条，按重要性排序；没有就输出空数组。
 - source 必须写来源：规则来的填 rule:<rule_id>，档案来的填 profile。
@@ -88,7 +88,7 @@ _USER_TEMPLATE = """【输入数据】<<INPUT_LAYOUT>>
 - 只输出确实能从规则或档案推出的内容，不要编造。
 <<EXTRA_BLOCK>>
 输出 JSON（不要 markdown 代码块、不要解释）：
-{"items":[{"action":"...","reason":"...","source":"rule:<rule_id> 或 profile"}],
+{"items":[{"title":"...","action":"...","reason":"...","source":"rule:<rule_id> 或 profile"}],
  "covered":[{"rule_id":"...","reason":"默认问题能覆盖，或只是持续状态..."}]}"""
 
 
@@ -114,6 +114,49 @@ _PROFILE_CACHE: tuple[int, int, str] | None = None
 # =============================================================================
 
 
+def _auto_title(action: str) -> str:
+    """从动作描述里取一个短标题（≤8 字）：去掉「主体」和标点后的首个短语。"""
+    text = re.sub(r"^主体", "", action.strip())
+    text = re.split(r"[，。；,;：:（(]", text, maxsplit=1)[0].strip()
+    return text[:8] or action[:8]
+
+
+def _forced_items(config: SpecialPassConfig, did: str = "") -> list[SpecialPassItem]:
+    """配置里写死的特殊放行项；不依赖 LLM，顺序在提炼项之前。"""
+    out: list[SpecialPassItem] = []
+    raw_items = list(config.force_items or ())
+    raw_items += list((config.force_items_by_camera or {}).get(did, ()))
+    for raw in raw_items:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        # 支持 "标题=描述"：标题给看板，描述给 StartLux；没有 "=" 就自动取标题。
+        head, sep, tail = text.partition("=")
+        title = head.strip() if sep else ""
+        action = (tail if sep else head).strip()[: config.max_action_chars]
+        if not action:
+            continue
+        out.append(
+            SpecialPassItem(
+                action=action,
+                title=(title or _auto_title(action))[:12],
+                reason="config.force_items",
+            )
+        )
+    return out[: config.max_items]
+
+
+def _merge_forced(
+    items: list[SpecialPassItem],
+    forced: list[SpecialPassItem],
+    config: SpecialPassConfig,
+) -> list[SpecialPassItem]:
+    if not forced:
+        return items[: config.max_items]
+    seen = {i.action for i in forced}
+    return (forced + [i for i in items if i.action not in seen])[: config.max_items]
+
+
 def prepare_camera(
     *,
     did: str,
@@ -133,15 +176,17 @@ def prepare_camera(
     input_layout = (input_layout or "").strip() or _FALLBACK_INPUT_LAYOUT
     if not config.enabled or config.max_items <= 0:
         return []
+    forced = _forced_items(config, did)
     try:
         profile = _profile_text()
         has_rules = any(r.query.strip() for r in rules)
         if not profile.strip() and not has_rules:
-            return []
+            # 没有规则/档案时 LLM 提炼无事可做，但配置写死的项仍然生效。
+            return list(forced)
         live = _live_config(omni_config)
         if live is None:
             # 没配 omni key 时感知本身也跑不起来；这里静默跳过，不每窗刷 warning。
-            return []
+            return list(forced)
         _load_cache(config)
         key = _camera_key(
             profile=profile,
@@ -171,7 +216,7 @@ def prepare_camera(
                     config=config,
                     omni_config=omni_config,
                 )
-            return list(entry.items)
+            return _merge_forced(list(entry.items), forced, config)
         # key 变化（档案/规则/机位改动）：旧项可能已对应不存在的规则，先不喂给门禁。
         _spawn_refresh(
             did=did,
@@ -185,10 +230,10 @@ def prepare_camera(
             config=config,
             omni_config=omni_config,
         )
-        return []
+        return list(forced)
     except Exception:  # noqa: BLE001 — 提炼是增益项，任何异常都不能影响感知
         logger.warning("gate special-pass prepare failed did=%s", did, exc_info=True)
-        return []
+        return list(forced)
 
 
 # =============================================================================
@@ -472,9 +517,11 @@ def _parse_output(
         source = _clean_text(raw.get("source"))
         if not (source.startswith("rule:") or source == "profile"):
             source = "profile"
+        title = _clean_text(raw.get("title"))[:12] or _auto_title(action)
         items.append(
             SpecialPassItem(
                 action=action,
+                title=title,
                 reason=_clean_text(raw.get("reason"))[:200],
                 source=source,
             )

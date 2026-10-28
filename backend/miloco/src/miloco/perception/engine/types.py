@@ -98,6 +98,8 @@ class GateTiming:
     semantic_applied: bool = False
     semantic_pass: bool = True
     semantic_score: float = 0.0
+    # 默认问题（变化）单独过没过的阈值（≥ min_score），看板据此标绿。
+    semantic_e_pass: bool = False
     semantic_veto: bool = False
     semantic_error: str = ""
     # 特殊放行问题（规则 / 档案经 LLM 提炼）：最高分、命中项下标、问了几条、总题数。
@@ -110,6 +112,10 @@ class GateTiming:
     semantic_pass_hits: str = ""
     semantic_pass_count: int = 0
     semantic_question_count: int = 0
+    # 每条特殊放行问题的 (title, score, 是否有效命中)；给看板展示「是哪条放行的」。
+    semantic_special_scores: tuple = ()
+    # 本窗原始命中下标（含被持续状态抑制的），供下一窗做连续命中抑制。
+    semantic_raw_hits: tuple = ()
 
     # 状态容器到点强制复核：本窗绕过视觉/语义门禁直接给 omni。
     recheck: bool = False
@@ -341,6 +347,8 @@ class SpecialPassItem:
     """
 
     action: str
+    # 看板展示用的短标题（≤8 个汉字）；空则前端回退到 action 截断。
+    title: str = ""
     reason: str = ""
     source: str = "profile"
 
@@ -354,6 +362,8 @@ class SemanticGateContext:
     camera_prompt: str | None = None
     room_name: str | None = None
     current_time: str | None = None
+    # 上一窗已经命中的特殊项下标：连续命中说明是持续状态，本窗不再据此放行。
+    sustained_items: tuple[int, ...] = ()
 
 
 @dataclass

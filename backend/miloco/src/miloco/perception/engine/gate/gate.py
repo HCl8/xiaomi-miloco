@@ -86,11 +86,26 @@ async def run_gate(
         semantic = await evaluate_semantic(
             input_slice.frames, prev_raw_frame, config.semantic, semantic_context
         )
+    def _effective_semantic(sem):
+        """连续命中抑制：上一窗已经命中的特殊项视为持续状态，本窗不再据此放行。"""
+        sustained = (
+            set(semantic_context.sustained_items) if semantic_context is not None else set()
+        )
+        hits = tuple(i for i in sem.pass_hits if i not in sustained)
+        base = (
+            sem.score >= config.semantic.min_score
+            or sem.end_passed
+            or sem.physio_passed
+        )
+        passed = (base or bool(hits)) if sem.applied else sem.passed
+        return hits, passed
+
+    effective_hits, semantic_passed = _effective_semantic(semantic)
     semantic_veto = (
         visual_changed
         and semantic.applied
         and config.semantic.mode == "enforce"
-        and not semantic.passed
+        and not semantic_passed
     )
     visual_effective = forced or (visual_changed and not semantic_veto)
 
@@ -132,12 +147,13 @@ async def run_gate(
         semantic = await evaluate_semantic(
             input_slice.frames, prev_raw_frame, config.semantic, semantic_context
         )
+        effective_hits, semantic_passed = _effective_semantic(semantic)
     hold_semantic_veto = (
         config.semantic.enabled
         and config.semantic.hold_semantic_gate
         and hold_candidate
         and semantic.applied
-        and not semantic.passed
+        and not semantic_passed
     )
     hold_opens_window = hold_candidate and not hold_semantic_veto
 
@@ -146,12 +162,29 @@ async def run_gate(
 
     # 命中项写成 "下标:动作" 便于在 traces.timing_detail 里直接看到是哪个特殊放行项。
     semantic_pass_hits = ""
-    if semantic_context is not None and semantic.pass_hits:
+    if semantic_context is not None and effective_hits:
         semantic_pass_hits = ",".join(
             f"{i}:{semantic_context.special_items[i].action[:30]}"
-            for i in semantic.pass_hits
+            for i in effective_hits
             if i < len(semantic_context.special_items)
         )[:300]
+
+    # 每条特殊放行问题各自的分数（看板要能看出是哪条放行的）。
+    semantic_special_scores: tuple = ()
+    if semantic_context is not None and semantic_context.special_items:
+        semantic_special_scores = tuple(
+            (
+                (item.title or item.action[:8]),
+                round(
+                    semantic.pass_scores[i]
+                    if i < len(semantic.pass_scores)
+                    else 0.0,
+                    3,
+                ),
+                i in effective_hits,
+            )
+            for i, item in enumerate(semantic_context.special_items)
+        )
 
     timing = GateTiming(
         video_ms=video_ms, audio_ms=audio_ms,
@@ -168,8 +201,11 @@ async def run_gate(
 
         semantic_ms=semantic.latency_ms,
         semantic_applied=semantic.applied,
-        semantic_pass=semantic.passed,
+        semantic_pass=semantic_passed,
         semantic_score=semantic.score,
+        semantic_e_pass=bool(
+            semantic.applied and semantic.score >= config.semantic.min_score
+        ),
         semantic_veto=semantic_veto,
         semantic_error=semantic.error,
         semantic_pass_score=semantic.pass_score,
@@ -182,6 +218,8 @@ async def run_gate(
         semantic_end_pass=semantic.end_passed,
         semantic_physio_score=semantic.physio_score,
         semantic_physio_pass=semantic.physio_passed,
+        semantic_special_scores=semantic_special_scores,
+        semantic_raw_hits=tuple(sorted(semantic.pass_hits)),
         recheck=forced,
     )
 

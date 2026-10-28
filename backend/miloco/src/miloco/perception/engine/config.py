@@ -175,6 +175,12 @@ class SpecialPassConfig:
     max_action_chars: int = 60
     # 追加到提炼提示词末尾的现场补充要求（可空）；改这个或上面的上限都会触发重提炼。
     extra_instructions: str = ""
+    # 无条件追加到每个机位的特殊放行项（不走 LLM 提炼，配置改了下窗生效）。
+    # 用于默认问题稳定判不出的「变化时刻」——例如看手机与坐在电脑前工作在画面上
+    # 高度相似，E 问题常判成「没变」，需要单独问一条「刚拿起手机看屏幕」。
+    force_items: list[str] = field(default_factory=list)
+    # 按机位追加（key=did）：只给需要的机位加，避免别的机位也被这些项放行。
+    force_items_by_camera: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass

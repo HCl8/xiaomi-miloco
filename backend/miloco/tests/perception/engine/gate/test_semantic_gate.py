@@ -384,12 +384,15 @@ def test_payload_adds_special_questions_and_context():
         "event", "event_end", "event_physio", "pass:0", "pass:1"
     }
     assert "老人捂胸口" in payload["questions"]["pass:0"]["instructions"]
-    assert "参考帧" in payload["questions"]["pass:0"]["instructions"]
-    # 特殊放行问的是「相对参考帧的变化」，不是静态状态
+    assert "这组连续画面里" in payload["questions"]["pass:0"]["instructions"]
+    # 特殊放行问的是「连续画面之间的变化」，不是静态状态
     assert "是否出现了以下变化" in payload["questions"]["pass:0"]["instructions"]
     assert "不要求跟参考帧相比有变化" not in payload["questions"]["pass:0"]["instructions"]
+    # 特殊放行问的是「相对第 1 张参考帧的变化」
+    assert "任意两张画面之间出现了这个变化就选是" in payload["questions"]["pass:0"]["instructions"]
     assert "客厅" in payload["state"]
-    assert "10:00:00" in payload["state"]
+    assert "只看画面中离镜头最近" in payload["state"]
+    assert "10:00:00" not in payload["state"]
 
 
 def test_payload_without_context_has_default_and_end_questions():
@@ -492,3 +495,57 @@ async def test_enforce_special_pass_keeps_window(monkeypatch):
     assert timing.semantic_pass_count == 1
     assert timing.semantic_question_count == 2
     assert "老人捂胸口" in timing.semantic_pass_hits
+
+
+async def test_special_item_scores_are_per_item(monkeypatch):
+    """每条特殊放行问题独立记分：看板才能显示「哪条放行的」。"""
+    client = _FakeClient(
+        answers={
+            "event": {"noul": 0.05},
+            "pass:0": {"noul": 0.1},
+            "pass:1": {"noul": 0.8},
+        }
+    )
+    monkeypatch.setattr(semantic_gate, "_client", lambda *a: client)
+
+    result = await evaluate_semantic(
+        _frames(), _frames(1)[0], _cfg(extra_min_score=0.5), _ctx("老人捂胸口", "宝宝在爬行垫上")
+    )
+    assert result.pass_scores == (0.1, 0.8)
+    assert result.pass_hits == (1,)
+    assert result.pass_score == pytest.approx(0.8)
+    assert result.passed is True
+
+
+async def test_sustained_special_hit_is_not_reopened(monkeypatch):
+    """特殊项连续命中 = 持续状态：上一窗已据此放行，本窗不再放行。"""
+
+    async def _pass(*a, **kw):
+        return SemanticEvalResult(
+            applied=True, passed=True, score=0.01,
+            pass_score=0.9, pass_scores=(0.9,), pass_hits=(0,),
+            pass_count=1, question_count=4,
+        )
+
+    monkeypatch.setattr(gate_mod, "evaluate_semantic", _pass)
+    cfg = GateConfig(semantic=SemanticGateConfig(enabled=True, mode="enforce"))
+    item = SpecialPassItem(action="刚拿起手机看屏幕")
+
+    packet, timing, *_ = await run_gate(
+        _slice_with_change(), cfg,
+        prev_frame=_baseline(), prev_raw_frame=_solid(100),
+        semantic_context=SemanticGateContext(special_items=(item,)),
+    )
+    assert packet is not None
+    assert timing.semantic_pass is True
+    assert timing.semantic_raw_hits == (0,)
+
+    packet2, timing2, *_ = await run_gate(
+        _slice_with_change(), cfg,
+        prev_frame=_baseline(), prev_raw_frame=_solid(100),
+        semantic_context=SemanticGateContext(
+            special_items=(item,), sustained_items=(0,)
+        ),
+    )
+    assert packet2 is None
+    assert timing2.semantic_veto is True
