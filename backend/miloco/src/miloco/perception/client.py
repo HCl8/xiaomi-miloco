@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -656,6 +657,7 @@ class PerceptionEngineProxy:
                 # 成功后把本 cycle 的触发结论写回 value；终态直接读它、不回读引擎记账表。
                 early_sent_rule_ids[(r.rule_id, did)] = await svc.update_state(
                     r.rule_id, did, True, r.reason,
+                    confirm_single=self._consume_recheck(did, r.rule_id),
                     trigger_room=r.room_name,
                     trigger_dids=r.source_device_ids,
                     caption="", device_name=r.device_name,
@@ -794,12 +796,47 @@ class PerceptionEngineProxy:
         rules = [rule.model_dump() for rule in omni_rules_only(all_rules)]
         return _filter_completed_event_rules(rules, guard_needed_task_ids)
 
-    def request_force_recheck(self, did: str, ttl_sec: float = 60.0) -> None:
-        """规则层「退出确认」：让引擎下一个周期强制放一窗该机位给 omni。"""
-        engine = self.perception_engine
-        if engine is None:
+    def request_force_recheck(
+        self, did: str, rule_id: str | None = None, ttl_sec: float = 15.0
+    ) -> None:
+        """规则层「退出确认」：让引擎下一个周期强制放一窗该机位给 omni。
+
+        同时在本进程记一条 (did, rule_id) 的「等待复核」，只有提出请求的那条规则
+        才拿得到 confirm_single —— 状态容器每 300s 的到点复核不该让规则一帧就撤销
+        退出，同机位的别的规则也不该蹭到。
+        """
+        if not did:
             return
-        engine.request_force_recheck(did, ttl_sec)
+        lock, pending = self._recheck_state()
+        with lock:
+            pending[(did, rule_id)] = time.monotonic() + ttl_sec
+        engine = self.perception_engine
+        if engine is not None:
+            engine.request_force_recheck(did, ttl_sec)
+
+    def _recheck_state(self) -> tuple["threading.Lock", dict]:
+        """等待复核的登记表 + 它的锁（惰性创建，兼容不走 __init__ 的构造路径）。"""
+        lock = getattr(self, "_recheck_guard_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._recheck_guard_lock = lock
+        pending = getattr(self, "_pending_rechecks", None)
+        if pending is None:
+            pending = {}
+            self._pending_rechecks = pending
+        return lock, pending
+
+    def _consume_recheck(self, did: str, rule_id: str) -> bool:
+        """这条规则是否正在等一次强制复核（用掉即销，过期作废）。"""
+        key = (did, rule_id)
+        now = time.monotonic()
+        lock, pending = self._recheck_state()
+        with lock:
+            expires = pending.get(key)
+            if expires is None:
+                return False
+            pending.pop(key, None)
+            return expires >= now
 
     async def gate_batch(self, batch: PerceptionBatch):
         """门禁阶段（主 loop）：collect 后立刻跑一级 + 二级，结果写内存环。
@@ -1100,7 +1137,7 @@ class PerceptionEngineProxy:
                     matched_rule.rule_id, did, True, matched_rule.reason,
                     # 强制复核窗是「退出确认」专门要来的，它的 True 一次就够 ——
                     # 不能再等第二帧（静态场景下第二帧可能根本不来，会话照样断）。
-                    confirm_single=did in (result.recheck_dids or ()),
+                    confirm_single=self._consume_recheck(did, matched_rule.rule_id),
                     trigger_room=matched_rule.room_name,
                     trigger_dids=matched_rule.source_device_ids,
                     caption=caption_for_dids(result.caption, matched_rule.source_device_ids),

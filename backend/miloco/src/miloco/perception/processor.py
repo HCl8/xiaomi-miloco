@@ -203,14 +203,18 @@ class _GatedBatch:
     device_trace_ids: dict[str, str]
     cycle_start_unix_ms: int
     collect_ms: float
+    # 门禁阶段入口的 monotonic 时刻：cycle_total_ms 从这儿起算，才包含门禁本身
+    cycle_start_mono: float = 0.0
 
 
 class PipelineProcessor:
     """Data flow pipeline: collect_batch → omni inference → log → postprocess."""
 
-    def request_force_recheck(self, did: str, ttl_sec: float = 60.0) -> None:
+    def request_force_recheck(
+        self, did: str, rule_id: str | None = None, ttl_sec: float = 15.0
+    ) -> None:
         """把「下一窗强制放行」的请求转给引擎（规则层退出确认）。"""
-        self._perception_engine_proxy.request_force_recheck(did, ttl_sec)
+        self._perception_engine_proxy.request_force_recheck(did, rule_id, ttl_sec)
 
     def __init__(
         self,
@@ -459,6 +463,8 @@ class PipelineProcessor:
         没过门禁的窗由 omni 阶段直接跳过（pregated），不占 omni。
         """
         async with get_monitor().track_async(NodeName.PROCESSOR, "gate") as _proc_h:
+            # 从门禁入口起算：cycle_total_ms 要含门禁本身，否则面板上的 rtf 系统性偏低
+            t_cycle = time.monotonic()
             t = time.monotonic()
             batch = self._collector.collect_batch(drain=True)
             collect_ms = _ms_since(t)
@@ -483,9 +489,31 @@ class PipelineProcessor:
                 device_trace_ids={did: str(uuid.uuid4()) for did in batch.devices},
                 cycle_start_unix_ms=int(time.time() * 1000),
                 collect_ms=collect_ms,
+                cycle_start_mono=t_cycle,
             )
             self._enqueue_omni(item)
             return True
+
+    @staticmethod
+    def _close_pending(item: "_GatedBatch", reason: str) -> None:
+        """把该窗各机位在看板上仍 pending 的记录落定为失败。"""
+        from miloco.perception.live_ring import close_pending
+
+        for did in getattr(item.batch, "devices", {}) or {}:
+            try:
+                close_pending(did, reason)
+            except Exception:  # noqa: BLE001 —— 看板失败不能影响队列
+                pass
+
+    @staticmethod
+    def _needs_omni(item: "_GatedBatch") -> bool:
+        """这一窗还值不值得排 omni：门禁全拦、又没有强制复核的窗只剩落 trace 的价值。"""
+        prepared = getattr(item, "prepared", None)
+        gated = getattr(prepared, "gated", None) or {}
+        if not gated:
+            return True
+        forced = set(getattr(prepared, "recheck_dids", ()) or ())
+        return any(g.packet is not None or did in forced for did, g in gated.items())
 
     def _enqueue_omni(self, item: "_GatedBatch") -> None:
         try:
@@ -493,19 +521,38 @@ class PipelineProcessor:
             return
         except asyncio.QueueFull:
             pass
-        # 队列满：丢最旧的一窗。门禁结果已经在环里，展示不受影响；只是这窗不跑 omni。
-        try:
-            dropped = self._omni_queue.get_nowait()
+        # 队列满：优先丢「本窗不需要 omni」的（全拦窗），别让它把真变化窗挤掉；
+        # 一窗都不需要 omni 时才按最旧丢。门禁结果已在内存环里，展示不受影响。
+        rest: list[_GatedBatch] = []
+        dropped: _GatedBatch | None = None
+        while True:
+            try:
+                old = self._omni_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
             self._omni_queue.task_done()
+            if dropped is None and not self._needs_omni(old):
+                dropped = old
+            else:
+                rest.append(old)
+        if dropped is None and rest:
+            dropped = rest.pop(0)
+        for keep in rest:
+            try:
+                self._omni_queue.put_nowait(keep)
+            except asyncio.QueueFull:
+                break
+        if dropped is not None:
             logger.warning(
-                "[processor] omni 队列满，丢弃最旧窗 trace=%s", dropped.trace_id
+                "[processor] omni 队列满，丢弃窗 trace=%s needs_omni=%s",
+                dropped.trace_id, self._needs_omni(dropped),
             )
-        except asyncio.QueueEmpty:
-            pass
+            self._close_pending(dropped, "omni 队列满，本窗被丢弃")
         try:
             self._omni_queue.put_nowait(item)
         except asyncio.QueueFull:
             logger.warning("[processor] omni 队列仍满，丢弃新窗 trace=%s", item.trace_id)
+            self._close_pending(item, "omni 队列满，本窗被丢弃")
 
     async def _omni_consumer_loop(self) -> None:
         while True:
@@ -538,6 +585,16 @@ class PipelineProcessor:
                 await task
             except asyncio.CancelledError:
                 pass
+        # 停引擎时排队中的窗已经过期（trace_id/画面都是几分钟前的），重新 start 后
+        # 让新 consumer 跑它们会对历史画面调 omni、推规则边沿、把 trace 顺序写乱。
+        while True:
+            try:
+                stale = self._omni_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._omni_queue.task_done()
+            logger.info("[processor] stop: 丢弃排队窗 trace=%s", stale.trace_id)
+            self._close_pending(stale, "引擎停止，排队窗未执行")
 
     async def _run_omni_phase(
         self, item: "_GatedBatch", _proc_h=None
@@ -678,7 +735,9 @@ class PipelineProcessor:
 
             # --- Assemble latency report from result.timing ---
             if self._perf_enabled:
-                cycle_total_ms = _ms_since(t_cycle)
+                # 从门禁阶段入口起算：拆分后 t_cycle 是 omni 阶段入口，只算它会把
+                # 门禁耗时和排队等待整段抹掉，rtf/e2e 跟着系统性偏低。
+                cycle_total_ms = _ms_since(item.cycle_start_mono or t_cycle)
 
                 timing = result.timing or {}
                 gate_ms, identity_ms, omni_ms = _aggregate_stage_ms(timing)

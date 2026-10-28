@@ -56,8 +56,8 @@ async def test_single_false_is_only_a_candidate(monkeypatch):
 async def test_exit_rechecks_halfway_through_the_grace(monkeypatch):
     """退出不是立刻要窗，而是宽限走一半时复核一次（第一次）。"""
     runner = _runner(monkeypatch, exit_debounce_seconds=1.0)
-    calls: list[str] = []
-    runner.set_recheck_requester(calls.append)
+    calls: list[tuple] = []
+    runner.set_recheck_requester(lambda did, rule_id, ttl: calls.append((did, rule_id)))
 
     await _feed(runner, True, True)
     assert calls == [], "进入时不该要窗"
@@ -69,11 +69,11 @@ async def test_exit_rechecks_halfway_through_the_grace(monkeypatch):
     assert calls == [], "刚判退出时还不该要窗"
 
     await asyncio.sleep(0.6)
-    assert calls == ["cam1"], "宽限一半要一次复核"
+    assert calls == [("cam1", "r-ses")], "宽限一半要一次复核（带 rule_id）"
 
     # 人确实走了：继续报假，没有新的边沿，不重复排程
     await _feed(runner, False)
-    assert calls == ["cam1"]
+    assert calls == [("cam1", "r-ses")]
     await asyncio.sleep(0.1)
 
 
@@ -81,7 +81,7 @@ async def test_exit_rechecks_halfway_through_the_grace(monkeypatch):
 async def test_forced_recheck_true_cancels_the_exit(monkeypatch):
     """复核窗说「还在」→ 撤掉宽限，按仍在处理，不重发 ENTERED。"""
     runner = _runner(monkeypatch)
-    runner.set_recheck_requester(lambda _did: None)
+    runner.set_recheck_requester(lambda *_a: None)
 
     await _feed(runner, True, True)
     await _feed(runner, False, False)
@@ -99,7 +99,7 @@ async def test_requester_failure_keeps_the_exit_path(monkeypatch):
     """要窗失败只是少一次复核，退出宽限照常开始。"""
     runner = _runner(monkeypatch)
 
-    def boom(_did: str) -> None:
+    def boom(*_a) -> None:
         raise RuntimeError("perception down")
 
     runner.set_recheck_requester(boom)
@@ -108,3 +108,40 @@ async def test_requester_failure_keeps_the_exit_path(monkeypatch):
 
     assert runner._state["r-ses"].exit_debounce_task is not None
     await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_confirm_single_outside_grace_changes_nothing(monkeypatch):
+    """没有宽限在跑时，confirm_single 不该改变进入方向的语义（正常边沿照常发）。"""
+    runner = _runner(monkeypatch)
+    await _feed(runner, False)
+    await runner.update_state("r-ses", "cam1", True, "", confirm_single=True)
+
+    state = runner._state["r-ses"]
+    assert state.sources["cam1"].last_bool is True
+    assert state.last_rule_state is True, "没有宽限时应按普通 ENTERED 处理"
+    assert state.exit_debounce_task is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_other_sources_pending_enter(monkeypatch):
+    """撤销退出后，别的机位残留的一帧 True 不能被当成下一轮的「第二帧」。"""
+    runner = _runner(monkeypatch)
+    runner._rules["r-ses"].condition.perceive_device_ids = ["cam1", "cam2"]
+
+    await _feed(runner, True, True)
+    await runner.update_state("r-ses", "cam2", True, "")
+    await runner.update_state("r-ses", "cam2", False, "")
+    await runner.update_state("r-ses", "cam2", False, "")
+    await _feed(runner, False, False)
+    state = runner._state["r-ses"]
+    assert state.exit_debounce_task is not None
+
+    # 模拟另一个机位在宽限里留下的一帧 True
+    state.sources.setdefault("cam2", type(state.sources["cam1"])()).pending_enter = True
+
+    runner.set_recheck_requester(lambda *_a: None)
+    await runner.update_state("r-ses", "cam1", True, "", confirm_single=True)
+
+    assert state.exit_debounce_task is None
+    assert all(not src.pending_enter for src in state.sources.values())

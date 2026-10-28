@@ -80,6 +80,8 @@ logger = logging.getLogger(__name__)
 
 # 到点复核最多等多久（窗 4s + omni 一次调用的余量）
 _EXIT_RECHECK_WAIT_SEC = 15.0
+# 强制复核请求的存活时间：只覆盖发起它的那一次退出宽限（下一个宽限至少 60s 后才开始）
+_EXIT_RECHECK_TTL_SEC = 15.0
 
 _EMPTY_RESULT_MSG = "MIoT 返回为空/不可判定,无法确认执行结果"
 _IOT_RECONCILE_CONTEXT = "iot_reconcile_exit"
@@ -277,6 +279,12 @@ class RuleRuntimeState:
     # 进入会话后排一次，退出宽限期间暂停，真退出时取消；到点派 on_target。
     # 退出宽限的中点复核任务（sources[0] 到 delay/2 时向感知层要一窗）
     exit_recheck_task: "asyncio.Task | None" = None
+    # 最近一次收到真实判定（True/False）的时刻；到点复核靠它判断结论是否已回来
+    last_update_mono: float = 0.0
+    # 定时器是否真的处于「宽限暂停」（不再从 debounce 任务推断）
+    state_target_paused: bool = False
+    # 已进入退出收尾（settle 之后）：此时复核确认不能再打断
+    exit_settling: bool = False
     state_target_task: "asyncio.Task | None" = None
     state_target_due: float | None = None      # monotonic 截止时刻
     state_target_remaining: float | None = None  # 暂停时保留的剩余秒数
@@ -641,6 +649,7 @@ class RuleRunner:
         state.exit_debounce_task = None
         state.exit_debounce_at = None
         state.last_rule_state = True
+        state.exit_settling = False
 
     # ---- Legacy field views (test / rule_tester compatibility) ----
     #
@@ -825,13 +834,17 @@ class RuleRunner:
         """接上「退出前强制要一窗」的入口（manager 在感知模块就绪后调用）。"""
         self._recheck_requester = fn
 
-    def _request_exit_recheck(self, source_did: str) -> None:
-        """退出候选时向感知层要一窗：绕过门禁再判一次，避免一次漏识就断会话。"""
+    def _request_exit_recheck(self, rule: Rule, source_did: str) -> None:
+        """退出候选时向感知层要一窗：绕过门禁再判一次，避免一次漏识就断会话。
+
+        带上 rule_id：只有提出请求的这条规则能凭这一窗「一帧确认」，同机位别的
+        规则和状态容器的到点复核都蹭不到。TTL 只覆盖这一次宽限，不跨轮次。
+        """
         fn = self._recheck_requester
         if fn is None or not source_did:
             return
         try:
-            fn(source_did)
+            fn(source_did, rule.id, _EXIT_RECHECK_TTL_SEC)
         except Exception:  # noqa: BLE001 —— 要窗失败不能影响状态机推进
             logger.warning(
                 "rule source %s exit recheck request failed",
@@ -857,6 +870,7 @@ class RuleRunner:
         if state is None:
             return
         self._cancel_state_target_state(state)
+        self._cancel_midpoint_recheck(state)
         if state.exit_debounce_task is not None and not state.exit_debounce_task.done():
             state.exit_debounce_task.cancel()
 
@@ -969,6 +983,7 @@ class RuleRunner:
                 return TriggerOutcome.NOT_FIRED
 
             src = self._ensure_source(rule_id, source_did)
+            self._state[rule_id].last_update_mono = time.monotonic()
             prev = src.last_bool
 
             # 帧级抗抖：source 上次 True 时，单帧 False 不立即翻转 — 视为 LLM 漏识，
@@ -1001,7 +1016,13 @@ class RuleRunner:
                 # debounce；第二帧 False 则吸收幻觉、debounce 继续完成。修复 omni
                 # 单帧幻觉反复打断 exit_debounce 导致 state 退不出的问题。
                 if current_bool:
-                    if confirm_single and self._state[rule_id].exit_debounce_task is not None:
+                    rule_state = self._state[rule_id]
+                    if rule_state.exit_settling:
+                        logger.debug(
+                            "rule %s source %s confirm ignored (settling)",
+                            safe_log(rule_id), safe_log(source_did),
+                        )
+                    elif confirm_single and rule_state.exit_debounce_task is not None:
                         # 强制复核窗的 True：撤掉宽限、恢复会话计时，按「仍在」收尾。
                         # 不重发 ENTERED —— 会话没断过，不能再记一次 session-start。
                         pending = self._state[rule_id].exit_debounce_task
@@ -1010,7 +1031,7 @@ class RuleRunner:
                         self._cancel_midpoint_recheck(self._state[rule_id])
                         self._rewind_abandoned_exit(self._state[rule_id])
                         self._resume_state_target(rule)
-                        src.pending_enter = False
+                        self._clear_pending_source_enter(rule.id)
                         src.last_bool = True
                         logger.info(
                             "rule %s source %s exit cancelled by forced recheck",
@@ -1293,6 +1314,7 @@ class RuleRunner:
             old.cancel()
         state.exit_debounce_task = None
         state.exit_debounce_at = None
+        state.exit_settling = False
         # 新一轮 debounce 开始前，清掉上一轮残留的 pending_enter
         self._clear_pending_source_enter(rule.id)
 
@@ -1328,7 +1350,12 @@ class RuleRunner:
         self._cancel_midpoint_recheck(state)
         task = asyncio.create_task(self._delayed_recheck(rule, source_did, delay / 2))
         state.exit_recheck_task = task
-        task.add_done_callback(lambda _t, st=state: setattr(st, "exit_recheck_task", None))
+        task.add_done_callback(
+            lambda t, st=state: (
+                setattr(st, "exit_recheck_task", None)
+                if st.exit_recheck_task is t else None
+            )
+        )
 
     async def _delayed_recheck(self, rule: Rule, source_did: str, wait: float) -> None:
         try:
@@ -1339,7 +1366,7 @@ class RuleRunner:
         state = self._state.get(rule.id)
         if state is None or state.exit_debounce_task is None:
             return
-        self._request_exit_recheck(source_did)
+        self._request_exit_recheck(rule, source_did)
 
     @staticmethod
     def _cancel_midpoint_recheck(state: RuleRuntimeState) -> None:
@@ -1358,10 +1385,16 @@ class RuleRunner:
         source_did = sources[0] if sources else ""
         if self._recheck_requester is None or not source_did:
             return
-        self._request_exit_recheck(source_did)
+        st0 = self._state.get(rule.id)
+        requested_at = st0.last_update_mono if st0 is not None else 0.0
+        self._request_exit_recheck(rule, source_did)
         deadline = time.monotonic() + _EXIT_RECHECK_WAIT_SEC
         while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
+            st = self._state.get(rule.id)
+            # 复核结论回来了（真假都算）就不必等满：假 → 交给收尾；真 → 确认路径已撤本任务
+            if st is not None and st.last_update_mono > requested_at:
+                return
             if self.is_condition_satisfied(rule.id) is not False:
                 return
 
@@ -1395,6 +1428,7 @@ class RuleRunner:
         # 达标兜底必须排在状态机翻 off 之前：达标动作要求 task 还在 session 里,
         # 翻完再喂就被 NOT_IN_SESSION 拦掉。撤 timer 反过来必须排在之后 —— 多 rule
         # 时这次退出可能被别的条件挡住 (STILL_HELD), session 还在, 撤了就丢达标。
+        rs.exit_settling = True
         await self._record_source.settle(rule.task_id)
         if self.is_condition_satisfied(rule.id) is not False:
             logger.info(
@@ -1724,6 +1758,7 @@ class RuleRunner:
             remaining = max(0.0, st.state_target_due - time.monotonic())
         self._detach_state_target_task(st)
         st.state_target_remaining = remaining
+        st.state_target_paused = True
         if remaining is not None:
             logger.info(
                 "STATE_TARGET_PAUSED: rule=%s task=%s remaining=%.1f",
@@ -1740,6 +1775,7 @@ class RuleRunner:
         remaining = st.state_target_remaining
         if remaining is None:
             return
+        st.state_target_paused = False
         self._schedule_state_target(rule, st)
         logger.info(
             "STATE_TARGET_RESUMED: rule=%s task=%s remaining=%.1f",
@@ -1768,7 +1804,7 @@ class RuleRunner:
                     running = True
                 elif st.state_target_remaining is not None:
                     remaining = st.state_target_remaining
-                    paused = st.exit_debounce_task is not None
+                    paused = st.state_target_paused
             out.append(
                 {
                     "rule_id": rule_id,
@@ -1780,6 +1816,7 @@ class RuleRunner:
                     "armed": remaining is not None,
                     "running": running,
                     "paused": paused,
+                    "enabled": bool(rule.enabled),
                 }
             )
         return out
@@ -1792,6 +1829,7 @@ class RuleRunner:
     def _cancel_state_target_state(self, st: RuleRuntimeState) -> None:
         self._detach_state_target_task(st)
         st.state_target_remaining = None
+        st.state_target_paused = False
 
     def _detach_state_target_task(self, st: RuleRuntimeState) -> None:
         task = st.state_target_task

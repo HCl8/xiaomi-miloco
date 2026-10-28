@@ -76,3 +76,26 @@ def test_create_response_reports_the_direction(client, rule_service):
 
     assert data["direction"] == "exit"
     assert data["mode"] == "event"
+
+
+def test_session_targets_exposes_the_runner_timer(client, rule_service):
+    """看板读的必须是 runner 内存里的计时，不是墙钟推算。"""
+    rule_service.session_target_states = MagicMock(
+        return_value=[
+            {
+                "rule_id": "r_live",
+                "task_id": "t1",
+                "duration_seconds": 1800,
+                "remaining_seconds": 1200.0,
+                "armed": True,
+                "running": True,
+                "paused": False,
+                "enabled": True,
+            }
+        ]
+    )
+
+    body = client.get("/api/rules/session-targets").json()
+
+    assert body["data"]["targets"][0]["remaining_seconds"] == 1200.0
+    rule_service.session_target_states.assert_called_once()
